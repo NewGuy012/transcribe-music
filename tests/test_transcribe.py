@@ -10,6 +10,7 @@ import soundfile as sf
 
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.models import Instrument
+from transcribe_music.transcribe._mt3_compat import ensure_mt3_transformers_compat
 from transcribe_music.transcribe.amt_piano import transcribe_piano_transkun
 from transcribe_music.transcribe.concerto import (
     detect_ensemble_accompaniment,
@@ -129,3 +130,92 @@ def test_transkun_bundled_weights_run_without_pkg_resources(tmp_path: Path) -> N
     midi = transcribe_piano_transkun(wav_path, midi_path, device="cpu")
     assert midi_path.exists()
     assert isinstance(midi, pretty_midi.PrettyMIDI)
+
+
+def test_mt3_compat_enables_yourmt3_and_mrmt3_inference() -> None:
+    import copy
+
+    import torch
+    from transformers import T5Config
+
+    ensure_mt3_transformers_compat()
+    ensure_mt3_transformers_compat()  # idempotent
+
+    from mt3_infer.models.mr_mt3.t5 import T5ForConditionalGeneration as MRMT3Model
+    from mt3_infer.models.yourmt3.config.config import audio_cfg as base_audio_cfg
+    from mt3_infer.models.yourmt3.config.config import model_cfg as base_model_cfg
+    from mt3_infer.models.yourmt3.model.ymt3 import YourMT3
+    from mt3_infer.models.yourmt3.utils.task_manager import TaskManager
+
+    # 1. YourMT3 Perceiver-TF + Multi-T5 (MoE + multi-channel autoregressive KV cache)
+    acfg = copy.deepcopy(base_audio_cfg)
+    mcfg = copy.deepcopy(base_model_cfg)
+    mcfg["encoder_type"] = "perceiver-tf"
+    mcfg["decoder_type"] = "multi-t5"
+    mcfg["pre_decoder_type"] = "mc_shared_linear"
+    mcfg["encoder"]["perceiver-tf"].update(
+        {
+            "num_latents": 8,
+            "d_latent": 32,
+            "d_latents": 32,
+            "d_model": 32,
+            "kv_dim": 64,
+            "num_blocks": 1,
+            "num_local_transformers_per_block": 1,
+            "num_temporal_transformers_per_block": 1,
+            "num_self_attention_heads": 4,
+            "num_cross_attention_heads": 4,
+            "qk_channels": 32,
+            "v_channels": 32,
+            "ff_layer_type": "moe",
+            "ff_widening_factor": 2,
+            "moe_num_experts": 2,
+            "moe_topk": 1,
+            "hidden_act": "silu",
+            "position_encoding_type": "rope",
+            "rope_partial_pe": False,
+        }
+    )
+    mcfg["decoder"]["multi-t5"].update(
+        {"d_model": 32, "num_heads": 2, "num_layers": 2, "num_channels": 4}
+    )
+    mcfg["conv_out_channels"] = 32
+    ymt3 = YourMT3(audio_cfg=acfg, model_cfg=mcfg, task_manager=TaskManager()).eval()
+    with torch.inference_mode():
+        pred_ids = ymt3.inference(torch.zeros(1, 1, acfg["input_frames"]), max_token_length=4)
+    assert pred_ids.shape[0] == 1
+    assert pred_ids.shape[1] == 4
+
+    # 2. YourMT3 T5 encoder + T5 decoder with trainable relative attention bias
+    acfg_t5 = copy.deepcopy(base_audio_cfg)
+    acfg_t5["n_mels"] = 32
+    mcfg_t5 = copy.deepcopy(base_model_cfg)
+    mcfg_t5["encoder"]["t5"].update(
+        {"d_model": 32, "num_heads": 2, "num_layers": 1, "position_encoding_type": "trainable"}
+    )
+    mcfg_t5["decoder"]["t5"].update(
+        {"d_model": 32, "num_heads": 2, "num_layers": 1, "position_encoding_type": "trainable"}
+    )
+    ymt3_t5 = YourMT3(audio_cfg=acfg_t5, model_cfg=mcfg_t5, task_manager=TaskManager()).eval()
+    with torch.inference_mode():
+        pred_t5 = ymt3_t5.inference(torch.zeros(1, 1, acfg_t5["input_frames"]), max_token_length=4)
+    assert pred_t5.shape[0] == 1
+
+    # 3. MR-MT3 T5ForConditionalGeneration still generates cleanly
+    mr_cfg = T5Config(
+        d_model=32,
+        d_ff=64,
+        d_kv=16,
+        num_heads=2,
+        num_layers=2,
+        num_decoder_layers=2,
+        vocab_size=32,
+        decoder_start_token_id=0,
+        pad_token_id=0,
+        eos_token_id=1,
+    )
+    mr_cfg.encoder_vocab_size = 32
+    mr_model = MRMT3Model(mr_cfg).eval()
+    with torch.inference_mode():
+        mr_out = mr_model.generate(inputs=torch.randn(1, 4, 32), max_length=5)
+    assert mr_out.shape[0] == 1

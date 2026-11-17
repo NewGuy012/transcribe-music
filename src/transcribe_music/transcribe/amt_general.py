@@ -11,6 +11,7 @@ import pretty_midi
 from transcribe_music.ingest.audio import load_mono_audio
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument, InstrumentSpec
 from transcribe_music.storage.catalog import hash_file
+from transcribe_music.transcribe._mt3_compat import ensure_mt3_transformers_compat
 from transcribe_music.transcribe.amt_piano import run_with_cpu_fallback
 
 _YOURMT3_CKPT_REL = (
@@ -124,6 +125,7 @@ def transcribe_with_mt3(
     device: str = "auto",
 ) -> tuple[pretty_midi.PrettyMIDI, list[str]]:
     """Run MR-MT3 (fast solo) or YourMT3 (concerto/multi-instrument) on WAV audio."""
+    ensure_mt3_transformers_compat()
     import mt3_infer
 
     warnings: list[str] = []
