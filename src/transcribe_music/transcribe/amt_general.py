@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,13 +166,15 @@ def transcribe_with_mt3(
     ckpt_path = str(_ensure_verified_checkpoint(ckpt_root, model_name))
 
     def _run(dev: str):
-        model = mt3_infer.load_model(
-            model_name,
-            checkpoint_path=ckpt_path,
-            device=dev,
-            auto_download=False,
-        )
-        out = model.transcribe(mono, sr=sr)
+        # Silence mt3-infer's unconditional stdout status prints while keeping stderr tracebacks.
+        with contextlib.redirect_stdout(io.StringIO()):
+            model = mt3_infer.load_model(
+                model_name,
+                checkpoint_path=ckpt_path,
+                device=dev,
+                auto_download=False,
+            )
+            out = model.transcribe(mono, sr=sr)
         record_torch_device(getattr(model, "device_str", dev))
         return out
 

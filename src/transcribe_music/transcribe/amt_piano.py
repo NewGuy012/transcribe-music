@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
@@ -90,6 +92,28 @@ def _read_stereo_float32(wav_path: Path) -> tuple[int, np.ndarray]:
     return int(fs), audio
 
 
+@contextmanager
+def _suppress_transkun_torch_warnings() -> Iterator[None]:
+    """Suppress harmless PyTorch 2.x/3.14 deprecation warnings triggered by bundled Transkun."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*`torch\.jit\.script` is not supported in Python 3\.14\+.*",
+            category=FutureWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*torch\.utils\.checkpoint: the use_reentrant parameter.*",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*None of the inputs have requires_grad=True.*",
+            category=UserWarning,
+        )
+        yield
+
+
 def transcribe_piano_transkun(
     wav_path: Path,
     output_midi_path: Path,
@@ -99,11 +123,12 @@ def transcribe_piano_transkun(
     fs, audio = _read_stereo_float32(wav_path)
 
     def _run(dev: str) -> Any:
-        model = _load_transkun_model(dev)
-        resampled = soxr.resample(audio, fs, model.fs) if fs != model.fs else audio
-        x = torch.from_numpy(resampled).to(dev)
-        with torch.inference_mode():
-            return model.transcribe(x, discardSecondHalf=False)
+        with _suppress_transkun_torch_warnings():
+            model = _load_transkun_model(dev)
+            resampled = soxr.resample(audio, fs, model.fs) if fs != model.fs else audio
+            x = torch.from_numpy(resampled).to(dev)
+            with torch.inference_mode():
+                return model.transcribe(x, discardSecondHalf=False)
 
     notes_est = run_with_cpu_fallback(device, _run)
     output_midi_path = Path(output_midi_path)

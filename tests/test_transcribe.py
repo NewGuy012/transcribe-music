@@ -115,6 +115,8 @@ def test_stitch_multipage_musicxml(tmp_path: Path) -> None:
 
 
 def test_transkun_bundled_weights_run_without_pkg_resources(tmp_path: Path) -> None:
+    import warnings
+
     sr = 44100
     t = np.linspace(0, 1.2, int(sr * 1.2), endpoint=False)
     # Plucky synthetic piano-like decay on C4 (261.63 Hz) + E4 (329.63 Hz) + G4 (392.00 Hz)
@@ -128,9 +130,15 @@ def test_transkun_bundled_weights_run_without_pkg_resources(tmp_path: Path) -> N
     sf.write(wav_path, wave.astype(np.float32), sr)
 
     midi_path = tmp_path / "out.mid"
-    midi = transcribe_piano_transkun(wav_path, midi_path, device="cpu")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        midi = transcribe_piano_transkun(wav_path, midi_path, device="cpu")
     assert midi_path.exists()
     assert isinstance(midi, pretty_midi.PrettyMIDI)
+    messages = [str(w.message) for w in caught]
+    assert not any("torch.jit.script" in msg for msg in messages)
+    assert not any("torch.utils.checkpoint" in msg for msg in messages)
+    assert not any("requires_grad=True" in msg for msg in messages)
 
 
 def test_mt3_compat_enables_yourmt3_and_mrmt3_inference() -> None:
@@ -335,3 +343,116 @@ def test_quantize_triplets_and_mixed_grids_export_cleanly(tmp_path: Path) -> Non
     }
     assert time_mods <= {("3", "2")}
     assert ("3", "2") in time_mods
+
+
+def test_mt3_compat_suppresses_third_party_noise_and_keeps_unrelated_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    import subprocess
+    import sys
+
+    from transcribe_music.transcribe._mt3_compat import (
+        _THIRD_PARTY_LOG_FILTERS,
+        _DropLogSubstringsFilter,
+    )
+
+    ensure_mt3_transformers_compat()
+    ensure_mt3_transformers_compat()
+
+    for logger_name, _ in _THIRD_PARTY_LOG_FILTERS:
+        compat_filters = [
+            f
+            for f in logging.getLogger(logger_name).filters
+            if isinstance(f, _DropLogSubstringsFilter)
+        ]
+        assert len(compat_filters) == 1
+
+    with caplog.at_level(logging.WARNING):
+        logging.getLogger("transformers.models.t5.modeling_t5").warning(
+            "Instantiating a decoder T5Attention without passing `layer_idx` is not recommended"
+        )
+        logging.getLogger("transformers.models.t5.modeling_t5").warning(
+            "Unexpected model error that should remain visible"
+        )
+
+    assert "without passing `layer_idx`" not in caplog.text
+    assert "Unexpected model error that should remain visible" in caplog.text
+
+    script = (
+        "from transcribe_music.transcribe._mt3_compat import ensure_mt3_transformers_compat; "
+        "ensure_mt3_transformers_compat(); "
+        "import mt3_infer; "
+        "from mt3_infer.models.yourmt3.model import ymt3; "
+        "from transformers import T5Config; "
+        "from transformers.models.t5.modeling_t5 import T5Attention; "
+        "cfg = T5Config(is_decoder=True, d_model=32, d_kv=16, num_heads=2, num_layers=1); "
+        "_ = cfg.use_return_dict; "
+        "_ = T5Attention(cfg, layer_idx=None)"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "Redirects are currently not supported in MacOs" not in combined
+    assert "torch.cuda.amp.autocast" not in combined
+    assert "without passing `layer_idx`" not in combined
+    assert "use_return_dict" not in combined
+
+
+def test_transcribe_with_mt3_suppresses_stdout_chatter_keeps_domain_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import mido
+    import mt3_infer
+
+    from transcribe_music.transcribe import amt_general
+
+    wav_path = tmp_path / "excerpt.wav"
+    sf.write(wav_path, np.zeros(16000, dtype=np.float32), 16000)
+    ckpt_path = tmp_path / "dummy.ckpt"
+    ckpt_path.write_bytes(b"ckpt")
+
+    monkeypatch.setattr(amt_general, "_ensure_verified_checkpoint", lambda *_args: ckpt_path)
+
+    class _FakeModel:
+        device_str = "cpu"
+
+        def transcribe(self, audio: np.ndarray, sr: int = 16000) -> mido.MidiFile:
+            print("Running inference on 1 segments...")
+            print("Got 1 prediction batches")
+            mid = mido.MidiFile(ticks_per_beat=480)
+            track = mido.MidiTrack()
+            track.append(mido.Message("program_change", program=48, time=0))  # String Ensemble 1
+            track.append(mido.Message("note_on", note=48, velocity=90, time=0))
+            track.append(mido.Message("note_off", note=48, velocity=0, time=480))
+            mid.tracks.append(track)
+            return mid
+
+    def _fake_load_model(*_args, **_kwargs):
+        print("Loading YourMT3 model: YPTF.MoE+Multi (noPS)")
+        print("Model loaded successfully! (type: YourMT3)")
+        return _FakeModel()
+
+    monkeypatch.setattr(mt3_infer, "load_model", _fake_load_model)
+
+    out_mid = tmp_path / "out.mid"
+    midi, warnings = amt_general.transcribe_with_mt3(
+        wav_path=wav_path,
+        instrument=Instrument.CELLO,
+        use_multi_track=True,
+        cache_dir=tmp_path / "cache",
+        output_midi_path=out_mid,
+        device="cpu",
+    )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert out_mid.exists()
+    assert len(midi.instruments[0].notes) == 1
+    assert any("No dedicated Cello GM track detected" in w for w in warnings)

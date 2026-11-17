@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 import sys
 import types
 import warnings
@@ -11,6 +12,49 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+
+
+class _DropLogSubstringsFilter(logging.Filter):
+    """Filter out known harmless third-party compatibility warning records."""
+
+    def __init__(self, substrings: tuple[str, ...]) -> None:
+        super().__init__()
+        self._substrings = substrings
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(sub in message for sub in self._substrings)
+
+
+_THIRD_PARTY_LOG_FILTERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "torch.distributed.elastic.multiprocessing.redirects",
+        ("Redirects are currently not supported in MacOs",),
+    ),
+    (
+        "transformers.models.t5.modeling_t5",
+        ("without passing `layer_idx`",),
+    ),
+    (
+        "transformers.configuration_utils",
+        ("`use_return_dict` is deprecated",),
+    ),
+)
+
+
+def _suppress_third_party_compat_noise() -> None:
+    """Suppress harmless deprecation and platform warnings from torch, transformers, and mt3."""
+    for logger_name, substrings in _THIRD_PARTY_LOG_FILTERS:
+        target_logger = logging.getLogger(logger_name)
+        if not any(isinstance(f, _DropLogSubstringsFilter) for f in target_logger.filters):
+            target_logger.addFilter(_DropLogSubstringsFilter(substrings))
+
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*torch\.cuda\.amp\.autocast.*",
+        category=FutureWarning,
+        module=r"mt3_infer\..*",
+    )
 
 
 def _ensure_model_parallel_utils() -> None:
@@ -380,6 +424,7 @@ def _ensure_framework_mps_device() -> None:
 
 def ensure_mt3_transformers_compat() -> None:
     """Install idempotent compatibility shims so mt3-infer works with modern transformers."""
+    _suppress_third_party_compat_noise()
     _ensure_model_parallel_utils()
     _ensure_pytorch_utils()
     _ensure_pretrained_model_masks()
