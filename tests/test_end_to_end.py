@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -71,10 +72,12 @@ def test_end_to_end_audio_piano_and_duckdb_cache(tmp_path: Path) -> None:
     root = ET.parse(out_xml).getroot()
     assert any(el.text == "brace" for el in root.findall(".//group-symbol"))
 
-    verovio = pytest.importorskip("verovio")
-    tk = verovio.toolkit()
-    assert tk.loadData(out_xml.read_text(encoding="utf-8"))
-    assert "<svg" in tk.renderToSVG(1)
+    if importlib.util.find_spec("verovio") is not None:
+        import verovio
+
+        tk = verovio.toolkit()
+        assert tk.loadData(out_xml.read_text(encoding="utf-8"))
+        assert "<svg" in tk.renderToSVG(1)
 
     out_xml_2 = tmp_path / "out_piano_cached.musicxml"
     res2 = transcribe_audio(wav_path, Instrument.PIANO, output_path=out_xml_2, config=cfg)
