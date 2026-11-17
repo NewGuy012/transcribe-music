@@ -1,15 +1,13 @@
-"""Hybrid acoustic chroma + symbolic Viterbi HMM chord recognizer."""
+"""Pure symbolic Viterbi HMM chord recognizer with optional full-score harmonic context."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 
-import librosa
 import music21
 import numpy as np
 
-from transcribe_music.ingest.audio import load_mono_audio
+from transcribe_music.export.musicxml import is_playable_chord
 
 _ROOT_NAMES = ("C", "C#", "D", "E-", "E", "F", "F#", "G", "A-", "A", "B-", "B")
 
@@ -48,39 +46,6 @@ _TEMPLATES = _build_templates()
 _TEMPLATE_MATRIX = np.stack([t.vector for t in _TEMPLATES], axis=0)  # (72, 12)
 
 
-def _compute_audio_chroma_by_window(
-    wav_path: Path,
-    tempo_bpm: float,
-    total_beats: float,
-    window_beats: float,
-) -> np.ndarray | None:
-    """Compute normalized 12-bin CQT chroma averaged over each beat window."""
-    if not wav_path.exists():
-        return None
-    y, sr = load_mono_audio(wav_path, target_sr=22050)
-    if y.size < sr // 2 or float(np.max(np.abs(y))) < 1e-5:
-        return None
-
-    hop_length = 512
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
-    times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop_length)
-    beats_per_sec = tempo_bpm / 60.0
-    frame_beats = times * beats_per_sec
-
-    n_windows = max(1, int(np.ceil(total_beats / window_beats)))
-    out = np.zeros((n_windows, 12), dtype=np.float64)
-    for w in range(n_windows):
-        b0 = w * window_beats
-        b1 = (w + 1) * window_beats
-        mask = (frame_beats >= b0) & (frame_beats < b1)
-        if np.any(mask):
-            vec = np.mean(chroma[:, mask], axis=1)
-            norm = float(np.linalg.norm(vec))
-            if norm > 1e-8:
-                out[w] = vec / norm
-    return out
-
-
 def _compute_symbolic_chroma_by_window(
     score: music21.stream.Score,
     total_beats: float,
@@ -91,7 +56,12 @@ def _compute_symbolic_chroma_by_window(
     out = np.zeros((n_windows, 12), dtype=np.float64)
     lowest_midi: list[int | None] = [None] * n_windows
 
-    flat = score.flatten()
+    try:
+        sounding_score = score.toSoundingPitch()
+    except Exception:  # noqa: BLE001 — fallback to raw score if transposition metadata is incomplete
+        sounding_score = score
+
+    flat = sounding_score.flatten()
     for el in flat.notes:
         if isinstance(el, music21.harmony.ChordSymbol):
             continue
@@ -169,16 +139,20 @@ def _viterbi_chords(
 
 def annotate_chords(
     score: music21.stream.Score,
-    audio_wav_path: Path | None = None,
-    tempo_bpm: float | None = None,
+    harmonic_reference_score: music21.stream.Score | None = None,
     window_beats: float = 2.0,
+    preserve_existing: bool = False,
 ) -> music21.stream.Score:
     """Annotate score with smoothed <harmony> ChordSymbol objects at beat/half-bar offsets."""
     if not score.parts:
         return score
 
     target_part = score.parts[0]
-    for existing in list(target_part.recurse().getElementsByClass(music21.harmony.ChordSymbol)):
+    existing_chords = list(target_part.recurse().getElementsByClass(music21.harmony.ChordSymbol))
+    if preserve_existing and existing_chords:
+        return score
+
+    for existing in existing_chords:
         if existing.activeSite is not None:
             existing.activeSite.remove(existing)
 
@@ -186,48 +160,44 @@ def annotate_chords(
     if total_beats <= 0:
         return score
 
-    if tempo_bpm is None:
-        mm = target_part.recurse().getElementsByClass(music21.tempo.MetronomeMark).first()
-        tempo_bpm = float(mm.number) if mm is not None and mm.number else 120.0
-
-    sym_chroma, bass_pcs = _compute_symbolic_chroma_by_window(score, total_beats, window_beats)
-    aud_chroma = (
-        _compute_audio_chroma_by_window(audio_wav_path, tempo_bpm, total_beats, window_beats)
-        if audio_wav_path is not None
-        else None
-    )
-
-    if aud_chroma is not None and aud_chroma.shape == sym_chroma.shape:
-        # Fuse symbolic clarity + full-mix acoustic chroma (great for concerto Tutti!)
-        combined = 0.65 * sym_chroma + 0.35 * aud_chroma
-        for i in range(combined.shape[0]):
-            # When soloist rests (Tutti), lean fully on acoustic orchestra chroma
-            if float(np.linalg.norm(sym_chroma[i])) < 1e-6:
-                combined[i] = aud_chroma[i]
-    else:
-        combined = sym_chroma
-
-    labels = _viterbi_chords(combined, bass_pcs=bass_pcs)
+    ref_score = harmonic_reference_score if harmonic_reference_score is not None else score
+    chroma, bass_pcs = _compute_symbolic_chroma_by_window(ref_score, total_beats, window_beats)
+    labels = _viterbi_chords(chroma, bass_pcs=bass_pcs)
     measures = list(target_part.getElementsByClass(music21.stream.Measure))
+    measure_has_notes = {
+        id(m): any(
+            isinstance(el, music21.note.Note) or is_playable_chord(el)
+            for el in m.recurse().notes
+        )
+        for m in measures
+    }
 
     last_symbol: str | None = None
+    placed_rest_measures: set[int] = set()
     for w_idx, label in enumerate(labels):
         if label is None or label == last_symbol:
             continue
         beat_offset = w_idx * window_beats
         try:
             cs = music21.harmony.ChordSymbol(label)
+            cs.writeAsChord = False
         except (music21.harmony.ChordSymbolException, ValueError):
             continue
 
         if measures:
-            # Place directly inside the owning measure at local measure offset
             placed = False
             for m in measures:
                 m_start = float(m.offset)
                 m_end = m_start + float(m.duration.quarterLength)
                 if m_start - 1e-6 <= beat_offset < m_end - 1e-6:
-                    m.insert(max(0.0, beat_offset - m_start), cs)
+                    if not measure_has_notes[id(m)]:
+                        if id(m) in placed_rest_measures:
+                            placed = True
+                            break
+                        m.insert(0.0, cs)
+                        placed_rest_measures.add(id(m))
+                    else:
+                        m.insert(max(0.0, beat_offset - m_start), cs)
                     placed = True
                     break
             if not placed:

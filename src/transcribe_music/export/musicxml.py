@@ -118,6 +118,41 @@ def _exact_fraction_or_none(value: float | Fraction) -> Fraction | None:
     return Fraction(float(value)).limit_denominator(10000)
 
 
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def split_tuplet_interval(onset: Fraction, end: Fraction) -> list[tuple[Fraction, Fraction]]:
+    """Keep tuplet spans beat-local by splitting non-binary endpoints at integer beat boundaries."""
+    if onset >= end:
+        return []
+    if _is_pow2(onset.denominator) and _is_pow2(end.denominator):
+        return [(onset, end)]
+
+    segments: list[tuple[Fraction, Fraction]] = []
+    cur = onset
+    if not _is_pow2(cur.denominator):
+        first_beat_end = Fraction(math.floor(cur) + 1, 1)
+        if end <= first_beat_end:
+            return [(cur, end)]
+        segments.append((cur, first_beat_end))
+        cur = first_beat_end
+
+    if not _is_pow2(end.denominator):
+        last_beat_start = Fraction(math.floor(end), 1)
+        if cur < last_beat_start:
+            segments.append((cur, last_beat_start))
+            cur = last_beat_start
+    if cur < end:
+        segments.append((cur, end))
+    return segments
+
+
+def _insert_split_rests(st: music21.stream.Stream, start: Fraction, end: Fraction) -> None:
+    for seg_start, seg_end in split_tuplet_interval(start, end):
+        st.insert(seg_start, music21.note.Rest(quarterLength=seg_end - seg_start))
+
+
 def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) -> None:
     """Repair unexportable durations and float-rounded offsets/gaps in a Measure, Voice, or Part."""
     items = [el for el in list(st) if _is_playable_or_rest(el) and not el.duration.isGrace]
@@ -155,7 +190,6 @@ def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) 
     if bar_ql is None or not repaired_ids:
         return
 
-    # Rebuild rests cleanly in the repaired measure/voice so gaps never carry rounding artifacts
     for r in list(st.getElementsByClass(music21.note.Rest)):
         if not r.duration.isGrace:
             st.remove(r)
@@ -187,7 +221,6 @@ def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) 
             if cur_ql > max_dur > 0:
                 n.duration = music21.duration.Duration(max_dur)
 
-    # Fill gaps with beat-split rests when non-binary offsets exist
     cursor = Fraction(0, 1)
     for n in notes_only:
         n_off = Fraction(n.offset).limit_denominator(24)
@@ -197,41 +230,6 @@ def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) 
         cursor = max(cursor, min(n_end, bar_ql))
     if cursor < bar_ql:
         _insert_split_rests(st, cursor, bar_ql)
-
-
-def _insert_split_rests(st: music21.stream.Stream, start: Fraction, end: Fraction) -> None:
-    for seg_start, seg_end in split_tuplet_interval(start, end):
-        st.insert(seg_start, music21.note.Rest(quarterLength=seg_end - seg_start))
-
-
-def split_tuplet_interval(onset: Fraction, end: Fraction) -> list[tuple[Fraction, Fraction]]:
-    """Keep tuplet spans beat-local by splitting non-binary endpoints at integer beat boundaries."""
-    if onset >= end:
-        return []
-    if _is_pow2(onset.denominator) and _is_pow2(end.denominator):
-        return [(onset, end)]
-
-    segments: list[tuple[Fraction, Fraction]] = []
-    cur = onset
-    if not _is_pow2(cur.denominator):
-        first_beat_end = Fraction(math.floor(cur) + 1, 1)
-        if end <= first_beat_end:
-            return [(cur, end)]
-        segments.append((cur, first_beat_end))
-        cur = first_beat_end
-
-    if not _is_pow2(end.denominator):
-        last_beat_start = Fraction(math.floor(end), 1)
-        if cur < last_beat_start:
-            segments.append((cur, last_beat_start))
-            cur = last_beat_start
-    if cur < end:
-        segments.append((cur, end))
-    return segments
-
-
-def _is_pow2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
 
 
 def _repair_unexportable_durations(part: music21.stream.Part) -> None:
@@ -288,20 +286,32 @@ def normalize_score_structure(
         m21_inst = _make_music21_instrument(instrument)
         if spec.transpose_semitones:
             m21_inst.transposition = music21.interval.Interval(spec.transpose_semitones)
+            part.atSoundingPitch = False
         part.insert(0, m21_inst)
 
         measures = list(part.getElementsByClass(music21.stream.Measure))
-        if not measures:
+        had_measures = bool(measures)
+        if not had_measures:
             if not part.getElementsByClass(music21.meter.TimeSignature):
                 part.insert(0, music21.meter.TimeSignature("4/4"))
+            if not part.getElementsByClass(music21.clef.Clef):
+                part.insert(0, _make_clef(spec.clef_mode, idx))
             _repair_unexportable_durations(part)
             part.makeMeasures(inPlace=True)
+            part.makeRests(fillGaps=True, inPlace=True)
             measures = list(part.getElementsByClass(music21.stream.Measure))
 
         if measures:
             first_m = measures[0]
-            if not first_m.getElementsByClass(music21.clef.Clef):
+            first_clefs = list(first_m.getElementsByClass(music21.clef.Clef))
+            if not first_clefs:
                 first_m.insert(0, _make_clef(spec.clef_mode, idx))
+            elif instrument == Instrument.GUITAR and not isinstance(
+                first_clefs[0], music21.clef.Treble8vbClef
+            ):
+                first_m.remove(first_clefs[0])
+                first_m.insert(0, _make_clef(spec.clef_mode, idx))
+
             if not first_m.getElementsByClass(music21.meter.TimeSignature):
                 ts = part.recurse().getElementsByClass(music21.meter.TimeSignature).first()
                 first_m.insert(0, ts if ts is not None else music21.meter.TimeSignature("4/4"))
@@ -311,9 +321,9 @@ def normalize_score_structure(
                     first_m.insert(0, ks)
 
         _repair_unexportable_durations(part)
-        part.makeNotation(inPlace=True)
-        # Final guard in case makeNotation introduced any unexportable duration/rest
-        _repair_unexportable_durations(part)
+        if not had_measures:
+            part.makeNotation(inPlace=True)
+            _repair_unexportable_durations(part)
 
     if instrument == Instrument.PIANO and len(parts) == 2:
         has_brace = any(
@@ -360,7 +370,6 @@ def _redistribute_chord_technical_tags(xml_path: Path) -> None:
                     strings = head_tech.findall("string")
                     frets = head_tech.findall("fret")
                     if len(strings) == len(group) or len(frets) == len(group):
-                        # Remove pooled string/fret tags from head note, keep only index 0
                         for idx in range(1, len(group)):
                             target_notations = group[idx].find("notations")
                             if target_notations is None:
@@ -383,6 +392,71 @@ def _redistribute_chord_technical_tags(xml_path: Path) -> None:
         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 
 
+def _validate_part_measures(parts: list[ET.Element]) -> None:
+    """Ensure no measure contains duplicate whole-bar rests or overflows its time signature."""
+    for part in parts:
+        divisions: int | None = None
+        beats: int | None = None
+        beat_type: int | None = None
+        senza_misura = False
+
+        for measure in part.findall("measure"):
+            m_num = measure.attrib.get("number", "?")
+            whole_rests = measure.findall("./note/rest[@measure='yes']")
+            if len(whole_rests) > 1:
+                raise ValueError(f"Measure {m_num} contains duplicate whole-measure rests")
+
+            for attrs in measure.findall("attributes"):
+                div_txt = attrs.findtext("divisions")
+                if div_txt is not None:
+                    divisions = int(div_txt)
+                time_el = attrs.find("time")
+                if time_el is not None:
+                    if time_el.find("senza-misura") is not None:
+                        senza_misura = True
+                    else:
+                        senza_misura = False
+                        b_txt = time_el.findtext("beats")
+                        bt_txt = time_el.findtext("beat-type")
+                        if b_txt and bt_txt and b_txt.isdigit() and bt_txt.isdigit():
+                            beats = int(b_txt)
+                            beat_type = int(bt_txt)
+
+            if senza_misura or divisions is None or beats is None or beat_type is None:
+                continue
+            if measure.attrib.get("implicit") == "yes":
+                continue
+
+            expected_divs = (divisions * beats * 4) // beat_type
+            cursor = 0
+            max_cursor = 0
+            for child in measure:
+                if child.tag == "note":
+                    if child.find("grace") is not None or child.find("chord") is not None:
+                        continue
+                    dur_txt = child.findtext("duration")
+                    if dur_txt is not None:
+                        cursor += int(dur_txt)
+                        if cursor > max_cursor:
+                            max_cursor = cursor
+                elif child.tag == "forward":
+                    dur_txt = child.findtext("duration")
+                    if dur_txt is not None:
+                        cursor += int(dur_txt)
+                        if cursor > max_cursor:
+                            max_cursor = cursor
+                elif child.tag == "backup":
+                    dur_txt = child.findtext("duration")
+                    if dur_txt is not None:
+                        cursor -= int(dur_txt)
+
+            if max_cursor > expected_divs + 1:
+                raise ValueError(
+                    f"Measure {m_num} overflows active {beats}/{beat_type} meter "
+                    f"({max_cursor} > {expected_divs} divisions)"
+                )
+
+
 def _extract_metrics_and_validate_xml(xml_path: Path) -> ExportMetrics:
     """Validate serialized MusicXML structure and extract structural counts."""
     tree = ET.parse(xml_path)
@@ -400,6 +474,9 @@ def _extract_metrics_and_validate_xml(xml_path: Path) -> ExportMetrics:
             raise ValueError("Exported MusicXML contains a <note> missing <duration>")
 
     parts = root.findall("part")
+    if parts:
+        _validate_part_measures(parts)
+
     measure_count = len(parts[0].findall("measure")) if parts else len(xml_measures)
     note_count = sum(1 for n in xml_notes if n.find("rest") is None)
     return ExportMetrics(

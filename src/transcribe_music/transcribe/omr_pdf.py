@@ -1,4 +1,4 @@
-"""Optical Music Recognition (OMR) for multi-page sheet music PDFs using homr."""
+"""Optical Music Recognition (OMR) fallback for multi-page sheet music PDFs via batched homr."""
 
 from __future__ import annotations
 
@@ -13,47 +13,67 @@ from transcribe_music.ingest.pdf import render_pdf_pages
 from transcribe_music.models import Instrument
 
 
-def _run_homr_on_image(image_path: Path) -> Path:
-    """Run homr OMR on one page PNG via native CLI or isolated uvx Python 3.14."""
-    image_path = Path(image_path).resolve()
-    expected_xml = image_path.with_suffix(".musicxml")
-    if expected_xml.exists():
-        expected_xml.unlink()
-
+def _build_homr_command(image_paths: list[Path]) -> list[str]:
+    """Build a single batched CLI invocation for homr across one or more rendered pages."""
+    resolved = [str(Path(p).resolve()) for p in image_paths]
     homr_bin = shutil.which("homr")
     if homr_bin:
-        cmd = [homr_bin, str(image_path)]
-    else:
-        uvx_bin = shutil.which("uvx") or "/opt/homebrew/bin/uvx"
-        if not Path(uvx_bin).exists() and shutil.which("uvx") is None:
-            raise RuntimeError(
-                "PDF OMR requires 'homr' or 'uvx' to run homr[cpu] in an isolated environment."
-            )
-        cmd = [
-            uvx_bin,
-            "--python",
-            "3.14",
-            "--from",
-            "homr[cpu]",
-            "homr",
-            str(image_path),
-        ]
+        return [homr_bin, *resolved]
 
+    uvx_bin = shutil.which("uvx") or "/opt/homebrew/bin/uvx"
+    if not Path(uvx_bin).exists() and shutil.which("uvx") is None:
+        raise RuntimeError(
+            "PDF OMR fallback requires 'homr' or 'uvx' to run homr[cpu] in an isolated environment."
+        )
+    return [uvx_bin, "--python", "3.14", "--from", "homr[cpu]", "homr", *resolved]
+
+
+def _run_homr_batch(image_paths: list[Path], work_dir: Path) -> list[Path]:
+    """Run homr OMR once across all PDF pages and return generated MusicXML path(s)."""
+    if not image_paths:
+        raise ValueError("No page images supplied to homr OMR.")
+
+    work_dir = Path(work_dir).resolve()
+    for stale in list(work_dir.glob("*.musicxml")) + list(work_dir.glob("*.xml")):
+        stale.unlink(missing_ok=True)
+
+    cmd = _build_homr_command(image_paths)
+    timeout_sec = max(300, 120 * len(image_paths))
     proc = subprocess.run(
-        cmd, check=False, cwd=str(image_path.parent), capture_output=True, text=True, timeout=300
+        cmd, check=False, cwd=str(work_dir), capture_output=True, text=True, timeout=timeout_sec
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"homr OMR failed on {image_path.name}: {proc.stderr.strip()}")
+        raise RuntimeError(f"homr OMR failed: {proc.stderr.strip() or proc.stdout.strip()}")
 
-    if not expected_xml.exists():
-        candidates = sorted(image_path.parent.glob(f"{image_path.stem}*.musicxml")) + sorted(
-            image_path.parent.glob(f"{image_path.stem}*.xml")
+    first_stem = image_paths[0].stem
+    merged_candidates = [
+        work_dir / f"merged_{first_stem}.musicxml",
+        work_dir / f"merged_{first_stem}.xml",
+    ]
+    for merged in merged_candidates:
+        if merged.exists():
+            return [merged]
+
+    per_page: list[Path] = []
+    for img in image_paths:
+        direct = img.with_suffix(".musicxml")
+        if direct.exists():
+            per_page.append(direct)
+            continue
+        matches = sorted(work_dir.glob(f"{img.stem}*.musicxml")) + sorted(
+            work_dir.glob(f"{img.stem}*.xml")
         )
-        if not candidates:
-            raise RuntimeError(f"homr produced no MusicXML output for {image_path.name}")
-        expected_xml = candidates[0]
+        if matches:
+            per_page.append(matches[0])
 
-    return expected_xml
+    if per_page:
+        return per_page
+
+    any_xml = sorted(work_dir.glob("*.musicxml")) + sorted(work_dir.glob("*.xml"))
+    if any_xml:
+        return any_xml
+
+    raise RuntimeError(f"homr produced no MusicXML output in {work_dir}")
 
 
 def stitch_musicxml_pages(
@@ -66,12 +86,16 @@ def stitch_musicxml_pages(
         raise ValueError("No page MusicXML files to stitch")
 
     if len(page_xml_paths) == 1:
-        score = music21.converter.parse(str(page_xml_paths[0]))
-        if isinstance(score, music21.stream.Part):
+        parsed = music21.converter.parse(str(page_xml_paths[0]))
+        if isinstance(parsed, music21.stream.Part):
             wrapper = music21.stream.Score()
-            wrapper.insert(0, score)
-            score = wrapper
-        return score
+            wrapper.insert(0, parsed)
+            parsed = wrapper
+        if parsed.metadata is None:
+            parsed.metadata = music21.metadata.Metadata()
+        if title and not parsed.metadata.title:
+            parsed.metadata.title = title
+        return parsed
 
     merged_score = music21.stream.Score()
     merged_score.metadata = music21.metadata.Metadata(title=title or f"{instrument.value.title()} Score")
@@ -99,9 +123,7 @@ def stitch_musicxml_pages(
                 m_copy.number = next_measure_num + m_offset
                 # Strip redundant clefs on subsequent page boundaries
                 if page_idx > 0 and m_offset == 0:
-                    for redundant in list(
-                        m_copy.getElementsByClass((music21.clef.Clef,))
-                    ):
+                    for redundant in list(m_copy.getElementsByClass((music21.clef.Clef,))):
                         m_copy.remove(redundant)
                 dst_part.append(m_copy)
 
@@ -118,8 +140,8 @@ def transcribe_pdf_omr(
     instrument: Instrument,
     dpi: int = 300,
 ) -> music21.stream.Score:
-    """Rasterize PDF pages and run homr OMR to produce a unified music21 Score."""
+    """Rasterize PDF pages and run a single batched homr OMR pass into a music21 Score."""
     pages_dir = Path(work_dir) / "pdf_pages"
     image_paths = render_pdf_pages(pdf_path, pages_dir, dpi=dpi)
-    xml_paths = [_run_homr_on_image(img) for img in image_paths]
+    xml_paths = _run_homr_batch(image_paths, pages_dir)
     return stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)

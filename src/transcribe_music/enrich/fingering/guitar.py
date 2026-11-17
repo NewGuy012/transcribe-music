@@ -132,9 +132,13 @@ def annotate_guitar_fingering(score: music21.stream.Score) -> music21.stream.Sco
     if not score.parts:
         return score
     part = score.parts[0]
+    first_clef = part.recurse().getElementsByClass(music21.clef.Clef).first()
+    is_written_8vb = part.atSoundingPitch is False or isinstance(
+        first_clef, music21.clef.Treble8vbClef
+    )
     transpose = (
         0
-        if part.atSoundingPitch is True
+        if (part.atSoundingPitch is True and not is_written_8vb)
         else INSTRUMENT_SPECS[Instrument.GUITAR].transpose_semitones
     )
 
