@@ -53,7 +53,6 @@ def _single_note_poses(sounding_midi: int) -> list[_GuitarPose]:
 
 def _chord_poses(sounding_midis: list[int]) -> list[_GuitarPose]:
     """Generate playable 6-string chord voicings (distinct strings, <= 4 fret span)."""
-    # Keep up to 6 unique pitches ordered low -> high
     per_note_opts = [_single_note_candidates(m) for m in sounding_midis]
     if any(not opts for opts in per_note_opts):
         # Fallback: solve each note independently when chord contains extreme pitch

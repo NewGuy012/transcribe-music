@@ -178,7 +178,6 @@ def annotate_chords(
         return score
 
     target_part = score.parts[0]
-    # Remove any existing ChordSymbols before re-annotating cleanly
     for existing in list(target_part.recurse().getElementsByClass(music21.harmony.ChordSymbol)):
         if existing.activeSite is not None:
             existing.activeSite.remove(existing)

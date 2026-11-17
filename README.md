@@ -2,20 +2,27 @@
 
 A fast, local-first Python CLI, SDK, and **Marimo** workbench that converts **YouTube videos**, **audio files**, or **sheet music PDFs** into validated **MusicXML** containing **notes, durations, measures, chord symbols (`<harmony>`), guitar TAB (`<string>`, `<fret>`), and ergonomic fingerings (`<fingering>`)** for:
 
-- **Piano** (Grand Staff split, bundled `Transkun` v2 + `pianoplayer` in-memory optimization)
+- **Piano** (Grand Staff split, bundled `Transkun` v2 + O(N) Viterbi fingering solver)
 - **Guitar** (Treble `8vb` transposition, fast `MR-MT3` + 6-string Viterbi TAB & chord-grip solver)
 - **Violin** (Solo/concerto salience pruning + 4-string Viterbi position solver)
 - **Cello** (Solo/concerto salience pruning + `Tutti` rest cues + 4-string closed/extended/thumb solver)
 
-Powered by modern Python tooling: **`uv`**, **`duckdb`** (content-addressed stage caching + queryable score tables), and **`marimo` + `verovio`** (reactive UI with inline SVG engraving).
+Powered by modern Python tooling: **`uv`**, **`duckdb`** (content-addressed job cache), and optional **`marimo` + `verovio`** (`--extra ui` reactive workbench with inline SVG engraving).
 
 ---
 
 ## Quickstart
 
-Requires **uv** (Python `3.15` managed automatically via `.python-version`). Zero system installs required (`pymupdf` handles PDFs, `static-ffmpeg` auto-fetches FFmpeg if absent, `verovio` renders scores).
+Requires **uv** (Python `3.15` managed automatically via `.python-version`). `pymupdf` handles PDFs and `imageio-ffmpeg` bundles FFmpeg if not installed on the system.
 
 ```bash
+# Core CLI + SDK
+uv sync
+
+# Optional interactive Marimo + Verovio workbench UI
+uv sync --extra ui
+
+# Development tools (pytest, ruff)
 uv sync --all-extras
 ```
 
@@ -70,8 +77,8 @@ print(res.musicxml_path, res.note_count, res.chord_count, res.fingering_count)
 1. **Guaranteed Baseline MusicXML Contract**: Every score passes through `music21` structural normalization (`makeMeasures`, `makeRests`, clefs, transpositions, time/key signatures) and XML validation so downstream apps always receive valid notes, durations, and complete measures.
 2. **Progressive Non-Destructive Enrichment**:
    - **Chords (`<harmony>`)**: Hybrid symbolic + acoustic CQT chroma Viterbi HMM.
-   - **Fingerings (`<technical><fingering>`)**: In-memory `pianoplayer` (`Piano`), 6-string fretboard + TAB (`Guitar`), and 4-string biomechanical Viterbi solvers (`Violin`, `Cello` including thumb position `T`).
-3. **DuckDB Catalog (`catalog.duckdb`)**: Content-addressed job caching plus relational `jobs`, `measures`, `notes`, and `chords` tables queryable via SQL or the Marimo UI.
+   - **Fingerings (`<technical><fingering>`)**: Unified O(N) Viterbi solvers for Piano, Guitar (`<string>` + `<fret>`), Violin, and Cello (including thumb position `T`).
+3. **DuckDB Catalog (`catalog.duckdb`)**: Content-addressed job caching queryable via `transcribe-music cache list` or the Marimo UI (`--no-cache` bypasses the database completely).
 
 ## Development & Testing
 

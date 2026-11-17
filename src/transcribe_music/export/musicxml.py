@@ -95,7 +95,6 @@ def normalize_score_structure(
         parts = [part]
 
     for idx, part in enumerate(parts):
-        # Replace or insert clean instrument metadata
         for existing_inst in list(part.recurse().getElementsByClass(music21.instrument.Instrument)):
             part.remove(existing_inst, recurse=True)
         m21_inst = _make_music21_instrument(instrument)
@@ -103,7 +102,6 @@ def normalize_score_structure(
             m21_inst.transposition = music21.interval.Interval(spec.transpose_semitones)
         part.insert(0, m21_inst)
 
-        # Ensure measures exist and are properly formed
         measures = list(part.getElementsByClass(music21.stream.Measure))
         if not measures:
             part.makeMeasures(inPlace=True)
@@ -121,7 +119,6 @@ def normalize_score_structure(
                 if ks is not None:
                     first_m.insert(0, ks)
 
-        # Fill gaps with valid rests and ensure ties/beams are notation-ready
         part.makeNotation(inPlace=True)
 
     if instrument == Instrument.PIANO and len(parts) == 2:

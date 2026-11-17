@@ -97,7 +97,7 @@ def stitch_musicxml_pages(
             for m_offset, m in enumerate(measures):
                 m_copy = copy.deepcopy(m)
                 m_copy.number = next_measure_num + m_offset
-                # Strip redundant clefs/key/time signatures on subsequent pages unless changed
+                # Strip redundant clefs on subsequent page boundaries
                 if page_idx > 0 and m_offset == 0:
                     for redundant in list(
                         m_copy.getElementsByClass((music21.clef.Clef,))
