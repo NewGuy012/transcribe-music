@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,20 @@ import soxr
 import torch
 import transkun
 from transkun.Data import writeMidi
+
+_LAST_TORCH_DEVICE: ContextVar[str | None] = ContextVar("_LAST_TORCH_DEVICE", default=None)
+
+
+def record_torch_device(device: str) -> None:
+    """Record the torch device actually used for the current transcription call."""
+    _LAST_TORCH_DEVICE.set(device)
+
+
+def consume_last_torch_device() -> str | None:
+    """Return and clear the most recently recorded torch device for this context."""
+    dev = _LAST_TORCH_DEVICE.get()
+    _LAST_TORCH_DEVICE.set(None)
+    return dev
 
 
 def resolve_torch_device(preferred: str = "auto") -> str:
@@ -29,11 +44,19 @@ def resolve_torch_device(preferred: str = "auto") -> str:
 def run_with_cpu_fallback[T](preferred: str, fn: Callable[[str], T]) -> T:
     """Run torch callable on resolved device, falling back to CPU if MPS fails."""
     resolved = resolve_torch_device(preferred)
+    _LAST_TORCH_DEVICE.set(None)
     try:
-        return fn(resolved)
+        out = fn(resolved)
+        if _LAST_TORCH_DEVICE.get() is None:
+            _LAST_TORCH_DEVICE.set(resolved)
+        return out
     except Exception:
         if resolved != "cpu":
-            return fn("cpu")
+            _LAST_TORCH_DEVICE.set(None)
+            out = fn("cpu")
+            if _LAST_TORCH_DEVICE.get() is None:
+                _LAST_TORCH_DEVICE.set("cpu")
+            return out
         raise
 
 

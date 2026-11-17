@@ -13,7 +13,7 @@ from transcribe_music.ingest.audio import load_mono_audio
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument, InstrumentSpec
 from transcribe_music.storage.catalog import hash_file
 from transcribe_music.transcribe._mt3_compat import ensure_mt3_transformers_compat
-from transcribe_music.transcribe.amt_piano import run_with_cpu_fallback
+from transcribe_music.transcribe.amt_piano import record_torch_device, run_with_cpu_fallback
 
 
 @dataclass(frozen=True)
@@ -170,7 +170,9 @@ def transcribe_with_mt3(
             device=dev,
             auto_download=False,
         )
-        return model.transcribe(mono, sr=sr)
+        out = model.transcribe(mono, sr=sr)
+        record_torch_device(getattr(model, "device_str", dev))
+        return out
 
     mido_midi = run_with_cpu_fallback(device, _run)
     raw_midi_path = Path(output_midi_path).with_name(f"{Path(output_midi_path).stem}_raw.mid")

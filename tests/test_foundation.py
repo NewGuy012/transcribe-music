@@ -172,6 +172,8 @@ def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:
         note_count=metrics.note_count,
         chord_count=metrics.chord_count,
         fingering_count=metrics.fingering_count,
+        backend="mr_mt3",
+        device_used="cpu",
         elapsed_sec=0.12,
     )
     store.record_job(res, cfg)
@@ -180,7 +182,39 @@ def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:
     assert cached is not None
     assert cached.cached is True
     assert cached.note_count == 8
+    assert cached.backend == "mr_mt3"
+    assert cached.device_used == "cpu"
     assert len(store.list_recent_jobs()) == 1
+
+    # Existing DB without backend/device_used columns migrates cleanly
+    import duckdb
+
+    legacy_dir = tmp_path / ".legacy_cache"
+    legacy_dir.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(str(legacy_dir / "catalog.duckdb")) as con:
+        con.execute(
+            """
+            CREATE TABLE jobs (
+                job_hash VARCHAR PRIMARY KEY,
+                source_type VARCHAR NOT NULL,
+                source_ref VARCHAR NOT NULL,
+                start_sec DOUBLE,
+                end_sec DOUBLE,
+                instrument VARCHAR NOT NULL,
+                config_json VARCHAR NOT NULL,
+                musicxml_path VARCHAR NOT NULL,
+                measure_count INTEGER NOT NULL,
+                note_count INTEGER NOT NULL,
+                chord_count INTEGER NOT NULL,
+                fingering_count INTEGER NOT NULL,
+                elapsed_sec DOUBLE NOT NULL,
+                warnings_json VARCHAR NOT NULL,
+                created_at TIMESTAMP NOT NULL
+            )
+            """
+        )
+    migrated = CatalogStore(legacy_dir)
+    assert migrated.list_recent_jobs() == []
 
 
 def test_audio_normalization_and_pdf_rasterization(tmp_path: Path) -> None:

@@ -66,6 +66,8 @@ def test_end_to_end_audio_piano_and_duckdb_cache(tmp_path: Path) -> None:
     res1 = transcribe_audio(wav_path, Instrument.PIANO, output_path=out_xml, config=cfg)
     assert out_xml.exists()
     assert res1.cached is False
+    assert res1.backend == "transkun"
+    assert res1.device_used == "cpu"
     assert res1.measure_count >= 1
     assert res1.fingering_count == res1.note_count
 
@@ -83,6 +85,8 @@ def test_end_to_end_audio_piano_and_duckdb_cache(tmp_path: Path) -> None:
     res2 = transcribe_audio(wav_path, Instrument.PIANO, output_path=out_xml_2, config=cfg)
     assert res2.cached is True
     assert res2.job_hash == res1.job_hash
+    assert res2.backend == "transkun"
+    assert res2.device_used == "cpu"
     assert out_xml_2.exists()
 
 
@@ -173,6 +177,8 @@ def test_end_to_end_pdf_guitar_omr_mocked(monkeypatch: pytest.MonkeyPatch, tmp_p
     )
     res = transcribe_pdf(pdf_path, Instrument.GUITAR, output_path=out_xml, config=cfg)
     assert out_xml.exists()
+    assert res.backend == "homr"
+    assert res.device_used is None
     assert res.measure_count == 2
     assert res.note_count == 8
     assert res.chord_count >= 1
@@ -222,6 +228,7 @@ def test_cli_youtube_audio_and_cache_commands(
         ],
     )
     assert nc_res.exit_code == 0, nc_res.output
+    assert "transkun (cpu)" in nc_res.output
     assert nocache_out.exists()
     assert not (cache_dir / "catalog.duckdb").exists()
 
@@ -252,6 +259,10 @@ def test_cli_youtube_audio_and_cache_commands(
     list_res = runner.invoke(app, ["cache", "list", "--cache-dir", str(cache_dir)])
     assert list_res.exit_code == 0, list_res.output
     assert "piano" in list_res.output
+    cached_rows = CatalogStore(cache_dir).list_recent_jobs()
+    assert len(cached_rows) == 1
+    assert cached_rows[0]["backend"] == "transkun"
+    assert cached_rows[0]["device_used"] == "cpu"
 
     clear_res = runner.invoke(app, ["cache", "clear", "--cache-dir", str(cache_dir)])
     assert clear_res.exit_code == 0, clear_res.output

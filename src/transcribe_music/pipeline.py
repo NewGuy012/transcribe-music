@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import music21
@@ -24,7 +25,11 @@ from transcribe_music.models import (
 )
 from transcribe_music.storage.catalog import CatalogStore, compute_job_hash, hash_file
 from transcribe_music.transcribe.amt_general import transcribe_with_mt3
-from transcribe_music.transcribe.amt_piano import transcribe_piano_transkun
+from transcribe_music.transcribe.amt_piano import (
+    consume_last_torch_device,
+    resolve_torch_device,
+    transcribe_piano_transkun,
+)
 from transcribe_music.transcribe.concerto import (
     detect_ensemble_accompaniment,
     prune_concerto_notes,
@@ -52,8 +57,17 @@ def _copy_if_needed(src: Path, dst: Path) -> Path:
     return dst
 
 
+@dataclass(frozen=True)
+class _ProducedScore:
+    score: music21.stream.Score
+    warnings: list[str]
+    audio_wav_path: Path | None
+    backend: str
+    device_used: str | None
+
+
 def _enrich_and_export(
-    score: music21.stream.Score,
+    produced: _ProducedScore,
     config: TranscriptionConfig,
     source_type: SourceType,
     source_ref: str,
@@ -61,17 +75,17 @@ def _enrich_and_export(
     output_path: Path,
     store: CatalogStore | None,
     t_start: float,
-    warnings: list[str],
-    audio_wav_path: Path | None = None,
     start_sec: float | None = None,
     end_sec: float | None = None,
     title: str | None = None,
 ) -> TranscriptionResult:
+    score = produced.score
+    warnings = list(produced.warnings)
     if config.enrich_chords:
         try:
             annotate_chords(
                 score,
-                audio_wav_path=audio_wav_path,
+                audio_wav_path=produced.audio_wav_path,
                 tempo_bpm=config.tempo_bpm,
             )
         except Exception as exc:  # noqa: BLE001 — non-fatal enrichment fallback
@@ -104,6 +118,8 @@ def _enrich_and_export(
         note_count=metrics.note_count,
         chord_count=metrics.chord_count,
         fingering_count=metrics.fingering_count,
+        backend=produced.backend,
+        device_used=produced.device_used,
         warnings=warnings,
     )
 
@@ -122,7 +138,7 @@ def _run_audio_pipeline(
     artifact_dir: Path,
     config: TranscriptionConfig,
     title: str,
-) -> tuple[music21.stream.Score, list[str]]:
+) -> _ProducedScore:
     """Run optimal solo vs concerto transcription path and return quantized Score."""
     warnings: list[str] = []
     instrument = config.instrument
@@ -132,9 +148,11 @@ def _run_audio_pipeline(
         is_concerto = detect_ensemble_accompaniment(wav_path)
 
     raw_midi_path = artifact_dir / "transcribed.mid"
+    consume_last_torch_device()
 
     if instrument == Instrument.PIANO:
         if is_concerto:
+            backend = "yourmt3"
             solo_midi, mt3_warn = transcribe_with_mt3(
                 wav_path,
                 instrument=Instrument.PIANO,
@@ -146,14 +164,18 @@ def _run_audio_pipeline(
             warnings.extend(mt3_warn)
             if not any(inst.notes for inst in solo_midi.instruments):
                 warnings.append("Multi-track piano stem empty; falling back to Transkun.")
+                backend = "transkun"
+                consume_last_torch_device()
                 solo_midi = transcribe_piano_transkun(
                     wav_path, raw_midi_path, device=config.device
                 )
         else:
+            backend = "transkun"
             solo_midi = transcribe_piano_transkun(wav_path, raw_midi_path, device=config.device)
     else:
         # Guitar solo uses ultra-fast MR-MT3; concerto/strings with accompaniment use YourMT3
         use_multi = is_concerto
+        backend = "yourmt3" if use_multi else "mr_mt3"
         solo_midi, mt3_warn = transcribe_with_mt3(
             wav_path,
             instrument=instrument,
@@ -164,6 +186,7 @@ def _run_audio_pipeline(
         )
         warnings.extend(mt3_warn)
 
+    device_used = consume_last_torch_device() or resolve_torch_device(config.device)
     cleaned_midi = prune_concerto_notes(solo_midi, instrument=instrument)
     score = midi_to_quantized_score(
         cleaned_midi,
@@ -174,7 +197,13 @@ def _run_audio_pipeline(
         concerto_cues=is_concerto and instrument in (Instrument.VIOLIN, Instrument.CELLO),
         title=title,
     )
-    return score, warnings
+    return _ProducedScore(
+        score=score,
+        warnings=warnings,
+        audio_wav_path=wav_path,
+        backend=backend,
+        device_used=device_used,
+    )
 
 
 def _normalize_timestamp_input(value: str | float | None) -> str | float | None:
@@ -198,7 +227,7 @@ def _run_cached_job(
     default_stem: str,
     output_path: Path | None,
     config: TranscriptionConfig | None,
-    produce_score: Callable[[Path, TranscriptionConfig], tuple[music21.stream.Score, list[str], Path | None]],
+    produce_score: Callable[[Path, TranscriptionConfig], _ProducedScore],
     *,
     title: str,
     start_sec: float | None = None,
@@ -231,9 +260,9 @@ def _run_cached_job(
                     "elapsed_sec": round(time.perf_counter() - t_start, 3),
                 }
             )
-        score, warnings, wav_path = produce_score(artifact_dir, cfg)
+        produced = produce_score(artifact_dir, cfg)
         return _enrich_and_export(
-            score=score,
+            produced=produced,
             config=cfg,
             source_type=source_type,
             source_ref=source_ref,
@@ -241,8 +270,6 @@ def _run_cached_job(
             output_path=final_out,
             store=store,
             t_start=t_start,
-            warnings=warnings,
-            audio_wav_path=wav_path,
             start_sec=start_sec,
             end_sec=end_sec,
             title=title,
@@ -251,9 +278,9 @@ def _run_cached_job(
     if output_path is not None:
         with tempfile.TemporaryDirectory(prefix="tm_work_") as tmp_dir_str:
             work_dir = Path(tmp_dir_str)
-            score, warnings, wav_path = produce_score(work_dir, cfg)
+            produced = produce_score(work_dir, cfg)
             return _enrich_and_export(
-                score=score,
+                produced=produced,
                 config=cfg,
                 source_type=source_type,
                 source_ref=source_ref,
@@ -261,8 +288,6 @@ def _run_cached_job(
                 output_path=Path(output_path),
                 store=None,
                 t_start=t_start,
-                warnings=warnings,
-                audio_wav_path=wav_path,
                 start_sec=start_sec,
                 end_sec=end_sec,
                 title=title,
@@ -271,9 +296,9 @@ def _run_cached_job(
     artifact_dir = cfg.cache_dir / "artifacts" / job_hash
     artifact_dir.mkdir(parents=True, exist_ok=True)
     final_out = _resolve_output_path(None, default_stem, inst, artifact_dir)
-    score, warnings, wav_path = produce_score(artifact_dir, cfg)
+    produced = produce_score(artifact_dir, cfg)
     return _enrich_and_export(
-        score=score,
+        produced=produced,
         config=cfg,
         source_type=source_type,
         source_ref=source_ref,
@@ -281,8 +306,6 @@ def _run_cached_job(
         output_path=final_out,
         store=None,
         t_start=t_start,
-        warnings=warnings,
-        audio_wav_path=wav_path,
         start_sec=start_sec,
         end_sec=end_sec,
         title=title,
@@ -319,11 +342,10 @@ def transcribe_youtube(
         default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_{int(time_range.end_sec)}"
         pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-{int(time_range.end_sec)}s)"
 
-    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> tuple[music21.stream.Score, list[str], Path]:
+    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
         wav_path = artifact_dir / ("yt_audio.wav" if time_range is None else "yt_slice.wav")
         download_youtube_slice(url, time_range, wav_path, sample_rate=44100)
-        score, warnings = _run_audio_pipeline(wav_path, artifact_dir, cfg, title=pipeline_title)
-        return score, warnings, wav_path
+        return _run_audio_pipeline(wav_path, artifact_dir, cfg, title=pipeline_title)
 
     return _run_cached_job(
         SourceType.YOUTUBE,
@@ -350,11 +372,10 @@ def transcribe_audio(
     path = Path(audio_path)
     _require_existing_file(path)
 
-    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> tuple[music21.stream.Score, list[str], Path]:
+    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
         wav_path = artifact_dir / "audio.wav"
         normalize_audio_to_wav(path, wav_path, sample_rate=44100)
-        score, warnings = _run_audio_pipeline(wav_path, artifact_dir, cfg, title=path.stem)
-        return score, warnings, wav_path
+        return _run_audio_pipeline(wav_path, artifact_dir, cfg, title=path.stem)
 
     return _run_cached_job(
         SourceType.AUDIO,
@@ -379,9 +400,15 @@ def transcribe_pdf(
     path = Path(pdf_path)
     _require_existing_file(path, expected_suffix=".pdf")
 
-    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> tuple[music21.stream.Score, list[str], None]:
+    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
         score = transcribe_pdf_omr(path, artifact_dir, instrument=cfg.instrument, dpi=cfg.pdf_dpi)
-        return score, [], None
+        return _ProducedScore(
+            score=score,
+            warnings=[],
+            audio_wav_path=None,
+            backend="homr",
+            device_used=None,
+        )
 
     return _run_cached_job(
         SourceType.PDF,

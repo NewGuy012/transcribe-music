@@ -37,11 +37,19 @@ TempoOpt = Annotated[float | None, typer.Option("--tempo", help="Override BPM in
 CacheDirOpt = Annotated[Path, typer.Option("--cache-dir", help="Cache directory.")]
 
 
+def _format_backend(backend: str | None, device_used: str | None) -> str:
+    if not backend:
+        return "-"
+    return f"{backend} ({device_used})" if device_used else backend
+
+
 def _print_result(res: TranscriptionResult) -> None:
     table = Table(title="Transcription Complete", show_header=False)
     table.add_row("Output MusicXML", str(res.musicxml_path))
     table.add_row("Instrument", res.instrument.value)
     table.add_row("Source", f"{res.source_type.value}: {res.source_ref}")
+    if res.backend:
+        table.add_row("Backend", _format_backend(res.backend, res.device_used))
     table.add_row("Cache Hit", "Yes" if res.cached else "No")
     table.add_row("Elapsed", f"{res.elapsed_sec:.2f}s")
     table.add_row("Measures", str(res.measure_count))

@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     note_count INTEGER NOT NULL,
     chord_count INTEGER NOT NULL,
     fingering_count INTEGER NOT NULL,
+    backend VARCHAR,
+    device_used VARCHAR,
     elapsed_sec DOUBLE NOT NULL,
     warnings_json VARCHAR NOT NULL,
     created_at TIMESTAMP NOT NULL
@@ -90,6 +92,8 @@ class CatalogStore:
     def _init_schema(self) -> None:
         with self._connect() as con:
             con.execute(_SCHEMA_SQL)
+            con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS backend VARCHAR")
+            con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS device_used VARCHAR")
 
     def artifact_dir(self, job_hash: str) -> Path:
         path = self.artifacts_dir / job_hash
@@ -102,7 +106,7 @@ class CatalogStore:
                 """
                 SELECT job_hash, source_type, source_ref, instrument, musicxml_path,
                        measure_count, note_count, chord_count, fingering_count,
-                       elapsed_sec, warnings_json
+                       elapsed_sec, warnings_json, backend, device_used
                 FROM jobs
                 WHERE job_hash = ?
                 """,
@@ -128,6 +132,8 @@ class CatalogStore:
             note_count=int(row[6]),
             chord_count=int(row[7]),
             fingering_count=int(row[8]),
+            backend=row[11],
+            device_used=row[12],
             warnings=json.loads(row[10]),
         )
 
@@ -145,8 +151,8 @@ class CatalogStore:
                 INSERT OR REPLACE INTO jobs (
                     job_hash, source_type, source_ref, start_sec, end_sec, instrument,
                     config_json, musicxml_path, measure_count, note_count, chord_count,
-                    fingering_count, elapsed_sec, warnings_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    fingering_count, backend, device_used, elapsed_sec, warnings_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     result.job_hash,
@@ -161,6 +167,8 @@ class CatalogStore:
                     result.note_count,
                     result.chord_count,
                     result.fingering_count,
+                    result.backend,
+                    result.device_used,
                     result.elapsed_sec,
                     json.dumps(result.warnings),
                     now,
@@ -173,7 +181,7 @@ class CatalogStore:
                 """
                 SELECT job_hash, source_type, source_ref, instrument, start_sec, end_sec,
                        measure_count, note_count, chord_count, fingering_count,
-                       elapsed_sec, musicxml_path, created_at
+                       backend, device_used, elapsed_sec, musicxml_path, created_at
                 FROM jobs
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -191,6 +199,8 @@ class CatalogStore:
             "note_count",
             "chord_count",
             "fingering_count",
+            "backend",
+            "device_used",
             "elapsed_sec",
             "musicxml_path",
             "created_at",

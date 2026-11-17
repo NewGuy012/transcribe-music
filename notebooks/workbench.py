@@ -224,10 +224,15 @@ def _(mo, result, verovio):
     tk.loadData(xml_bytes.decode("utf-8"))
     pages_svg = [tk.renderToSVG(p) for p in range(1, tk.getPageCount() + 1)]
 
+    backend_label = (
+        f"{result.backend} ({result.device_used})"
+        if result.backend and result.device_used
+        else (result.backend or "-")
+    )
     summary_md = mo.md(
         f"""
         ### Export Ready (`{result.musicxml_path.name}`)
-        - **Measures:** {result.measure_count} | **Notes:** {result.note_count} | **Chords:** {result.chord_count} | **Fingerings:** {result.fingering_count}
+        - **Backend:** `{backend_label}` | **Measures:** {result.measure_count} | **Notes:** {result.note_count} | **Chords:** {result.chord_count} | **Fingerings:** {result.fingering_count}
         - **Cached:** `{result.cached}` | **Elapsed:** `{result.elapsed_sec:.2f}s`
         """
     )

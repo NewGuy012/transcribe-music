@@ -194,4 +194,6 @@ class TranscriptionResult(BaseModel):
     note_count: int = 0
     chord_count: int = 0
     fingering_count: int = 0
+    backend: str | None = None
+    device_used: str | None = None
     warnings: list[str] = Field(default_factory=list)
