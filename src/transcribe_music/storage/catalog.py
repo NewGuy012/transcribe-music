@@ -1,4 +1,4 @@
-"""Embedded DuckDB catalog for content-addressed job caching."""
+"""Embedded DuckDB catalog for content-addressed score job caching."""
 
 from __future__ import annotations
 
@@ -22,8 +22,6 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_hash VARCHAR PRIMARY KEY,
     source_type VARCHAR NOT NULL,
     source_ref VARCHAR NOT NULL,
-    start_sec DOUBLE,
-    end_sec DOUBLE,
     instrument VARCHAR NOT NULL,
     config_json VARCHAR NOT NULL,
     musicxml_path VARCHAR NOT NULL,
@@ -32,7 +30,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     chord_count INTEGER NOT NULL,
     fingering_count INTEGER NOT NULL,
     backend VARCHAR,
-    device_used VARCHAR,
+    selected_part VARCHAR,
     elapsed_sec DOUBLE NOT NULL,
     warnings_json VARCHAR NOT NULL,
     created_at TIMESTAMP NOT NULL
@@ -53,21 +51,18 @@ def compute_job_hash(
     source_type: SourceType,
     source_identity: str,
     config: TranscriptionConfig,
-    start_sec: float | None = None,
-    end_sec: float | None = None,
 ) -> str:
-    """Compute a deterministic cache key for a transcription job."""
+    """Compute a deterministic cache key for a score conversion/OMR job."""
     payload = {
-        "pipeline_version": "v1",
+        "pipeline_version": "v2",
         "source_type": source_type.value,
         "source_identity": source_identity,
-        "start_sec": round(start_sec, 3) if start_sec is not None else None,
-        "end_sec": round(end_sec, 3) if end_sec is not None else None,
         "instrument": config.instrument.value,
-        "concerto_mode": config.concerto_mode,
+        "part": config.part,
         "enrich_chords": config.enrich_chords,
         "enrich_fingering": config.enrich_fingering,
-        "tempo_bpm": config.tempo_bpm,
+        "preserve_existing_chords": config.preserve_existing_chords,
+        "preserve_existing_fingering": config.preserve_existing_fingering,
         "quantize_divisors": list(config.quantize_divisors),
         "pdf_dpi": config.pdf_dpi if source_type == SourceType.PDF else None,
     }
@@ -76,7 +71,7 @@ def compute_job_hash(
 
 
 class CatalogStore:
-    """Single-file DuckDB catalog for caching transcription jobs."""
+    """Single-file DuckDB catalog for caching MusicXML enrichment jobs."""
 
     def __init__(self, cache_dir: Path = Path(".transcribe_cache")) -> None:
         self.cache_dir = Path(cache_dir)
@@ -93,7 +88,7 @@ class CatalogStore:
         with self._connect() as con:
             con.execute(_SCHEMA_SQL)
             con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS backend VARCHAR")
-            con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS device_used VARCHAR")
+            con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS selected_part VARCHAR")
 
     def artifact_dir(self, job_hash: str) -> Path:
         path = self.artifacts_dir / job_hash
@@ -106,7 +101,7 @@ class CatalogStore:
                 """
                 SELECT job_hash, source_type, source_ref, instrument, musicxml_path,
                        measure_count, note_count, chord_count, fingering_count,
-                       elapsed_sec, warnings_json, backend, device_used
+                       elapsed_sec, warnings_json, backend, selected_part
                 FROM jobs
                 WHERE job_hash = ?
                 """,
@@ -133,7 +128,7 @@ class CatalogStore:
             chord_count=int(row[7]),
             fingering_count=int(row[8]),
             backend=row[11],
-            device_used=row[12],
+            selected_part=row[12],
             warnings=json.loads(row[10]),
         )
 
@@ -141,25 +136,21 @@ class CatalogStore:
         self,
         result: TranscriptionResult,
         config: TranscriptionConfig,
-        start_sec: float | None = None,
-        end_sec: float | None = None,
     ) -> None:
         now = datetime.now(UTC).replace(tzinfo=None)
         with self._connect() as con:
             con.execute(
                 """
                 INSERT OR REPLACE INTO jobs (
-                    job_hash, source_type, source_ref, start_sec, end_sec, instrument,
+                    job_hash, source_type, source_ref, instrument,
                     config_json, musicxml_path, measure_count, note_count, chord_count,
-                    fingering_count, backend, device_used, elapsed_sec, warnings_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    fingering_count, backend, selected_part, elapsed_sec, warnings_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     result.job_hash,
                     result.source_type.value,
                     result.source_ref,
-                    start_sec,
-                    end_sec,
                     result.instrument.value,
                     config.model_dump_json(),
                     str(result.musicxml_path),
@@ -168,7 +159,7 @@ class CatalogStore:
                     result.chord_count,
                     result.fingering_count,
                     result.backend,
-                    result.device_used,
+                    result.selected_part,
                     result.elapsed_sec,
                     json.dumps(result.warnings),
                     now,
@@ -179,9 +170,9 @@ class CatalogStore:
         with self._connect() as con:
             rows = con.execute(
                 """
-                SELECT job_hash, source_type, source_ref, instrument, start_sec, end_sec,
+                SELECT job_hash, source_type, source_ref, instrument,
                        measure_count, note_count, chord_count, fingering_count,
-                       backend, device_used, elapsed_sec, musicxml_path, created_at
+                       backend, selected_part, elapsed_sec, musicxml_path, created_at
                 FROM jobs
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -193,14 +184,12 @@ class CatalogStore:
             "source_type",
             "source_ref",
             "instrument",
-            "start_sec",
-            "end_sec",
             "measure_count",
             "note_count",
             "chord_count",
             "fingering_count",
             "backend",
-            "device_used",
+            "selected_part",
             "elapsed_sec",
             "musicxml_path",
             "created_at",

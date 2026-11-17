@@ -1,18 +1,17 @@
-"""Core domain models, instrument specifications, and timestamp parsing."""
+"""Core domain models, instrument specifications, and inspection metadata."""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class Instrument(str, Enum):
-    """Supported instruments for transcription and fingering generation."""
+    """Supported target instruments for score adaptation and fingering generation."""
 
     PIANO = "piano"
     GUITAR = "guitar"
@@ -21,10 +20,9 @@ class Instrument(str, Enum):
 
 
 class SourceType(str, Enum):
-    """Supported ingestion source types."""
+    """Supported score ingestion source types."""
 
-    YOUTUBE = "youtube"
-    AUDIO = "audio"
+    DIGITAL = "digital"
     PDF = "pdf"
 
 
@@ -40,7 +38,6 @@ class InstrumentSpec:
     transpose_semitones: int
     max_polyphony: int
     gm_programs: tuple[int, ...]
-    ensemble_fallback_programs: tuple[int, ...]
     open_string_midi: tuple[int, ...]  # Ordered string 1 (highest) -> string N (lowest)
 
 
@@ -54,7 +51,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         transpose_semitones=0,
         max_polyphony=10,
         gm_programs=tuple(range(8)),
-        ensemble_fallback_programs=(),
         open_string_midi=(),
     ),
     Instrument.GUITAR: InstrumentSpec(
@@ -66,7 +62,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         transpose_semitones=-12,
         max_polyphony=6,
         gm_programs=tuple(range(24, 32)),
-        ensemble_fallback_programs=(),
         open_string_midi=(64, 59, 55, 50, 45, 40),  # E4, B3, G3, D3, A2, E2
     ),
     Instrument.VIOLIN: InstrumentSpec(
@@ -78,7 +73,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         transpose_semitones=0,
         max_polyphony=2,
         gm_programs=(40,),
-        ensemble_fallback_programs=(48, 49),
         open_string_midi=(76, 69, 62, 55),  # E5, A4, D4, G3
     ),
     Instrument.CELLO: InstrumentSpec(
@@ -90,98 +84,52 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         transpose_semitones=0,
         max_polyphony=2,
         gm_programs=(42,),
-        ensemble_fallback_programs=(48, 49, 43),
         open_string_midi=(57, 50, 43, 36),  # A3, D3, G2, C2
     ),
 }
 
-_TIME_RE = re.compile(r"^\s*(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)\s*$")
+
+class PartInfo(BaseModel):
+    """Summary metadata for a single part/track inside a digital score."""
+
+    index: int
+    part_id: str
+    name: str
+    instrument_name: str | None = None
+    midi_program: int | None = None
+    clef: str | None = None
+    measure_count: int = 0
+    note_count: int = 0
+    pitch_min: int | None = None
+    pitch_max: int | None = None
 
 
-def parse_timestamp(value: str | float) -> float:
-    """Parse seconds or HH:MM:SS / MM:SS string into non-negative float seconds."""
-    if isinstance(value, (int, float)):
-        sec = float(value)
-        if sec < 0:
-            raise ValueError(f"Timestamp must be non-negative, got {value}")
-        return sec
+class ScoreInspection(BaseModel):
+    """Structured overview of all parts detected inside a digital music file."""
 
-    raw = value.strip()
-    if not raw:
-        raise ValueError("Empty timestamp")
-
-    try:
-        sec = float(raw)
-        if sec < 0:
-            raise ValueError(f"Timestamp must be non-negative, got {value}")
-        return sec
-    except ValueError:
-        pass
-
-    match = _TIME_RE.match(raw)
-    if not match:
-        raise ValueError(
-            f"Invalid timestamp {value!r}. Expected seconds (e.g. '75.5'), 'MM:SS', or 'HH:MM:SS'."
-        )
-    hours_s, mins_s, secs_s = match.groups()
-    hours = int(hours_s) if hours_s is not None else 0
-    mins = int(mins_s)
-    secs = float(secs_s)
-    if mins >= 60 or secs >= 60:
-        raise ValueError(f"Minutes/seconds must be < 60 in timestamp {value!r}")
-    return hours * 3600.0 + mins * 60.0 + secs
-
-
-class TimeRange(BaseModel):
-    """Optional start and end timestamps (in seconds) for YouTube slicing."""
-
-    start_sec: float = Field(default=0.0, ge=0.0)
-    end_sec: float | None = Field(default=None, gt=0.0)
-
-    @field_validator("end_sec")
-    @classmethod
-    def _validate_order(cls, v: float | None, info) -> float | None:
-        if v is None:
-            return None
-        start = info.data.get("start_sec")
-        if start is not None and v <= start:
-            raise ValueError(f"end_sec ({v}) must be greater than start_sec ({start})")
-        return v
-
-    @property
-    def duration_sec(self) -> float | None:
-        if self.end_sec is None:
-            return None
-        return self.end_sec - self.start_sec
-
-    @classmethod
-    def from_inputs(
-        cls,
-        start: str | float | None = None,
-        end: str | float | None = None,
-    ) -> TimeRange:
-        start_sec = 0.0 if start is None else parse_timestamp(start)
-        end_sec = None if end is None else parse_timestamp(end)
-        return cls(start_sec=start_sec, end_sec=end_sec)
+    source_path: Path
+    format_name: str
+    title: str | None = None
+    parts: list[PartInfo] = Field(default_factory=list)
 
 
 class TranscriptionConfig(BaseModel):
-    """Runtime configuration for transcription, enrichment, and caching."""
+    """Runtime configuration for score ingestion, part selection, enrichment, and caching."""
 
     instrument: Instrument
-    concerto_mode: Literal["auto", "solo", "concerto"] = "auto"
-    device: Literal["auto", "mps", "cpu"] = "auto"
+    part: str | None = None
     use_cache: bool = True
     enrich_chords: bool = True
     enrich_fingering: bool = True
-    tempo_bpm: float | None = Field(default=None, gt=20.0, lt=320.0)
-    quantize_divisors: tuple[int, ...] = (4, 3)  # 16th notes + triplets
+    preserve_existing_chords: bool = False
+    preserve_existing_fingering: bool = False
+    quantize_divisors: tuple[int, ...] = (4, 3)
     cache_dir: Path = Path(".transcribe_cache")
     pdf_dpi: int = Field(default=300, ge=150, le=600)
 
 
 class TranscriptionResult(BaseModel):
-    """Structured result metadata returned by CLI/SDK/pipeline."""
+    """Structured result metadata returned by CLI, SDK, and pipeline."""
 
     job_hash: str
     source_type: SourceType
@@ -195,5 +143,5 @@ class TranscriptionResult(BaseModel):
     chord_count: int = 0
     fingering_count: int = 0
     backend: str | None = None
-    device_used: str | None = None
+    selected_part: str | None = None
     warnings: list[str] = Field(default_factory=list)
