@@ -2,25 +2,31 @@
 
 from transcribe_music.models import (
     Instrument,
+    PartInfo,
+    ScoreInspection,
     SourceType,
-    TimeRange,
     TranscriptionConfig,
     TranscriptionResult,
-    parse_timestamp,
 )
-from transcribe_music.pipeline import transcribe_audio, transcribe_pdf, transcribe_youtube
+from transcribe_music.pipeline import (
+    convert_music,
+    inspect_score,
+    transcribe_pdf,
+    transcribe_score,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Instrument",
+    "PartInfo",
+    "ScoreInspection",
     "SourceType",
-    "TimeRange",
     "TranscriptionConfig",
     "TranscriptionResult",
     "__version__",
-    "parse_timestamp",
-    "transcribe_audio",
+    "convert_music",
+    "inspect_score",
     "transcribe_pdf",
-    "transcribe_youtube",
+    "transcribe_score",
 ]

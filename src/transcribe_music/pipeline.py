@@ -1,4 +1,4 @@
-"""End-to-end transcription, enrichment, caching, and MusicXML export pipeline."""
+"""End-to-end digital score conversion, PDF fallback OMR, enrichment, caching, and MusicXML export."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import music21
@@ -14,28 +14,17 @@ import music21
 from transcribe_music.enrich.chords import annotate_chords
 from transcribe_music.enrich.fingering import apply_fingering
 from transcribe_music.export.musicxml import export_musicxml
-from transcribe_music.ingest.audio import normalize_audio_to_wav
-from transcribe_music.ingest.youtube import download_youtube_slice, extract_youtube_id
+from transcribe_music.ingest.digital import inspect_digital_score, load_digital_score
 from transcribe_music.models import (
     Instrument,
+    ScoreInspection,
     SourceType,
-    TimeRange,
     TranscriptionConfig,
     TranscriptionResult,
 )
 from transcribe_music.storage.catalog import CatalogStore, compute_job_hash, hash_file
-from transcribe_music.transcribe.amt_general import transcribe_with_mt3
-from transcribe_music.transcribe.amt_piano import (
-    consume_last_torch_device,
-    resolve_torch_device,
-    transcribe_piano_transkun,
-)
-from transcribe_music.transcribe.concerto import (
-    detect_ensemble_accompaniment,
-    prune_concerto_notes,
-)
 from transcribe_music.transcribe.omr_pdf import transcribe_pdf_omr
-from transcribe_music.transcribe.quantize import midi_to_quantized_score
+from transcribe_music.transcribe.part_selector import select_and_adapt_parts
 
 
 def _resolve_output_path(
@@ -60,10 +49,10 @@ def _copy_if_needed(src: Path, dst: Path) -> Path:
 @dataclass(frozen=True)
 class _ProducedScore:
     score: music21.stream.Score
-    warnings: list[str]
-    audio_wav_path: Path | None
+    harmonic_reference_score: music21.stream.Score | None
     backend: str
-    device_used: str | None
+    selected_part: str | None
+    warnings: list[str] = field(default_factory=list)
 
 
 def _enrich_and_export(
@@ -75,33 +64,39 @@ def _enrich_and_export(
     output_path: Path,
     store: CatalogStore | None,
     t_start: float,
-    start_sec: float | None = None,
-    end_sec: float | None = None,
-    title: str | None = None,
+    fallback_title: str,
 ) -> TranscriptionResult:
     score = produced.score
     warnings = list(produced.warnings)
+
     if config.enrich_chords:
         try:
             annotate_chords(
                 score,
-                audio_wav_path=produced.audio_wav_path,
-                tempo_bpm=config.tempo_bpm,
+                harmonic_reference_score=produced.harmonic_reference_score,
+                preserve_existing=config.preserve_existing_chords,
             )
         except Exception as exc:  # noqa: BLE001 — non-fatal enrichment fallback
             warnings.append(f"Chord enrichment skipped safely: {exc}")
 
     if config.enrich_fingering:
         try:
-            apply_fingering(score, config.instrument)
+            apply_fingering(
+                score,
+                config.instrument,
+                preserve_existing=config.preserve_existing_fingering,
+            )
         except Exception as exc:  # noqa: BLE001 — non-fatal enrichment fallback
             warnings.append(f"Fingering enrichment skipped safely: {exc}")
+
+    existing_title = score.metadata.title.strip() if score.metadata and score.metadata.title else ""
+    final_title = existing_title or fallback_title
 
     metrics, export_warnings = export_musicxml(
         score,
         output_path=output_path,
         instrument=config.instrument,
-        title=title,
+        title=final_title,
     )
     warnings.extend(export_warnings)
 
@@ -119,97 +114,13 @@ def _enrich_and_export(
         chord_count=metrics.chord_count,
         fingering_count=metrics.fingering_count,
         backend=produced.backend,
-        device_used=produced.device_used,
+        selected_part=produced.selected_part,
         warnings=warnings,
     )
 
     if store is not None:
-        store.record_job(
-            result=result,
-            config=config,
-            start_sec=start_sec,
-            end_sec=end_sec,
-        )
+        store.record_job(result=result, config=config)
     return result
-
-
-def _run_audio_pipeline(
-    wav_path: Path,
-    artifact_dir: Path,
-    config: TranscriptionConfig,
-    title: str,
-) -> _ProducedScore:
-    """Run optimal solo vs concerto transcription path and return quantized Score."""
-    warnings: list[str] = []
-    instrument = config.instrument
-
-    is_concerto = config.concerto_mode == "concerto"
-    if config.concerto_mode == "auto":
-        is_concerto = detect_ensemble_accompaniment(wav_path)
-
-    raw_midi_path = artifact_dir / "transcribed.mid"
-    consume_last_torch_device()
-
-    if instrument == Instrument.PIANO:
-        if is_concerto:
-            backend = "yourmt3"
-            solo_midi, mt3_warn = transcribe_with_mt3(
-                wav_path,
-                instrument=Instrument.PIANO,
-                use_multi_track=True,
-                cache_dir=config.cache_dir,
-                output_midi_path=raw_midi_path,
-                device=config.device,
-            )
-            warnings.extend(mt3_warn)
-            if not any(inst.notes for inst in solo_midi.instruments):
-                warnings.append("Multi-track piano stem empty; falling back to Transkun.")
-                backend = "transkun"
-                consume_last_torch_device()
-                solo_midi = transcribe_piano_transkun(
-                    wav_path, raw_midi_path, device=config.device
-                )
-        else:
-            backend = "transkun"
-            solo_midi = transcribe_piano_transkun(wav_path, raw_midi_path, device=config.device)
-    else:
-        # Guitar solo uses ultra-fast MR-MT3; concerto/strings with accompaniment use YourMT3
-        use_multi = is_concerto
-        backend = "yourmt3" if use_multi else "mr_mt3"
-        solo_midi, mt3_warn = transcribe_with_mt3(
-            wav_path,
-            instrument=instrument,
-            use_multi_track=use_multi,
-            cache_dir=config.cache_dir,
-            output_midi_path=raw_midi_path,
-            device=config.device,
-        )
-        warnings.extend(mt3_warn)
-
-    device_used = consume_last_torch_device() or resolve_torch_device(config.device)
-    cleaned_midi = prune_concerto_notes(solo_midi, instrument=instrument)
-    score = midi_to_quantized_score(
-        cleaned_midi,
-        instrument=instrument,
-        audio_wav_path=wav_path,
-        tempo_bpm=config.tempo_bpm,
-        quantize_divisors=config.quantize_divisors,
-        concerto_cues=is_concerto and instrument in (Instrument.VIOLIN, Instrument.CELLO),
-        title=title,
-    )
-    return _ProducedScore(
-        score=score,
-        warnings=warnings,
-        audio_wav_path=wav_path,
-        backend=backend,
-        device_used=device_used,
-    )
-
-
-def _normalize_timestamp_input(value: str | float | None) -> str | float | None:
-    if isinstance(value, str) and not value.strip():
-        return None
-    return value
 
 
 def _require_existing_file(path: Path, expected_suffix: str | None = None) -> None:
@@ -229,9 +140,7 @@ def _run_cached_job(
     config: TranscriptionConfig | None,
     produce_score: Callable[[Path, TranscriptionConfig], _ProducedScore],
     *,
-    title: str,
-    start_sec: float | None = None,
-    end_sec: float | None = None,
+    fallback_title: str,
 ) -> TranscriptionResult:
     t_start = time.perf_counter()
     inst = Instrument(instrument)
@@ -239,13 +148,7 @@ def _run_cached_job(
     if cfg.instrument != inst:
         cfg = cfg.model_copy(update={"instrument": inst})
 
-    job_hash = compute_job_hash(
-        source_type,
-        source_identity,
-        cfg,
-        start_sec=start_sec,
-        end_sec=end_sec,
-    )
+    job_hash = compute_job_hash(source_type, source_identity, cfg)
 
     if cfg.use_cache:
         store = CatalogStore(cfg.cache_dir)
@@ -270,9 +173,7 @@ def _run_cached_job(
             output_path=final_out,
             store=store,
             t_start=t_start,
-            start_sec=start_sec,
-            end_sec=end_sec,
-            title=title,
+            fallback_title=fallback_title,
         )
 
     if output_path is not None:
@@ -288,9 +189,7 @@ def _run_cached_job(
                 output_path=Path(output_path),
                 store=None,
                 t_start=t_start,
-                start_sec=start_sec,
-                end_sec=end_sec,
-                title=title,
+                fallback_title=fallback_title,
             )
 
     artifact_dir = cfg.cache_dir / "artifacts" / job_hash
@@ -306,79 +205,43 @@ def _run_cached_job(
         output_path=final_out,
         store=None,
         t_start=t_start,
-        start_sec=start_sec,
-        end_sec=end_sec,
-        title=title,
+        fallback_title=fallback_title,
     )
 
 
-def transcribe_youtube(
-    url: str,
-    instrument: Instrument | str,
-    start: str | float | None = None,
-    end: str | float | None = None,
-    output_path: Path | None = None,
-    config: TranscriptionConfig | None = None,
-) -> TranscriptionResult:
-    """Download a YouTube video (or optional [start, end] slice) and transcribe it to MusicXML."""
-    start_val = _normalize_timestamp_input(start)
-    end_val = _normalize_timestamp_input(end)
-    time_range = (
-        None
-        if (start_val is None and end_val is None)
-        else TimeRange.from_inputs(start_val, end_val)
-    )
-    start_sec = time_range.start_sec if time_range is not None else None
-    end_sec = time_range.end_sec if time_range is not None else None
-    video_id = extract_youtube_id(url)
-
-    if time_range is None:
-        default_stem = f"yt_{video_id}"
-        pipeline_title = f"YouTube {video_id}"
-    elif time_range.end_sec is None:
-        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_end"
-        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-end)"
-    else:
-        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_{int(time_range.end_sec)}"
-        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-{int(time_range.end_sec)}s)"
-
-    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
-        wav_path = artifact_dir / ("yt_audio.wav" if time_range is None else "yt_slice.wav")
-        download_youtube_slice(url, time_range, wav_path, sample_rate=44100)
-        return _run_audio_pipeline(wav_path, artifact_dir, cfg, title=pipeline_title)
-
-    return _run_cached_job(
-        SourceType.YOUTUBE,
-        video_id,
-        url,
-        instrument,
-        default_stem,
-        output_path,
-        config,
-        _produce,
-        title=f"YouTube {video_id}",
-        start_sec=start_sec,
-        end_sec=end_sec,
-    )
+def inspect_score(score_path: Path | str) -> ScoreInspection:
+    """Inspect parts, instruments, clefs, and pitch ranges inside a digital score file."""
+    return inspect_digital_score(score_path)
 
 
-def transcribe_audio(
-    audio_path: Path | str,
+def transcribe_score(
+    score_path: Path | str,
     instrument: Instrument | str,
     output_path: Path | None = None,
     config: TranscriptionConfig | None = None,
 ) -> TranscriptionResult:
-    """Transcribe a full local audio file into enriched MusicXML."""
-    path = Path(audio_path)
+    """Convert and enrich a digital symbolic score (.musicxml, .mxl, .mid, .krn, .mei, .abc, .gp3-.gp5, .mscz)."""
+    path = Path(score_path)
     _require_existing_file(path)
 
-    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
-        wav_path = artifact_dir / "audio.wav"
-        normalize_audio_to_wav(path, wav_path, sample_rate=44100)
-        return _run_audio_pipeline(wav_path, artifact_dir, cfg, title=path.stem)
+    def _produce(_artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
+        loaded = load_digital_score(path, quantize_divisors=cfg.quantize_divisors)
+        selected = select_and_adapt_parts(
+            loaded.score,
+            instrument=cfg.instrument,
+            part_selector=cfg.part,
+            is_sounding_pitch_source=loaded.is_sounding_pitch_source,
+        )
+        return _ProducedScore(
+            score=selected.score,
+            harmonic_reference_score=loaded.score,
+            backend=loaded.backend,
+            selected_part=selected.selected_part,
+            warnings=[*loaded.warnings, *selected.warnings],
+        )
 
     return _run_cached_job(
-        SourceType.AUDIO,
+        SourceType.DIGITAL,
         hash_file(path),
         str(path),
         instrument,
@@ -386,7 +249,7 @@ def transcribe_audio(
         output_path,
         config,
         _produce,
-        title=path.stem,
+        fallback_title=path.stem,
     )
 
 
@@ -396,18 +259,26 @@ def transcribe_pdf(
     output_path: Path | None = None,
     config: TranscriptionConfig | None = None,
 ) -> TranscriptionResult:
-    """Run OMR on a sheet music PDF and enrich with chords and ergonomic fingerings."""
+    """Fallback OMR on a sheet music PDF followed by part selection, chords, and fingerings."""
     path = Path(pdf_path)
     _require_existing_file(path, expected_suffix=".pdf")
 
     def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
-        score = transcribe_pdf_omr(path, artifact_dir, instrument=cfg.instrument, dpi=cfg.pdf_dpi)
+        raw_score = transcribe_pdf_omr(
+            path, artifact_dir, instrument=cfg.instrument, dpi=cfg.pdf_dpi
+        )
+        selected = select_and_adapt_parts(
+            raw_score,
+            instrument=cfg.instrument,
+            part_selector=cfg.part,
+            is_sounding_pitch_source=False,
+        )
         return _ProducedScore(
-            score=score,
-            warnings=[],
-            audio_wav_path=None,
+            score=selected.score,
+            harmonic_reference_score=raw_score,
             backend="homr",
-            device_used=None,
+            selected_part=selected.selected_part,
+            warnings=selected.warnings,
         )
 
     return _run_cached_job(
@@ -419,5 +290,19 @@ def transcribe_pdf(
         output_path,
         config,
         _produce,
-        title=path.stem,
+        fallback_title=path.stem,
     )
+
+
+def convert_music(
+    input_path: Path | str,
+    instrument: Instrument | str,
+    output_path: Path | None = None,
+    config: TranscriptionConfig | None = None,
+) -> TranscriptionResult:
+    """Auto-route a digital symbolic file (primary) or PDF sheet scan (fallback) to MusicXML."""
+    path = Path(input_path)
+    _require_existing_file(path)
+    if path.suffix.lower() == ".pdf":
+        return transcribe_pdf(path, instrument=instrument, output_path=output_path, config=config)
+    return transcribe_score(path, instrument=instrument, output_path=output_path, config=config)

@@ -1,19 +1,37 @@
 # transcribe-music
 
-A fast, local-first Python CLI, SDK, and **Marimo** workbench that converts **YouTube videos**, **audio files**, or **sheet music PDFs** into validated **MusicXML** containing **notes, durations, measures, chord symbols (`<harmony>`), guitar TAB (`<string>`, `<fret>`), and ergonomic fingerings (`<fingering>`)** for:
+A fast, local-first Python CLI, SDK, and **Marimo** workbench that converts **digital symbolic music scores** (primary source of truth) — or **sheet music PDFs** as an OMR fallback — into validated **MusicXML** enriched with **chord symbols (`<harmony>`), guitar TAB (`<string>`, `<fret>`), and ergonomic fingerings (`<fingering>`)** for:
 
-- **Piano** (Grand Staff split, bundled `Transkun` v2 + O(N) Viterbi fingering solver)
-- **Guitar** (Treble `8vb` transposition, fast `MR-MT3` + 6-string Viterbi TAB & chord-grip solver)
-- **Violin** (Solo/concerto salience pruning + 4-string Viterbi position solver)
-- **Cello** (Solo/concerto salience pruning + `Tutti` rest cues + 4-string closed/extended/thumb solver)
+- **Piano** (Grand Staff RH/LH splitting or native 2-staff preservation + O(N) Viterbi fingering solver)
+- **Guitar** (Treble `8vb` written-pitch normalization + 6-string Viterbi TAB & chord-grip solver)
+- **Violin** (4-string Viterbi position solver)
+- **Cello** (Preserves Bass/Tenor/Treble clefs + 4-string closed/extended/thumb `T` solver)
 
-Powered by modern Python tooling: **`uv`**, **`duckdb`** (content-addressed job cache), and optional **`marimo` + `verovio`** (`--extra ui` reactive workbench with inline SVG engraving).
+Powered by **`uv`**, **`music21`**, **`converter21`**, **`pyguitarpro`**, **`duckdb`**, and optional **`marimo` + `verovio`**.
+
+---
+
+## Supported Input Formats
+
+### 1. Digital Symbolic Files (Primary — 99–100% Note Fidelity, < 0.5s)
+- **MusicXML**: `.musicxml`, `.xml`, `.mxl`
+- **Humdrum / MEI / ABC** (via `converter21`): `.krn`, `.mei`, `.abc`
+- **MIDI**: `.mid`, `.midi` (quantized cleanly + auto-split Piano Grand Staff)
+- **Guitar Pro** (via `pyguitarpro`): `.gp3`, `.gp4`, `.gp5`
+- **MuseScore** (when MuseScore Studio CLI is installed locally): `.mscz`, `.mscx`
+
+**Where to get free digital scores:**
+- **Classical / Public Domain**: **PDMX** (250k+ MusicXML scores), **OpenScore** (curated chamber/lieder/orchestral `.mxl`), **MuseScore.com**, **KernScores** (`.krn`), and **IMSLP** (`.mxl`/`.mid` attachments or Solo Part PDFs).
+- **Modern / Rock / Pop / Anime**: **MuseScore.com** (`.mxl`/`.mscz`) or **Guitar Pro tabs** (`.gp5` via Ultimate Guitar / Songsterr).
+
+### 2. Sheet Music PDFs (Fallback OMR)
+- **`.pdf`**: Rasterized with `pymupdf` and processed in a single batched **`homr`** Vision Transformer pass via `uvx` Python 3.14. Best accuracy on clean solo instrument parts rather than full orchestral conductor scores.
 
 ---
 
 ## Quickstart
 
-Requires **uv** (Python `3.14` managed automatically via `.python-version`). `pymupdf` handles PDFs and `imageio-ffmpeg` bundles FFmpeg if not installed on the system.
+Requires **uv** (Python `3.14` managed automatically via `.python-version`).
 
 ```bash
 # Core CLI + SDK
@@ -29,28 +47,29 @@ uv sync --all-extras
 ### CLI Usage
 
 ```bash
-# 1. YouTube video (defaults to the whole video; pass optional --start and/or --end to slice)
-uv run transcribe-music youtube "https://www.youtube.com/watch?v=..." \
-  --instrument cello -o suite_prelude.musicxml
-uv run transcribe-music youtube "https://www.youtube.com/watch?v=..." \
-  --start 0:42 --end 2:15 --instrument cello -o suite_prelude_slice.musicxml
+# 1. Inspect parts/tracks inside a multi-part digital score
+uv run transcribe-music inspect haydn_cello_concerto.mxl
 
-# 2. Full local audio file (WAV / MP3 / FLAC / M4A)
-uv run transcribe-music audio guitar_solo.mp3 \
-  --instrument guitar -o guitar_solo.musicxml
+# 2. Convert any digital score (or fallback PDF) with automatic part selection
+uv run transcribe-music convert haydn_cello_concerto.mxl \
+  --instrument cello -o haydn_cello_fingered.musicxml
 
-# 3. Piano or cello concerto excerpt (isolates soloist track & marks Tutti rests)
-uv run transcribe-music audio concerto.mp3 \
-  --instrument piano --mode concerto -o concerto_piano.musicxml
+# 3. Override part selection explicitly by part number or name
+uv run transcribe-music score suite_or_sonata.mid \
+  --instrument cello --part "Solo Cello" -o solo_cello.musicxml
 
-# 4. Sheet music PDF (.pdf only; runs homr Vision Transformer OMR via uvx Python 3.14)
-uv run transcribe-music pdf score.pdf \
-  --instrument piano -o score_fingered.musicxml
+# 4. Guitar Pro tab -> MusicXML with chords & ergonomic 6-string TAB/fingerings
+uv run transcribe-music convert song.gp5 \
+  --instrument guitar -o song_guitar.musicxml
 
-# 5. Launch the Marimo Interactive Workbench + Verovio SVG viewer + DuckDB explorer
+# 5. Sheet music PDF fallback (batched homr OMR via uvx Python 3.14)
+uv run transcribe-music pdf solo_cello_part.pdf \
+  --instrument cello -o cello_from_pdf.musicxml
+
+# 6. Launch the Marimo Interactive Workbench + Verovio SVG viewer + DuckDB explorer
 uv run transcribe-music ui
 
-# 6. Inspect or clear the DuckDB cache
+# 7. Inspect or clear the DuckDB cache
 uv run transcribe-music cache list
 uv run transcribe-music cache clear
 ```
@@ -58,27 +77,29 @@ uv run transcribe-music cache clear
 ### Python SDK Usage
 
 ```python
-from transcribe_music import Instrument, transcribe_audio, transcribe_pdf, transcribe_youtube
+from transcribe_music import Instrument, convert_music, inspect_score
 
-res = transcribe_youtube(
-    url="https://www.youtube.com/watch?v=...",
-    instrument=Instrument.GUITAR,
-    start="1:05",  # optional; omit start & end for the whole video
-    end="2:30",
-    output_path="out/guitar.musicxml",
+inspection = inspect_score("haydn_cello_concerto.mxl")
+print([(p.index, p.name, p.measure_count) for p in inspection.parts])
+
+res = convert_music(
+    input_path="haydn_cello_concerto.mxl",
+    instrument=Instrument.CELLO,
+    output_path="out/haydn_cello.musicxml",
 )
-print(res.musicxml_path, res.note_count, res.chord_count, res.fingering_count)
+print(res.musicxml_path, res.selected_part, res.note_count, res.chord_count, res.fingering_count)
 ```
 
 ---
 
 ## Architecture Highlights
 
-1. **Guaranteed Baseline MusicXML Contract**: Every score passes through `music21` structural normalization (`makeMeasures`, `makeRests`, clefs, transpositions, time/key signatures) and XML validation so downstream apps always receive valid notes, durations, and complete measures.
-2. **Progressive Non-Destructive Enrichment**:
-   - **Chords (`<harmony>`)**: Hybrid symbolic + acoustic CQT chroma Viterbi HMM.
+1. **Digital-First Multi-Part Selection**: Isolates the target soloist part from full ensemble scores (or splits single-track Piano MIDI into Grand Staff `RH` + `LH`) while computing harmonic chroma from the **full ensemble** so solo parts inherit accurate accompaniment `<harmony>` chords.
+2. **Non-Destructive MusicXML Normalization & Strict Validation**: Preserves authored measures, key/time signatures, and clef transitions (e.g., Cello Bass/Tenor/Treble) while enforcing strict bar-duration integrity (zero duplicate whole-bar rests or overfull measures).
+3. **Pure-Symbolic Enrichment**:
+   - **Chords (`<harmony>`)**: Symbolic pitch-class Viterbi HMM.
    - **Fingerings (`<technical><fingering>`)**: Unified O(N) Viterbi solvers for Piano, Guitar (`<string>` + `<fret>`), Violin, and Cello (including thumb position `T`).
-3. **DuckDB Catalog (`catalog.duckdb`)**: Content-addressed job caching queryable via `transcribe-music cache list` or the Marimo UI (`--no-cache` bypasses the database completely).
+4. **DuckDB Catalog (`catalog.duckdb`)**: Content-addressed job caching queryable via `transcribe-music cache list` or the Marimo UI (`--no-cache` bypasses the database).
 
 ## Development & Testing
 

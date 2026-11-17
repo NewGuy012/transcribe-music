@@ -92,7 +92,10 @@ def _coerce_to_score(
 
     if score.metadata is None:
         score.metadata = music21.metadata.Metadata()
-    if not score.metadata.title:
+    resolved_title = (score.metadata.title or score.metadata.movementName or "").strip()
+    if resolved_title and resolved_title != "Music21 Fragment":
+        score.metadata.title = resolved_title
+    else:
         score.metadata.title = default_title
     return score, warnings
 
