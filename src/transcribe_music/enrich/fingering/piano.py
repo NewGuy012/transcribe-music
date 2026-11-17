@@ -8,7 +8,7 @@ from itertools import combinations
 import music21
 
 from transcribe_music.enrich.fingering.viterbi import solve_viterbi
-from transcribe_music.export.musicxml import sorted_playable_notes
+from transcribe_music.export.musicxml import clear_technical_articulations, sorted_playable_notes
 
 # White-key x coordinates in white-key units (~2.35 cm); black keys sit at half-steps.
 _KEY_X = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0)
@@ -49,10 +49,7 @@ def _annotate_single_part(part: music21.stream.Part, side: str) -> None:
     if not elements:
         return
 
-    for el in elements:
-        el.articulations = [
-            a for a in el.articulations if not isinstance(a, music21.articulations.Fingering)
-        ]
+    clear_technical_articulations(elements, music21.articulations.Fingering)
 
     ordered_indices: list[list[int]] = []
     steps: list[list[_PianoPose]] = []

@@ -6,7 +6,7 @@ import importlib.util
 import subprocess
 import sys
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import typer
 from rich.console import Console
@@ -26,6 +26,16 @@ app.add_typer(cache_app, name="cache")
 
 console = Console()
 
+InstrumentOpt = Annotated[Instrument, typer.Option(..., "--instrument", "-i", help="Target instrument.")]
+OutputOpt = Annotated[Path | None, typer.Option("--output", "-o", help="Output .musicxml path.")]
+ModeOpt = Annotated[Literal["auto", "solo", "concerto"], typer.Option("--mode", help="Solo vs concerto handling.")]
+DeviceOpt = Annotated[Literal["auto", "mps", "cpu"], typer.Option("--device", help="Torch compute device.")]
+ChordsOpt = Annotated[bool, typer.Option("--chords/--no-chords", help="Annotate chord symbols.")]
+FingeringOpt = Annotated[bool, typer.Option("--fingering/--no-fingering", help="Annotate fingerings/TAB.")]
+CacheOpt = Annotated[bool, typer.Option("--cache/--no-cache", help="Use DuckDB cache.")]
+TempoOpt = Annotated[float | None, typer.Option("--tempo", help="Override BPM instead of auto beat tracking.")]
+CacheDirOpt = Annotated[Path, typer.Option("--cache-dir", help="Cache directory.")]
+
 
 def _print_result(res: TranscriptionResult) -> None:
     table = Table(title="Transcription Complete", show_header=False)
@@ -43,18 +53,29 @@ def _print_result(res: TranscriptionResult) -> None:
         console.print(f"[yellow]Warning:[/yellow] {warn}")
 
 
-def _build_config(
-    instrument: Instrument,
-    mode: Literal["auto", "solo", "concerto"],
-    device: Literal["auto", "mps", "cpu"],
-    chords: bool,
-    fingering: bool,
-    cache: bool,
-    tempo: float | None,
-    cache_dir: Path,
-    dpi: int = 300,
-) -> TranscriptionConfig:
-    return TranscriptionConfig(
+@app.command()
+def youtube(
+    url: Annotated[str, typer.Argument(help="YouTube video URL.")],
+    instrument: InstrumentOpt,
+    start: Annotated[
+        str | None,
+        typer.Option("--start", "-s", help="Optional start timestamp (e.g. '0:42' or '42')."),
+    ] = None,
+    end: Annotated[
+        str | None,
+        typer.Option("--end", "-e", help="Optional end timestamp (e.g. '2:15' or '135')."),
+    ] = None,
+    output: OutputOpt = None,
+    mode: ModeOpt = "auto",
+    device: DeviceOpt = "auto",
+    chords: ChordsOpt = True,
+    fingering: FingeringOpt = True,
+    cache: CacheOpt = True,
+    tempo: TempoOpt = None,
+    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
+) -> None:
+    """Download a YouTube video (or optional start/end slice) and transcribe it to MusicXML."""
+    cfg = TranscriptionConfig(
         instrument=instrument,
         concerto_mode=mode,
         device=device,
@@ -63,81 +84,71 @@ def _build_config(
         use_cache=cache,
         tempo_bpm=tempo,
         cache_dir=cache_dir,
-        pdf_dpi=dpi,
     )
-
-
-@app.command()
-def youtube(
-    url: str = typer.Argument(..., help="YouTube video URL."),
-    start: str | None = typer.Option(
-        None,
-        "--start",
-        "-s",
-        help="Optional start timestamp (e.g. '0:42' or '42'). Defaults to start of video.",
-    ),
-    end: str | None = typer.Option(
-        None,
-        "--end",
-        "-e",
-        help="Optional end timestamp (e.g. '2:15' or '135'). Defaults to end of video.",
-    ),
-    instrument: Instrument = typer.Option(..., "--instrument", "-i", help="Target instrument."),
-    output: Path | None = typer.Option(None, "--output", "-o", help="Output .musicxml path."),
-    mode: Literal["auto", "solo", "concerto"] = typer.Option("auto", "--mode", help="Solo vs concerto handling."),
-    device: Literal["auto", "mps", "cpu"] = typer.Option("auto", "--device", help="Torch compute device."),
-    chords: bool = typer.Option(True, "--chords/--no-chords", help="Annotate chord symbols."),
-    fingering: bool = typer.Option(True, "--fingering/--no-fingering", help="Annotate fingerings/TAB."),
-    cache: bool = typer.Option(True, "--cache/--no-cache", help="Use DuckDB cache."),
-    tempo: float | None = typer.Option(None, "--tempo", help="Override BPM instead of auto beat tracking."),
-    cache_dir: Path = typer.Option(Path(".transcribe_cache"), "--cache-dir", help="Cache directory."),
-) -> None:
-    """Download a YouTube video (or optional start/end slice) and transcribe it to MusicXML."""
-    cfg = _build_config(instrument, mode, device, chords, fingering, cache, tempo, cache_dir)
     res = transcribe_youtube(url=url, instrument=instrument, start=start, end=end, output_path=output, config=cfg)
     _print_result(res)
 
 
 @app.command()
 def audio(
-    audio_file: Path = typer.Argument(..., exists=True, readable=True, help="Local audio file (WAV/MP3/FLAC/M4A)."),
-    instrument: Instrument = typer.Option(..., "--instrument", "-i", help="Target instrument."),
-    output: Path | None = typer.Option(None, "--output", "-o", help="Output .musicxml path."),
-    mode: Literal["auto", "solo", "concerto"] = typer.Option("auto", "--mode", help="Solo vs concerto handling."),
-    device: Literal["auto", "mps", "cpu"] = typer.Option("auto", "--device", help="Torch compute device."),
-    chords: bool = typer.Option(True, "--chords/--no-chords", help="Annotate chord symbols."),
-    fingering: bool = typer.Option(True, "--fingering/--no-fingering", help="Annotate fingerings/TAB."),
-    cache: bool = typer.Option(True, "--cache/--no-cache", help="Use DuckDB cache."),
-    tempo: float | None = typer.Option(None, "--tempo", help="Override BPM instead of auto beat tracking."),
-    cache_dir: Path = typer.Option(Path(".transcribe_cache"), "--cache-dir", help="Cache directory."),
+    audio_file: Annotated[
+        Path, typer.Argument(exists=True, readable=True, help="Local audio file (WAV/MP3/FLAC/M4A).")
+    ],
+    instrument: InstrumentOpt,
+    output: OutputOpt = None,
+    mode: ModeOpt = "auto",
+    device: DeviceOpt = "auto",
+    chords: ChordsOpt = True,
+    fingering: FingeringOpt = True,
+    cache: CacheOpt = True,
+    tempo: TempoOpt = None,
+    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
     """Transcribe a full local audio file into MusicXML."""
-    cfg = _build_config(instrument, mode, device, chords, fingering, cache, tempo, cache_dir)
+    cfg = TranscriptionConfig(
+        instrument=instrument,
+        concerto_mode=mode,
+        device=device,
+        enrich_chords=chords,
+        enrich_fingering=fingering,
+        use_cache=cache,
+        tempo_bpm=tempo,
+        cache_dir=cache_dir,
+    )
     res = transcribe_audio(audio_path=audio_file, instrument=instrument, output_path=output, config=cfg)
     _print_result(res)
 
 
 @app.command()
 def pdf(
-    pdf_file: Path = typer.Argument(..., exists=True, readable=True, help="Sheet music .pdf file."),
-    instrument: Instrument = typer.Option(..., "--instrument", "-i", help="Target instrument."),
-    output: Path | None = typer.Option(None, "--output", "-o", help="Output .musicxml path."),
-    dpi: int = typer.Option(300, "--dpi", help="PDF rasterization DPI for OMR."),
-    chords: bool = typer.Option(True, "--chords/--no-chords", help="Annotate chord symbols."),
-    fingering: bool = typer.Option(True, "--fingering/--no-fingering", help="Annotate fingerings/TAB."),
-    cache: bool = typer.Option(True, "--cache/--no-cache", help="Use DuckDB cache."),
-    cache_dir: Path = typer.Option(Path(".transcribe_cache"), "--cache-dir", help="Cache directory."),
+    pdf_file: Annotated[
+        Path, typer.Argument(exists=True, readable=True, help="Sheet music .pdf file.")
+    ],
+    instrument: InstrumentOpt,
+    output: OutputOpt = None,
+    dpi: Annotated[int, typer.Option("--dpi", help="PDF rasterization DPI for OMR.")] = 300,
+    chords: ChordsOpt = True,
+    fingering: FingeringOpt = True,
+    cache: CacheOpt = True,
+    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
     """Run OMR on a sheet music PDF and enrich with chords and fingerings."""
-    cfg = _build_config(instrument, "auto", "auto", chords, fingering, cache, None, cache_dir, dpi=dpi)
+    cfg = TranscriptionConfig(
+        instrument=instrument,
+        enrich_chords=chords,
+        enrich_fingering=fingering,
+        use_cache=cache,
+        cache_dir=cache_dir,
+        pdf_dpi=dpi,
+    )
     res = transcribe_pdf(pdf_path=pdf_file, instrument=instrument, output_path=output, config=cfg)
     _print_result(res)
 
 
 @app.command()
 def ui(
-    port: int = typer.Option(2718, "--port", help="Port for Marimo workbench."),
-    edit: bool = typer.Option(False, "--edit", help="Launch in Marimo notebook edit mode."),
+    port: Annotated[int, typer.Option("--port", help="Port for Marimo workbench.")] = 2718,
+    edit: Annotated[bool, typer.Option("--edit", help="Launch in Marimo notebook edit mode.")] = False,
 ) -> None:
     """Launch the interactive Marimo + Verovio + DuckDB workbench."""
     missing = [pkg for pkg in ("marimo", "verovio") if importlib.util.find_spec(pkg) is None]
@@ -164,8 +175,8 @@ def ui(
 
 @cache_app.command("list")
 def cache_list(
-    limit: int = typer.Option(20, "--limit", "-n", help="Max jobs to show."),
-    cache_dir: Path = typer.Option(Path(".transcribe_cache"), "--cache-dir", help="Cache directory."),
+    limit: Annotated[int, typer.Option("--limit", "-n", help="Max jobs to show.")] = 20,
+    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
     """List cached transcription jobs stored in DuckDB."""
     store = CatalogStore(cache_dir)
@@ -191,9 +202,7 @@ def cache_list(
 
 
 @cache_app.command("clear")
-def cache_clear(
-    cache_dir: Path = typer.Option(Path(".transcribe_cache"), "--cache-dir", help="Cache directory."),
-) -> None:
+def cache_clear(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
     """Clear cached entries in DuckDB."""
     store = CatalogStore(cache_dir)
     removed = store.clear_cache()

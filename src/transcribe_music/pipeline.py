@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import music21
@@ -180,51 +181,42 @@ def _normalize_timestamp_input(value: str | float | None) -> str | float | None:
     return value
 
 
-def transcribe_youtube(
-    url: str,
+def _require_existing_file(path: Path, expected_suffix: str | None = None) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+    if expected_suffix and path.suffix.lower() != expected_suffix:
+        raise ValueError(f"Expected a {expected_suffix} file, got: {path.suffix}")
+
+
+def _run_cached_job(
+    source_type: SourceType,
+    source_identity: str,
+    source_ref: str,
     instrument: Instrument | str,
-    start: str | float | None = None,
-    end: str | float | None = None,
-    output_path: Path | None = None,
-    config: TranscriptionConfig | None = None,
+    default_stem: str,
+    output_path: Path | None,
+    config: TranscriptionConfig | None,
+    produce_score: Callable[[Path, TranscriptionConfig], tuple[music21.stream.Score, list[str], Path | None]],
+    *,
+    title: str,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
 ) -> TranscriptionResult:
-    """Download a YouTube video (or optional [start, end] slice) and transcribe it to MusicXML."""
     t_start = time.perf_counter()
     inst = Instrument(instrument)
     cfg = config or TranscriptionConfig(instrument=inst)
     if cfg.instrument != inst:
         cfg = cfg.model_copy(update={"instrument": inst})
 
-    start_val = _normalize_timestamp_input(start)
-    end_val = _normalize_timestamp_input(end)
-    time_range = (
-        None
-        if (start_val is None and end_val is None)
-        else TimeRange.from_inputs(start_val, end_val)
-    )
-    start_sec = time_range.start_sec if time_range is not None else None
-    end_sec = time_range.end_sec if time_range is not None else None
-
-    video_id = extract_youtube_id(url)
     store = CatalogStore(cfg.cache_dir)
     job_hash = compute_job_hash(
-        SourceType.YOUTUBE,
-        video_id,
+        source_type,
+        source_identity,
         cfg,
         start_sec=start_sec,
         end_sec=end_sec,
     )
     artifact_dir = store.artifact_dir(job_hash)
-    if time_range is None:
-        default_stem = f"yt_{video_id}"
-        pipeline_title = f"YouTube {video_id}"
-    elif time_range.end_sec is None:
-        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_end"
-        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-end)"
-    else:
-        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_{int(time_range.end_sec)}"
-        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-{int(time_range.end_sec)}s)"
-
     final_out = _resolve_output_path(output_path, default_stem, inst, artifact_dir)
 
     if cfg.use_cache:
@@ -238,15 +230,12 @@ def transcribe_youtube(
                 }
             )
 
-    wav_path = artifact_dir / ("yt_audio.wav" if time_range is None else "yt_slice.wav")
-    download_youtube_slice(url, time_range, wav_path, sample_rate=44100)
-    score, warnings = _run_audio_pipeline(wav_path, artifact_dir, cfg, title=pipeline_title)
-
+    score, warnings, wav_path = produce_score(artifact_dir, cfg)
     return _enrich_and_export(
         score=score,
         config=cfg,
-        source_type=SourceType.YOUTUBE,
-        source_ref=url,
+        source_type=source_type,
+        source_ref=source_ref,
         job_hash=job_hash,
         output_path=final_out,
         store=store,
@@ -255,7 +244,58 @@ def transcribe_youtube(
         audio_wav_path=wav_path,
         start_sec=start_sec,
         end_sec=end_sec,
+        title=title,
+    )
+
+
+def transcribe_youtube(
+    url: str,
+    instrument: Instrument | str,
+    start: str | float | None = None,
+    end: str | float | None = None,
+    output_path: Path | None = None,
+    config: TranscriptionConfig | None = None,
+) -> TranscriptionResult:
+    """Download a YouTube video (or optional [start, end] slice) and transcribe it to MusicXML."""
+    start_val = _normalize_timestamp_input(start)
+    end_val = _normalize_timestamp_input(end)
+    time_range = (
+        None
+        if (start_val is None and end_val is None)
+        else TimeRange.from_inputs(start_val, end_val)
+    )
+    start_sec = time_range.start_sec if time_range is not None else None
+    end_sec = time_range.end_sec if time_range is not None else None
+    video_id = extract_youtube_id(url)
+
+    if time_range is None:
+        default_stem = f"yt_{video_id}"
+        pipeline_title = f"YouTube {video_id}"
+    elif time_range.end_sec is None:
+        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_end"
+        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-end)"
+    else:
+        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_{int(time_range.end_sec)}"
+        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-{int(time_range.end_sec)}s)"
+
+    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> tuple[music21.stream.Score, list[str], Path]:
+        wav_path = artifact_dir / ("yt_audio.wav" if time_range is None else "yt_slice.wav")
+        download_youtube_slice(url, time_range, wav_path, sample_rate=44100)
+        score, warnings = _run_audio_pipeline(wav_path, artifact_dir, cfg, title=pipeline_title)
+        return score, warnings, wav_path
+
+    return _run_cached_job(
+        SourceType.YOUTUBE,
+        video_id,
+        url,
+        instrument,
+        default_stem,
+        output_path,
+        config,
+        _produce,
         title=f"YouTube {video_id}",
+        start_sec=start_sec,
+        end_sec=end_sec,
     )
 
 
@@ -266,49 +306,25 @@ def transcribe_audio(
     config: TranscriptionConfig | None = None,
 ) -> TranscriptionResult:
     """Transcribe a full local audio file into enriched MusicXML."""
-    t_start = time.perf_counter()
-    audio_path = Path(audio_path)
-    if not audio_path.exists():
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    path = Path(audio_path)
+    _require_existing_file(path)
 
-    inst = Instrument(instrument)
-    cfg = config or TranscriptionConfig(instrument=inst)
-    if cfg.instrument != inst:
-        cfg = cfg.model_copy(update={"instrument": inst})
+    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> tuple[music21.stream.Score, list[str], Path]:
+        wav_path = artifact_dir / "audio.wav"
+        normalize_audio_to_wav(path, wav_path, sample_rate=44100)
+        score, warnings = _run_audio_pipeline(wav_path, artifact_dir, cfg, title=path.stem)
+        return score, warnings, wav_path
 
-    store = CatalogStore(cfg.cache_dir)
-    digest = hash_file(audio_path)
-    job_hash = compute_job_hash(SourceType.AUDIO, digest, cfg)
-    artifact_dir = store.artifact_dir(job_hash)
-    final_out = _resolve_output_path(output_path, audio_path.stem, inst, artifact_dir)
-
-    if cfg.use_cache:
-        cached = store.get_cached_job(job_hash)
-        if cached is not None:
-            _copy_if_needed(cached.musicxml_path, final_out)
-            return cached.model_copy(
-                update={
-                    "musicxml_path": final_out,
-                    "elapsed_sec": round(time.perf_counter() - t_start, 3),
-                }
-            )
-
-    wav_path = artifact_dir / "audio.wav"
-    normalize_audio_to_wav(audio_path, wav_path, sample_rate=44100)
-    score, warnings = _run_audio_pipeline(wav_path, artifact_dir, cfg, title=audio_path.stem)
-
-    return _enrich_and_export(
-        score=score,
-        config=cfg,
-        source_type=SourceType.AUDIO,
-        source_ref=str(audio_path),
-        job_hash=job_hash,
-        output_path=final_out,
-        store=store,
-        t_start=t_start,
-        warnings=warnings,
-        audio_wav_path=wav_path,
-        title=audio_path.stem,
+    return _run_cached_job(
+        SourceType.AUDIO,
+        hash_file(path),
+        str(path),
+        instrument,
+        path.stem,
+        output_path,
+        config,
+        _produce,
+        title=path.stem,
     )
 
 
@@ -319,46 +335,21 @@ def transcribe_pdf(
     config: TranscriptionConfig | None = None,
 ) -> TranscriptionResult:
     """Run OMR on a sheet music PDF and enrich with chords and ergonomic fingerings."""
-    t_start = time.perf_counter()
-    pdf_path = Path(pdf_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-    if pdf_path.suffix.lower() != ".pdf":
-        raise ValueError(f"Expected a .pdf file, got: {pdf_path.suffix}")
+    path = Path(pdf_path)
+    _require_existing_file(path, expected_suffix=".pdf")
 
-    inst = Instrument(instrument)
-    cfg = config or TranscriptionConfig(instrument=inst)
-    if cfg.instrument != inst:
-        cfg = cfg.model_copy(update={"instrument": inst})
+    def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> tuple[music21.stream.Score, list[str], None]:
+        score = transcribe_pdf_omr(path, artifact_dir, instrument=cfg.instrument, dpi=cfg.pdf_dpi)
+        return score, [], None
 
-    store = CatalogStore(cfg.cache_dir)
-    digest = hash_file(pdf_path)
-    job_hash = compute_job_hash(SourceType.PDF, digest, cfg)
-    artifact_dir = store.artifact_dir(job_hash)
-    final_out = _resolve_output_path(output_path, pdf_path.stem, inst, artifact_dir)
-
-    if cfg.use_cache:
-        cached = store.get_cached_job(job_hash)
-        if cached is not None:
-            _copy_if_needed(cached.musicxml_path, final_out)
-            return cached.model_copy(
-                update={
-                    "musicxml_path": final_out,
-                    "elapsed_sec": round(time.perf_counter() - t_start, 3),
-                }
-            )
-
-    score = transcribe_pdf_omr(pdf_path, artifact_dir, instrument=inst, dpi=cfg.pdf_dpi)
-    return _enrich_and_export(
-        score=score,
-        config=cfg,
-        source_type=SourceType.PDF,
-        source_ref=str(pdf_path),
-        job_hash=job_hash,
-        output_path=final_out,
-        store=store,
-        t_start=t_start,
-        warnings=[],
-        audio_wav_path=None,
-        title=pdf_path.stem,
+    return _run_cached_job(
+        SourceType.PDF,
+        hash_file(path),
+        str(path),
+        instrument,
+        path.stem,
+        output_path,
+        config,
+        _produce,
+        title=path.stem,
     )

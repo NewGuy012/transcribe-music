@@ -166,6 +166,32 @@ def _mark_tutti_rests(part: music21.stream.Part) -> None:
     _flush(run_start, run_len)
 
 
+def _build_part(
+    part_id: str,
+    events: list[tuple[float, float, int, int]],
+    total_beats: float,
+    bpm: float,
+    clef: music21.clef.Clef | None = None,
+    include_tempo: bool = True,
+    transpose_semitones: int = 0,
+) -> music21.stream.Part:
+    part = music21.stream.Part(id=part_id)
+    if clef is not None:
+        part.insert(0, clef)
+    part.insert(0, music21.meter.TimeSignature("4/4"))
+    if include_tempo:
+        part.insert(0, music21.tempo.MetronomeMark(number=round(bpm, 1)))
+    _populate_part_from_events(part, events, total_beats, transpose_semitones=transpose_semitones)
+    if part.highestTime < total_beats:
+        part.insert(
+            part.highestTime,
+            music21.note.Rest(quarterLength=max(0.25, total_beats - part.highestTime)),
+        )
+    part.makeMeasures(inPlace=True)
+    part.makeRests(fillGaps=True, inPlace=True)
+    return part
+
+
 def midi_to_quantized_score(
     midi: pretty_midi.PrettyMIDI,
     instrument: Instrument,
@@ -184,11 +210,7 @@ def midi_to_quantized_score(
     else:
         bpm, beat_times = estimate_tempo_and_beats(audio_wav_path, fallback_bpm=120.0)
 
-    raw_notes: list[pretty_midi.Note] = []
-    for inst in midi.instruments:
-        if not inst.is_drum:
-            raw_notes.extend(inst.notes)
-
+    raw_notes = [n for inst in midi.instruments if not inst.is_drum for n in inst.notes]
     events: list[tuple[float, float, int, int]] = []
     max_beat = 4.0
     for n in raw_notes:
@@ -202,7 +224,6 @@ def midi_to_quantized_score(
         events.append((onset_b, dur_b, int(n.pitch), int(n.velocity)))
         max_beat = max(max_beat, onset_b + dur_b)
 
-    # Pad to whole 4/4 measure boundary
     total_measures = max(1, int(np.ceil(max_beat / 4.0)))
     total_beats = float(total_measures * 4)
 
@@ -211,46 +232,14 @@ def midi_to_quantized_score(
 
     if instrument == Instrument.PIANO:
         rh_events, lh_events = _split_piano_rh_lh(events)
-        rh_part = music21.stream.Part(id="RH")
-        lh_part = music21.stream.Part(id="LH")
-        rh_part.insert(0, music21.clef.TrebleClef())
-        lh_part.insert(0, music21.clef.BassClef())
-        rh_part.insert(0, music21.meter.TimeSignature("4/4"))
-        lh_part.insert(0, music21.meter.TimeSignature("4/4"))
-        rh_part.insert(0, music21.tempo.MetronomeMark(number=round(bpm, 1)))
-
-        _populate_part_from_events(rh_part, rh_events, total_beats, transpose_semitones=0)
-        _populate_part_from_events(lh_part, lh_events, total_beats, transpose_semitones=0)
-
-        for p in (rh_part, lh_part):
-            if p.highestTime < total_beats:
-                p.insert(
-                    p.highestTime,
-                    music21.note.Rest(quarterLength=max(0.25, total_beats - p.highestTime)),
-                )
-            p.makeMeasures(inPlace=True)
-            p.makeRests(fillGaps=True, inPlace=True)
-
-        score.insert(0, rh_part)
-        score.insert(0, lh_part)
-    else:
-        part = music21.stream.Part(id=instrument.value)
-        part.insert(0, music21.meter.TimeSignature("4/4"))
-        part.insert(0, music21.tempo.MetronomeMark(number=round(bpm, 1)))
-
-        _populate_part_from_events(
-            part,
-            events,
-            total_beats,
-            transpose_semitones=spec.transpose_semitones,
+        score.insert(0, _build_part("RH", rh_events, total_beats, bpm, music21.clef.TrebleClef()))
+        score.insert(
+            0, _build_part("LH", lh_events, total_beats, bpm, music21.clef.BassClef(), include_tempo=False)
         )
-        if part.highestTime < total_beats:
-            part.insert(
-                part.highestTime,
-                music21.note.Rest(quarterLength=max(0.25, total_beats - part.highestTime)),
-            )
-        part.makeMeasures(inPlace=True)
-        part.makeRests(fillGaps=True, inPlace=True)
+    else:
+        part = _build_part(
+            instrument.value, events, total_beats, bpm, transpose_semitones=spec.transpose_semitones
+        )
         if concerto_cues:
             _mark_tutti_rests(part)
         score.insert(0, part)

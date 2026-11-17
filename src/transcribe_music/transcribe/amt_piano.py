@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -22,9 +23,18 @@ def resolve_torch_device(preferred: str = "auto") -> str:
         if preferred == "mps" and not torch.backends.mps.is_available():
             return "cpu"
         return preferred
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+    return "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+def run_with_cpu_fallback[T](preferred: str, fn: Callable[[str], T]) -> T:
+    """Run torch callable on resolved device, falling back to CPU if MPS fails."""
+    resolved = resolve_torch_device(preferred)
+    try:
+        return fn(resolved)
+    except Exception:
+        if resolved != "cpu":
+            return fn("cpu")
+        raise
 
 
 @lru_cache(maxsize=2)
@@ -63,30 +73,17 @@ def transcribe_piano_transkun(
     device: str = "auto",
 ) -> pretty_midi.PrettyMIDI:
     """Transcribe solo piano WAV into PrettyMIDI using bundled Transkun v2 model."""
-    resolved_device = resolve_torch_device(device)
     fs, audio = _read_stereo_float32(wav_path)
 
-    try:
-        model = _load_transkun_model(resolved_device)
-        if fs != model.fs:
-            audio = soxr.resample(audio, fs, model.fs)
-        x = torch.from_numpy(audio).to(resolved_device)
+    def _run(dev: str) -> Any:
+        model = _load_transkun_model(dev)
+        resampled = soxr.resample(audio, fs, model.fs) if fs != model.fs else audio
+        x = torch.from_numpy(resampled).to(dev)
         with torch.inference_mode():
-            notes_est = model.transcribe(x, discardSecondHalf=False)
-    except Exception:
-        if resolved_device != "cpu":
-            # Automatic CPU fallback if any MPS op fails on specific macOS versions
-            model = _load_transkun_model("cpu")
-            if fs != model.fs:
-                audio = soxr.resample(audio, fs, model.fs)
-            x = torch.from_numpy(audio).to("cpu")
-            with torch.inference_mode():
-                notes_est = model.transcribe(x, discardSecondHalf=False)
-        else:
-            raise
+            return model.transcribe(x, discardSecondHalf=False)
 
+    notes_est = run_with_cpu_fallback(device, _run)
     output_midi_path = Path(output_midi_path)
     output_midi_path.parent.mkdir(parents=True, exist_ok=True)
-    out_midi = writeMidi(notes_est)
-    out_midi.write(str(output_midi_path))
+    writeMidi(notes_est).write(str(output_midi_path))
     return pretty_midi.PrettyMIDI(str(output_midi_path))

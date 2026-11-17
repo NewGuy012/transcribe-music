@@ -8,7 +8,7 @@ from itertools import product
 import music21
 
 from transcribe_music.enrich.fingering.viterbi import solve_viterbi
-from transcribe_music.export.musicxml import sorted_playable_notes
+from transcribe_music.export.musicxml import clear_technical_articulations, sorted_playable_notes
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 
 _GUITAR_OPEN_MIDI = INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi  # Strings 1..6 (E4..E2)
@@ -139,19 +139,12 @@ def annotate_guitar_fingering(score: music21.stream.Score) -> music21.stream.Sco
     if not elements:
         return score
 
-    for el in elements:
-        el.articulations = [
-            a
-            for a in el.articulations
-            if not isinstance(
-                a,
-                (
-                    music21.articulations.Fingering,
-                    music21.articulations.StringIndication,
-                    music21.articulations.FretIndication,
-                ),
-            )
-        ]
+    clear_technical_articulations(
+        elements,
+        music21.articulations.Fingering,
+        music21.articulations.StringIndication,
+        music21.articulations.FretIndication,
+    )
 
     states_per_step: list[list[_GuitarPose]] = []
     for el in elements:

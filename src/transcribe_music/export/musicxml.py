@@ -40,6 +40,15 @@ def sorted_playable_notes(
     return sorted(items, key=lambda el: float(el.getOffsetInHierarchy(part)))
 
 
+def clear_technical_articulations(
+    elements: list[music21.note.Note | music21.chord.Chord],
+    *articulation_types: type[music21.articulations.Articulation],
+) -> None:
+    """Remove any existing technical articulations of the given types before re-annotating."""
+    for el in elements:
+        el.articulations = [a for a in el.articulations if not isinstance(a, articulation_types)]
+
+
 def _make_music21_instrument(instrument: Instrument) -> music21.instrument.Instrument:
     if instrument == Instrument.PIANO:
         return music21.instrument.Piano()

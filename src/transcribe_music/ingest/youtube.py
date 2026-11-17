@@ -61,12 +61,6 @@ def download_youtube_slice(
         "noplaylist": True,
         "ffmpeg_location": str(Path(ffmpeg_path).parent),
         "outtmpl": f"{raw_stem}.%(ext)s",
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-            }
-        ],
     }
 
     has_slice = time_range is not None and (

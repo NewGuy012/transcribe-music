@@ -135,34 +135,23 @@ def _viterbi_chords(
     sims = chroma_windows @ _TEMPLATE_MATRIX.T  # (W, S)
 
     if bass_pcs is not None:
-        root_pcs = np.array([t.root_pc for t in _TEMPLATES], dtype=np.int32)
-        for w, b_pc in enumerate(bass_pcs):
-            if b_pc is not None:
-                sims[w, root_pcs == b_pc] += 0.12
-            # Penalize chords whose root pitch class is completely silent in this window
-            for s_idx, r_pc in enumerate(root_pcs):
-                if chroma_windows[w, r_pc] < 1e-3:
-                    sims[w, s_idx] -= 0.20
+        root_pcs = np.array([t.root_pc for t in _TEMPLATES], dtype=np.intp)
+        bass_arr = np.array([-1 if b is None else b for b in bass_pcs], dtype=np.intp)
+        sims += (bass_arr[:, None] == root_pcs[None, :]) * 0.12
+        sims -= (chroma_windows[:, root_pcs] < 1e-3) * 0.20
 
-    # Identify silent windows (no harmonic content at all)
     energies = np.linalg.norm(chroma_windows, axis=1)
-
     dp = np.zeros((n_win, n_states), dtype=np.float64)
     back = np.zeros((n_win, n_states), dtype=np.int32)
     dp[0] = sims[0]
+    state_ids = np.arange(n_states, dtype=np.int32)
 
     for t in range(1, n_win):
         prev_best_idx = int(np.argmax(dp[t - 1]))
-        prev_best_val = dp[t - 1, prev_best_idx]
-        for s in range(n_states):
-            stay_val = dp[t - 1, s]
-            switch_val = prev_best_val - switch_penalty
-            if stay_val >= switch_val:
-                dp[t, s] = stay_val + sims[t, s]
-                back[t, s] = s
-            else:
-                dp[t, s] = switch_val + sims[t, s]
-                back[t, s] = prev_best_idx
+        switch_val = dp[t - 1, prev_best_idx] - switch_penalty
+        stay_mask = dp[t - 1] >= switch_val
+        dp[t] = np.where(stay_mask, dp[t - 1], switch_val) + sims[t]
+        back[t] = np.where(stay_mask, state_ids, prev_best_idx)
 
     best_states = np.zeros(n_win, dtype=np.int32)
     best_states[-1] = int(np.argmax(dp[-1]))

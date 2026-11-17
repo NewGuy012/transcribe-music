@@ -9,8 +9,8 @@ from pathlib import Path
 import pretty_midi
 
 from transcribe_music.ingest.audio import load_mono_audio
-from transcribe_music.models import INSTRUMENT_SPECS, Instrument
-from transcribe_music.transcribe.amt_piano import resolve_torch_device
+from transcribe_music.models import INSTRUMENT_SPECS, Instrument, InstrumentSpec
+from transcribe_music.transcribe.amt_piano import run_with_cpu_fallback
 
 _YOURMT3_CKPT_REL = (
     "yourmt3/mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b36_nops/last.ckpt"
@@ -39,50 +39,15 @@ def _mido_to_pretty_midi(midi_obj, temp_path: Path) -> pretty_midi.PrettyMIDI:
     return pretty_midi.PrettyMIDI(str(temp_path))
 
 
-def _filter_pretty_midi_for_instrument(
-    full_midi: pretty_midi.PrettyMIDI,
-    instrument: Instrument,
-    warnings: list[str],
+def _extract_in_range_track(
+    tracks: list[pretty_midi.Instrument],
+    spec: InstrumentSpec,
 ) -> pretty_midi.PrettyMIDI:
-    """Select target soloist tracks from multi-track MT3 MIDI with pitch/program checks."""
-    spec = INSTRUMENT_SPECS[instrument]
-    non_drum = [inst for inst in full_midi.instruments if not inst.is_drum and inst.notes]
-    if not non_drum:
-        return pretty_midi.PrettyMIDI(initial_tempo=120.0)
-
-    exact_tracks = [inst for inst in non_drum if inst.program in spec.gm_programs]
-    selected_tracks = exact_tracks
-
-    if not selected_tracks and spec.ensemble_fallback_programs:
-        selected_tracks = [
-            inst for inst in non_drum if inst.program in spec.ensemble_fallback_programs
-        ]
-        if selected_tracks:
-            warnings.append(
-                f"No dedicated {spec.display_name} GM track detected; extracted ensemble strings "
-                "constrained to soloist pitch register."
-            )
-
-    if not selected_tracks:
-        # Fallback: pick the track with the highest proportion of in-range notes
-        def _in_range_score(inst: pretty_midi.Instrument) -> tuple[int, int]:
-            in_range = sum(1 for n in inst.notes if spec.midi_min <= n.pitch <= spec.midi_max)
-            return (in_range, len(inst.notes))
-
-        best = max(non_drum, key=_in_range_score)
-        selected_tracks = [best]
-        warnings.append(
-            f"Target GM program for {spec.display_name} absent; used dominant in-range track "
-            f"(program {best.program})."
-        )
-
     out = pretty_midi.PrettyMIDI(initial_tempo=120.0)
-    merged = pretty_midi.Instrument(
-        program=spec.gm_programs[0],
-        is_drum=False,
-        name=spec.display_name,
-    )
-    for track in selected_tracks:
+    merged = pretty_midi.Instrument(program=spec.gm_programs[0], name=spec.display_name)
+    for track in tracks:
+        if track.is_drum:
+            continue
         for note in track.notes:
             if spec.midi_min <= note.pitch <= spec.midi_max:
                 merged.notes.append(
@@ -96,6 +61,43 @@ def _filter_pretty_midi_for_instrument(
     merged.notes.sort(key=lambda n: (n.start, n.pitch))
     out.instruments.append(merged)
     return out
+
+
+def _filter_pretty_midi_for_instrument(
+    full_midi: pretty_midi.PrettyMIDI,
+    instrument: Instrument,
+    warnings: list[str],
+) -> pretty_midi.PrettyMIDI:
+    """Select target soloist tracks from multi-track MT3 MIDI with pitch/program checks."""
+    spec = INSTRUMENT_SPECS[instrument]
+    non_drum = [inst for inst in full_midi.instruments if not inst.is_drum and inst.notes]
+    if not non_drum:
+        return pretty_midi.PrettyMIDI(initial_tempo=120.0)
+
+    selected = [inst for inst in non_drum if inst.program in spec.gm_programs]
+    if not selected and spec.ensemble_fallback_programs:
+        selected = [inst for inst in non_drum if inst.program in spec.ensemble_fallback_programs]
+        if selected:
+            warnings.append(
+                f"No dedicated {spec.display_name} GM track detected; extracted ensemble strings "
+                "constrained to soloist pitch register."
+            )
+
+    if not selected:
+        best = max(
+            non_drum,
+            key=lambda inst: (
+                sum(1 for n in inst.notes if spec.midi_min <= n.pitch <= spec.midi_max),
+                len(inst.notes),
+            ),
+        )
+        selected = [best]
+        warnings.append(
+            f"Target GM program for {spec.display_name} absent; used dominant in-range track "
+            f"(program {best.program})."
+        )
+
+    return _extract_in_range_track(selected, spec)
 
 
 def transcribe_with_mt3(
@@ -115,67 +117,33 @@ def transcribe_with_mt3(
     os.environ.setdefault("MT3_CHECKPOINT_DIR", str(ckpt_root))
 
     mono, sr = load_mono_audio(wav_path, target_sr=16000)
-    # Trim leading/trailing silence? No — preserve exact timeline for beat sync.
     if not mono.size:
-        empty = pretty_midi.PrettyMIDI(initial_tempo=120.0)
-        return empty, ["Input audio slice was empty."]
+        return pretty_midi.PrettyMIDI(initial_tempo=120.0), ["Input audio slice was empty."]
 
-    # Ensure safe float range [-1, 1]
     peak = float(abs(mono).max())
     if peak > 1.0:
         mono = mono / peak
 
-    resolved_device = resolve_torch_device(device)
     model_name = "yourmt3" if use_multi_track else "mr_mt3"
-    ckpt_path: str | None = None
-    if model_name == "yourmt3":
-        ckpt_path = str(_ensure_yourmt3_checkpoint(ckpt_root))
+    ckpt_path = str(_ensure_yourmt3_checkpoint(ckpt_root)) if model_name == "yourmt3" else None
 
-    try:
+    def _run(dev: str):
         model = mt3_infer.load_model(
             model_name,
             checkpoint_path=ckpt_path,
-            device=resolved_device,
+            device=dev,
             auto_download=True,
         )
-        mido_midi = model.transcribe(mono, sr=sr)
-    except Exception:
-        if resolved_device != "cpu":
-            model = mt3_infer.load_model(
-                model_name,
-                checkpoint_path=ckpt_path,
-                device="cpu",
-                auto_download=True,
-            )
-            mido_midi = model.transcribe(mono, sr=sr)
-        else:
-            raise
+        return model.transcribe(mono, sr=sr)
 
+    mido_midi = run_with_cpu_fallback(device, _run)
     raw_midi_path = Path(output_midi_path).with_name(f"{Path(output_midi_path).stem}_raw.mid")
     full_midi = _mido_to_pretty_midi(mido_midi, raw_midi_path)
 
     if use_multi_track:
         solo_midi = _filter_pretty_midi_for_instrument(full_midi, instrument, warnings)
     else:
-        # MR-MT3 combines into one channel; filter by instrument physical range
-        spec = INSTRUMENT_SPECS[instrument]
-        solo_midi = pretty_midi.PrettyMIDI(initial_tempo=120.0)
-        inst = pretty_midi.Instrument(program=spec.gm_programs[0], name=spec.display_name)
-        for tr in full_midi.instruments:
-            if tr.is_drum:
-                continue
-            for n in tr.notes:
-                if spec.midi_min <= n.pitch <= spec.midi_max:
-                    inst.notes.append(
-                        pretty_midi.Note(
-                            velocity=n.velocity,
-                            pitch=n.pitch,
-                            start=n.start,
-                            end=n.end,
-                        )
-                    )
-        inst.notes.sort(key=lambda n: (n.start, n.pitch))
-        solo_midi.instruments.append(inst)
+        solo_midi = _extract_in_range_track(full_midi.instruments, INSTRUMENT_SPECS[instrument])
 
     solo_midi.write(str(output_midi_path))
     return solo_midi, warnings
