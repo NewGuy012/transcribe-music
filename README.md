@@ -13,7 +13,7 @@ Powered by modern Python tooling: **`uv`**, **`duckdb`** (content-addressed job 
 
 ## Quickstart
 
-Requires **uv** (Python `3.15` managed automatically via `.python-version`). `pymupdf` handles PDFs and `imageio-ffmpeg` bundles FFmpeg if not installed on the system.
+Requires **uv** (Python `3.14` managed automatically via `.python-version`). `pymupdf` handles PDFs and `imageio-ffmpeg` bundles FFmpeg if not installed on the system.
 
 ```bash
 # Core CLI + SDK
