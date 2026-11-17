@@ -1,1 +1,1 @@
-"""Input ingestion modules for YouTube slices, audio files, and PDF sheet music."""
+"""Input ingestion modules for digital symbolic scores and fallback PDF sheet music."""

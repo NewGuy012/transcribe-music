@@ -1,1 +1,1 @@
-"""Audio-to-MIDI transcription, concerto filtering, quantization, and PDF OMR."""
+"""Multi-part score selection, instrument adaptation, and fallback PDF OMR."""

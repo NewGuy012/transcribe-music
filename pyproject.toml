@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "transcribe-music"
 version = "0.1.0"
-description = "Fast local Python CLI, SDK, and Marimo workbench to transcribe YouTube slices, audio, and PDF sheet music into MusicXML with chords and instrument fingerings."
+description = "Fast local Python CLI, SDK, and Marimo workbench to convert digital scores and fallback PDF sheet music into validated MusicXML with chords and instrument fingerings."
 readme = "README.md"
 license = "BSD-3-Clause"
 requires-python = ">=3.14,<3.15"
@@ -14,17 +14,10 @@ dependencies = [
     "pydantic",
     "duckdb",
     "music21",
-    "librosa",
-    "soundfile",
+    "converter21",
+    "pyguitarpro",
     "numpy",
-    "soxr",
-    "pretty-midi",
-    "yt-dlp",
-    "imageio-ffmpeg",
     "pymupdf",
-    "mt3-infer[torch]",
-    "transformers>=4.44,<6",
-    "transkun",
 ]
 
 [tool.uv]
