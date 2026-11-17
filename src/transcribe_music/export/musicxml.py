@@ -298,6 +298,7 @@ def normalize_score_structure(
                 part.insert(0, _make_clef(spec.clef_mode, idx))
             _repair_unexportable_durations(part)
             part.makeMeasures(inPlace=True)
+            part.makeNotation(inPlace=True)
             part.makeRests(fillGaps=True, inPlace=True)
             measures = list(part.getElementsByClass(music21.stream.Measure))
 
@@ -321,9 +322,6 @@ def normalize_score_structure(
                     first_m.insert(0, ks)
 
         _repair_unexportable_durations(part)
-        if not had_measures:
-            part.makeNotation(inPlace=True)
-            _repair_unexportable_durations(part)
 
     if instrument == Instrument.PIANO and len(parts) == 2:
         has_brace = any(
@@ -437,14 +435,12 @@ def _validate_part_measures(parts: list[ET.Element]) -> None:
                     dur_txt = child.findtext("duration")
                     if dur_txt is not None:
                         cursor += int(dur_txt)
-                        if cursor > max_cursor:
-                            max_cursor = cursor
+                        max_cursor = max(max_cursor, cursor)
                 elif child.tag == "forward":
                     dur_txt = child.findtext("duration")
                     if dur_txt is not None:
                         cursor += int(dur_txt)
-                        if cursor > max_cursor:
-                            max_cursor = cursor
+                        max_cursor = max(max_cursor, cursor)
                 elif child.tag == "backup":
                     dur_txt = child.findtext("duration")
                     if dur_txt is not None:

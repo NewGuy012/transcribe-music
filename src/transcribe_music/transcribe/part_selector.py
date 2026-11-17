@@ -134,11 +134,11 @@ def _score_part_for_instrument(
 
     if info.clef:
         clef_l = info.clef.lower()
-        if instrument == Instrument.CELLO and ("bass" in clef_l or "tenor" in clef_l):
-            score += 8.0
-        elif instrument == Instrument.VIOLIN and "treble" in clef_l and "8vb" not in clef_l:
-            score += 8.0
-        elif instrument == Instrument.GUITAR and "treble8vb" in clef_l:
+        if (
+            (instrument == Instrument.CELLO and ("bass" in clef_l or "tenor" in clef_l))
+            or (instrument == Instrument.VIOLIN and "treble" in clef_l and "8vb" not in clef_l)
+            or (instrument == Instrument.GUITAR and "treble8vb" in clef_l)
+        ):
             score += 8.0
 
     score += min(info.note_count, 5000) * 0.001
@@ -199,7 +199,7 @@ def _fill_measure_gaps(
         [
             el
             for el in list(measure)
-            if (isinstance(el, music21.note.Note) or isinstance(el, music21.chord.Chord))
+            if isinstance(el, (music21.note.Note, music21.chord.Chord))
             and not isinstance(el, music21.harmony.ChordSymbol)
         ],
         key=lambda e: float(e.offset),
@@ -289,8 +289,8 @@ def _split_single_part_piano(src_part: music21.stream.Part) -> tuple[music21.str
             music21.bar.Barline,
         ):
             for el in m.getElementsByClass(meta_cls):
-                if isinstance(el, music21.tempo.MetronomeMark) or isinstance(
-                    el, music21.expressions.RehearsalMark
+                if isinstance(
+                    el, (music21.tempo.MetronomeMark, music21.expressions.RehearsalMark)
                 ):
                     rh_m.insert(el.offset, copy.deepcopy(el))
                 else:
