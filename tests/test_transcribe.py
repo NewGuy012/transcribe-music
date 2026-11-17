@@ -6,6 +6,7 @@ from pathlib import Path
 import music21
 import numpy as np
 import pretty_midi
+import pytest
 import soundfile as sf
 
 from transcribe_music.export.musicxml import export_musicxml
@@ -219,3 +220,72 @@ def test_mt3_compat_enables_yourmt3_and_mrmt3_inference() -> None:
     with torch.inference_mode():
         mr_out = mr_model.generate(inputs=torch.randn(1, 4, 32), max_length=5)
     assert mr_out.shape[0] == 1
+
+
+def test_mt3_compat_enables_mps_device_for_mrmt3(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import torch
+    from transformers import T5Config
+
+    ensure_mt3_transformers_compat()
+    from mt3_infer.adapters.mr_mt3 import MRMT3Adapter
+    from mt3_infer.models.mr_mt3.t5 import T5ForConditionalGeneration as MRMT3Model
+    from mt3_infer.utils import framework
+
+    expected_dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    assert framework.get_device("mps") == expected_dev
+
+    adapter = MRMT3Adapter()
+    cfg = T5Config.from_dict(adapter.model_config)
+    ckpt = tmp_path / "mt3.pth"
+    torch.save(MRMT3Model(cfg).state_dict(), ckpt)
+    adapter.load_model(str(ckpt), device="mps")
+    assert adapter.device_str == expected_dev
+
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    with pytest.warns(UserWarning, match="MPS requested"):
+        assert framework.get_device("mps") == "cpu"
+
+
+def test_ensure_verified_checkpoint_replaces_corrupt_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import hashlib
+    import io
+
+    from transcribe_music.transcribe import amt_general
+
+    payload = b"valid-mr-mt3-checkpoint-bytes"
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    monkeypatch.setitem(
+        amt_general._CHECKPOINT_SPECS,
+        "mr_mt3",
+        amt_general._CheckpointSpec(
+            rel_path="mr_mt3/mt3.pth",
+            url="https://example.invalid/mt3.pth",
+            sha256=expected_sha,
+            label="MR-MT3",
+        ),
+    )
+
+    corrupt = tmp_path / "mr_mt3" / "mt3.pth"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_bytes(b"corrupted")
+
+    class _FakeResp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        amt_general.urllib.request,
+        "urlopen",
+        lambda url, timeout=120: _FakeResp(payload),
+    )
+    resolved = amt_general._ensure_verified_checkpoint(tmp_path, "mr_mt3")
+    assert resolved == corrupt
+    assert resolved.read_bytes() == payload
+    assert not list(tmp_path.rglob("*.part"))

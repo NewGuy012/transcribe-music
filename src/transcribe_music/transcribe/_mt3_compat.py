@@ -6,6 +6,7 @@ import importlib
 import inspect
 import sys
 import types
+import warnings
 from typing import Any
 
 import torch
@@ -341,9 +342,46 @@ def _ensure_yourmt3_t5_attention() -> None:
     t5mod.T5LayerCrossAttention = _CompatT5LayerCrossAttention
 
 
+def _ensure_framework_mps_device() -> None:
+    """Allow mt3_infer.utils.framework.get_device to resolve Apple Silicon MPS cleanly."""
+    from mt3_infer.utils import framework
+
+    if getattr(framework.get_device, "_mps_compat", False):
+        return
+
+    orig_get_device = framework.get_device
+
+    def get_device_with_mps(device_hint: str | None = None) -> str:
+        hint = "auto" if device_hint is None else device_hint.lower()
+        if hint == "mps":
+            if torch.backends.mps.is_available():
+                try:
+                    probe = torch.zeros(1, device="mps")
+                    del probe
+                    return "mps"
+                except Exception as exc:  # noqa: BLE001 — mirror CUDA fallback behavior
+                    warnings.warn(
+                        f"MPS requested but failed: {exc}. Falling back to CPU.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                    return "cpu"
+            warnings.warn(
+                "MPS requested but not available. Falling back to CPU.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return "cpu"
+        return orig_get_device(device_hint)
+
+    get_device_with_mps._mps_compat = True  # type: ignore[attr-defined]
+    framework.get_device = get_device_with_mps
+
+
 def ensure_mt3_transformers_compat() -> None:
     """Install idempotent compatibility shims so mt3-infer works with modern transformers."""
     _ensure_model_parallel_utils()
     _ensure_pytorch_utils()
     _ensure_pretrained_model_masks()
     _ensure_yourmt3_t5_attention()
+    _ensure_framework_mps_device()

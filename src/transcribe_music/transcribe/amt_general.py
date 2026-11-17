@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 import pretty_midi
@@ -14,34 +15,53 @@ from transcribe_music.storage.catalog import hash_file
 from transcribe_music.transcribe._mt3_compat import ensure_mt3_transformers_compat
 from transcribe_music.transcribe.amt_piano import run_with_cpu_fallback
 
-_YOURMT3_CKPT_REL = (
-    "yourmt3/mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b36_nops/last.ckpt"
-)
-_YOURMT3_HF_URL = (
-    "https://huggingface.co/spaces/mimbres/YourMT3/resolve/main/amt/logs/2024/"
-    "mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b36_nops/checkpoints/last.ckpt"
-)
-_YOURMT3_SHA256 = "ae38e415c79efd5592dcb9b658cdb99ddb11d4c4e1eaa364cab04a052473fc25"
+
+@dataclass(frozen=True)
+class _CheckpointSpec:
+    rel_path: str
+    url: str
+    sha256: str
+    label: str
 
 
-def _ensure_yourmt3_checkpoint(ckpt_root: Path) -> Path:
-    """Download and SHA-256 verify YourMT3 MoE checkpoint via HTTPS."""
-    dest = ckpt_root / _YOURMT3_CKPT_REL
+_CHECKPOINT_SPECS: dict[str, _CheckpointSpec] = {
+    "yourmt3": _CheckpointSpec(
+        rel_path="yourmt3/mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b36_nops/last.ckpt",
+        url=(
+            "https://huggingface.co/spaces/mimbres/YourMT3/resolve/main/amt/logs/2024/"
+            "mc13_256_g4_all_v7_mt3f_sqr_rms_moe_wf4_n8k2_silu_rope_rp_b36_nops/checkpoints/last.ckpt"
+        ),
+        sha256="ae38e415c79efd5592dcb9b658cdb99ddb11d4c4e1eaa364cab04a052473fc25",
+        label="YourMT3",
+    ),
+    "mr_mt3": _CheckpointSpec(
+        rel_path="mr_mt3/mt3.pth",
+        url="https://huggingface.co/gudgud1014/MR-MT3/resolve/main/mt3.pth",
+        sha256="b8a3807ed265059abd25ad7f68142c06c35e8f6144dcaa45bd55946a3745398f",
+        label="MR-MT3",
+    ),
+}
+
+
+def _ensure_verified_checkpoint(ckpt_root: Path, model_name: str) -> Path:
+    """Download atomically via .part file and SHA-256 verify an MT3 model checkpoint."""
+    spec = _CHECKPOINT_SPECS[model_name]
+    dest = ckpt_root / spec.rel_path
     if dest.exists():
-        if hash_file(dest) == _YOURMT3_SHA256:
+        if hash_file(dest) == spec.sha256:
             return dest
         dest.unlink()
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".ckpt.part")
+    tmp = dest.with_suffix(f"{dest.suffix}.part")
     digest = hashlib.sha256()
     try:
-        with urllib.request.urlopen(_YOURMT3_HF_URL, timeout=120) as resp, tmp.open("wb") as out:
+        with urllib.request.urlopen(spec.url, timeout=120) as resp, tmp.open("wb") as out:
             while chunk := resp.read(1024 * 1024):
                 digest.update(chunk)
                 out.write(chunk)
-        if digest.hexdigest() != _YOURMT3_SHA256:
-            raise RuntimeError("YourMT3 checkpoint SHA-256 verification failed")
+        if digest.hexdigest() != spec.sha256:
+            raise RuntimeError(f"{spec.label} checkpoint SHA-256 verification failed")
         tmp.replace(dest)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -141,19 +161,14 @@ def transcribe_with_mt3(
         mono = mono / peak
 
     model_name = "yourmt3" if use_multi_track else "mr_mt3"
-    if model_name == "yourmt3":
-        ckpt_path = str(_ensure_yourmt3_checkpoint(ckpt_root))
-    else:
-        mr_ckpt = ckpt_root / "mr_mt3" / "mt3.pth"
-        mr_ckpt.parent.mkdir(parents=True, exist_ok=True)
-        ckpt_path = str(mr_ckpt)
+    ckpt_path = str(_ensure_verified_checkpoint(ckpt_root, model_name))
 
     def _run(dev: str):
         model = mt3_infer.load_model(
             model_name,
             checkpoint_path=ckpt_path,
             device=dev,
-            auto_download=True,
+            auto_download=False,
         )
         return model.transcribe(mono, sr=sr)
 
