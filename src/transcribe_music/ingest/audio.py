@@ -52,16 +52,22 @@ def normalize_audio_to_wav(
             sf.write(str(output_wav), data, sr, subtype="PCM_16")
             return output_wav
 
+    if start_sec is not None and end_sec is not None and end_sec <= start_sec:
+        raise ValueError(f"end_sec ({end_sec}) must be greater than start_sec ({start_sec})")
+
+    src_path = input_path.resolve()
+    dst_path = output_wav.resolve()
     ffmpeg = get_ffmpeg_executable()
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
     if start_sec is not None:
         cmd.extend(["-ss", f"{start_sec:.3f}"])
     if end_sec is not None:
-        cmd.extend(["-to", f"{end_sec:.3f}"])
+        duration_sec = end_sec - (start_sec or 0.0)
+        cmd.extend(["-t", f"{duration_sec:.3f}"])
     cmd.extend(
         [
             "-i",
-            str(input_path),
+            str(src_path),
             "-vn",
             "-acodec",
             "pcm_s16le",
@@ -69,10 +75,10 @@ def normalize_audio_to_wav(
             str(sample_rate),
             "-ac",
             "2",
-            str(output_wav),
+            str(dst_path),
         ]
     )
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=300)
     if proc.returncode != 0:
         raise RuntimeError(f"FFmpeg audio decode failed: {proc.stderr.strip()}")
     if not output_wav.exists() or output_wav.stat().st_size == 0:

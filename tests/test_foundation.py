@@ -63,11 +63,20 @@ def test_extract_youtube_id() -> None:
     assert extract_youtube_id("https://youtu.be/dQw4w9WgXcQ?si=abc") == "dQw4w9WgXcQ"
     assert extract_youtube_id("https://youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
 
+    for bad_url in (
+        "file:///etc/passwd",
+        "https://evil.example.com/watch?v=dQw4w9WgXcQ",
+        "https://www.youtube.com/watch?v=not_11",
+    ):
+        with pytest.raises(ValueError):
+            extract_youtube_id(bad_url)
+
 
 def test_download_youtube_slice_full_and_partial_ranges(monkeypatch, tmp_path: Path) -> None:
     import yt_dlp
 
     captured_opts: list[dict] = []
+    captured_urls: list[list[str]] = []
     sr = 44100
     t = np.linspace(0, 1.5, int(sr * 1.5), endpoint=False)
     sample_wave = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
@@ -84,14 +93,16 @@ def test_download_youtube_slice_full_and_partial_ranges(monkeypatch, tmp_path: P
             return None
 
         def download(self, urls: list[str]) -> None:
+            captured_urls.append(urls)
             raw_path = Path(self.opts["outtmpl"].replace("%(ext)s", "wav"))
             sf.write(raw_path, sample_wave, sr)
 
     monkeypatch.setattr(yt_dlp, "YoutubeDL", _FakeYoutubeDL)
 
     full_wav = tmp_path / "full" / "out.wav"
-    download_youtube_slice("https://youtu.be/dQw4w9WgXcQ", None, full_wav, sample_rate=sr)
+    download_youtube_slice("https://youtu.be/dQw4w9WgXcQ?si=abc", None, full_wav, sample_rate=sr)
     assert full_wav.exists()
+    assert captured_urls[-1] == ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]
     assert "download_ranges" not in captured_opts[-1]
     assert "force_keyframes_at_cuts" not in captured_opts[-1]
     full_data, _ = sf.read(full_wav)

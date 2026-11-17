@@ -14,10 +14,12 @@ _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 
 
 def extract_youtube_id(url: str) -> str:
-    """Extract canonical 11-character YouTube video ID for stable cache keys."""
+    """Validate an http(s) YouTube URL and return its canonical 11-character video ID."""
     parsed = urlparse(url.strip())
-    host = parsed.netloc.lower().removeprefix("www.")
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"YouTube URL must use http or https scheme, got: {url!r}")
 
+    host = (parsed.hostname or "").lower().removeprefix("www.")
     if host == "youtu.be":
         candidate = parsed.path.strip("/").split("/")[0]
         if _YOUTUBE_ID_RE.match(candidate):
@@ -32,8 +34,7 @@ def extract_youtube_id(url: str) -> str:
         if len(parts) >= 2 and parts[0] in {"shorts", "live", "embed"} and _YOUTUBE_ID_RE.match(parts[1]):
             return parts[1]
 
-    # Fallback: use normalized URL if non-standard link
-    return url.strip()
+    raise ValueError(f"Unsupported or invalid YouTube URL: {url!r}")
 
 
 def download_youtube_slice(
@@ -44,6 +45,9 @@ def download_youtube_slice(
 ) -> Path:
     """Download YouTube audio (whole video by default, or [start_sec, end_sec] slice) as WAV."""
     import yt_dlp
+
+    video_id = extract_youtube_id(url)
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
 
     output_wav = Path(output_wav)
     output_wav.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +79,7 @@ def download_youtube_slice(
         ydl_opts["force_keyframes_at_cuts"] = False
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+        ydl.download([canonical_url])
 
     downloaded_candidates = sorted(output_wav.parent.glob("yt_slice_raw.*"))
     if not downloaded_candidates:

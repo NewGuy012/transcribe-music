@@ -15,6 +15,7 @@ from transcribe_music.models import Instrument
 
 def _run_homr_on_image(image_path: Path) -> Path:
     """Run homr OMR on one page PNG via native CLI or isolated uvx Python 3.14."""
+    image_path = Path(image_path).resolve()
     expected_xml = image_path.with_suffix(".musicxml")
     if expected_xml.exists():
         expected_xml.unlink()
@@ -38,7 +39,9 @@ def _run_homr_on_image(image_path: Path) -> Path:
             str(image_path),
         ]
 
-    proc = subprocess.run(cmd, check=False, cwd=str(image_path.parent), capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd, check=False, cwd=str(image_path.parent), capture_output=True, text=True, timeout=300
+    )
     if proc.returncode != 0:
         raise RuntimeError(f"homr OMR failed on {image_path.name}: {proc.stderr.strip()}")
 

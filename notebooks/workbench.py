@@ -197,19 +197,20 @@ def _(
         if not audio_upload.value:
             raise ValueError("Please upload an audio file.")
         uploaded = audio_upload.value[0]
-        suffix = Path(uploaded.name).suffix or ".wav"
-        tmp_dir = Path(tempfile.mkdtemp(prefix="tm_ui_"))
-        tmp_file = tmp_dir / f"input{suffix}"
-        tmp_file.write_bytes(uploaded.contents)
-        result = transcribe_audio(tmp_file, instrument=cfg.instrument, config=cfg)
+        raw_suffix = Path(uploaded.name).suffix.lower()
+        suffix = raw_suffix if raw_suffix in {".wav", ".mp3", ".flac", ".m4a", ".ogg"} else ".wav"
+        with tempfile.TemporaryDirectory(prefix="tm_ui_") as tmp_dir_str:
+            tmp_file = Path(tmp_dir_str) / f"input{suffix}"
+            tmp_file.write_bytes(uploaded.contents)
+            result = transcribe_audio(tmp_file, instrument=cfg.instrument, config=cfg)
     else:
         if not pdf_upload.value:
             raise ValueError("Please upload a PDF file.")
         uploaded = pdf_upload.value[0]
-        tmp_dir = Path(tempfile.mkdtemp(prefix="tm_ui_"))
-        tmp_file = tmp_dir / uploaded.name
-        tmp_file.write_bytes(uploaded.contents)
-        result = transcribe_pdf(tmp_file, instrument=cfg.instrument, config=cfg)
+        with tempfile.TemporaryDirectory(prefix="tm_ui_") as tmp_dir_str:
+            tmp_file = Path(tmp_dir_str) / "input.pdf"
+            tmp_file.write_bytes(uploaded.contents)
+            result = transcribe_pdf(tmp_file, instrument=cfg.instrument, config=cfg)
 
     result
     return (result,)

@@ -133,7 +133,11 @@ def annotate_guitar_fingering(score: music21.stream.Score) -> music21.stream.Sco
     if not score.parts:
         return score
     part = score.parts[0]
-    transpose = INSTRUMENT_SPECS[Instrument.GUITAR].transpose_semitones  # -12
+    transpose = (
+        0
+        if part.atSoundingPitch is True
+        else INSTRUMENT_SPECS[Instrument.GUITAR].transpose_semitones
+    )
 
     elements = sorted_playable_notes(part)
     if not elements:

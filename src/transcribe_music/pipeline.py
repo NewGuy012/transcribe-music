@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -58,7 +59,7 @@ def _enrich_and_export(
     source_ref: str,
     job_hash: str,
     output_path: Path,
-    store: CatalogStore,
+    store: CatalogStore | None,
     t_start: float,
     warnings: list[str],
     audio_wav_path: Path | None = None,
@@ -106,12 +107,13 @@ def _enrich_and_export(
         warnings=warnings,
     )
 
-    store.record_job(
-        result=result,
-        config=config,
-        start_sec=start_sec,
-        end_sec=end_sec,
-    )
+    if store is not None:
+        store.record_job(
+            result=result,
+            config=config,
+            start_sec=start_sec,
+            end_sec=end_sec,
+        )
     return result
 
 
@@ -208,7 +210,6 @@ def _run_cached_job(
     if cfg.instrument != inst:
         cfg = cfg.model_copy(update={"instrument": inst})
 
-    store = CatalogStore(cfg.cache_dir)
     job_hash = compute_job_hash(
         source_type,
         source_identity,
@@ -216,10 +217,11 @@ def _run_cached_job(
         start_sec=start_sec,
         end_sec=end_sec,
     )
-    artifact_dir = store.artifact_dir(job_hash)
-    final_out = _resolve_output_path(output_path, default_stem, inst, artifact_dir)
 
     if cfg.use_cache:
+        store = CatalogStore(cfg.cache_dir)
+        artifact_dir = store.artifact_dir(job_hash)
+        final_out = _resolve_output_path(output_path, default_stem, inst, artifact_dir)
         cached = store.get_cached_job(job_hash)
         if cached is not None:
             _copy_if_needed(cached.musicxml_path, final_out)
@@ -229,7 +231,46 @@ def _run_cached_job(
                     "elapsed_sec": round(time.perf_counter() - t_start, 3),
                 }
             )
+        score, warnings, wav_path = produce_score(artifact_dir, cfg)
+        return _enrich_and_export(
+            score=score,
+            config=cfg,
+            source_type=source_type,
+            source_ref=source_ref,
+            job_hash=job_hash,
+            output_path=final_out,
+            store=store,
+            t_start=t_start,
+            warnings=warnings,
+            audio_wav_path=wav_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            title=title,
+        )
 
+    if output_path is not None:
+        with tempfile.TemporaryDirectory(prefix="tm_work_") as tmp_dir_str:
+            work_dir = Path(tmp_dir_str)
+            score, warnings, wav_path = produce_score(work_dir, cfg)
+            return _enrich_and_export(
+                score=score,
+                config=cfg,
+                source_type=source_type,
+                source_ref=source_ref,
+                job_hash=job_hash,
+                output_path=Path(output_path),
+                store=None,
+                t_start=t_start,
+                warnings=warnings,
+                audio_wav_path=wav_path,
+                start_sec=start_sec,
+                end_sec=end_sec,
+                title=title,
+            )
+
+    artifact_dir = cfg.cache_dir / "artifacts" / job_hash
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    final_out = _resolve_output_path(None, default_stem, inst, artifact_dir)
     score, warnings, wav_path = produce_score(artifact_dir, cfg)
     return _enrich_and_export(
         score=score,
@@ -238,7 +279,7 @@ def _run_cached_job(
         source_ref=source_ref,
         job_hash=job_hash,
         output_path=final_out,
-        store=store,
+        store=None,
         t_start=t_start,
         warnings=warnings,
         audio_wav_path=wav_path,

@@ -124,6 +124,14 @@ def normalize_score_structure(
         # Fill gaps with valid rests and ensure ties/beams are notation-ready
         part.makeNotation(inPlace=True)
 
+    if instrument == Instrument.PIANO and len(parts) == 2:
+        has_brace = any(
+            getattr(sg, "symbol", None) == "brace"
+            for sg in score.getElementsByClass(music21.layout.StaffGroup)
+        )
+        if not has_brace:
+            score.insert(0, music21.layout.StaffGroup(parts, name="Piano", symbol="brace"))
+
     return score
 
 
