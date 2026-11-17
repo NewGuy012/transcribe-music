@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import music21
@@ -69,6 +71,192 @@ def _make_clef(spec_clef: str, staff_idx: int = 0) -> music21.clef.Clef:
     return music21.clef.TrebleClef()
 
 
+_UNEXPORTABLE_DURATION_TYPES = frozenset({"inexpressible", "zero", "2048th", "duplex-maxima"})
+
+
+def _is_unexportable_element(el: object) -> bool:
+    """Return True if el is a non-grace Note/Rest/Chord with an unexportable MusicXML duration."""
+    return (
+        isinstance(el, (music21.note.Note, music21.note.Rest, music21.chord.Chord))
+        and not isinstance(el, music21.harmony.ChordSymbol)
+        and not el.duration.isGrace
+        and el.duration.type in _UNEXPORTABLE_DURATION_TYPES
+    )
+
+
+def _is_playable_or_rest(el: object) -> bool:
+    return isinstance(el, (music21.note.Note, music21.note.Rest)) or is_playable_chord(el)
+
+
+def _snap_clean_quarter_length(
+    value: float,
+    *,
+    allow_zero: bool = False,
+    min_ql: Fraction = Fraction(1, 8),
+) -> Fraction:
+    """Snap an arbitrary float duration/offset to the closest standard binary/triplet Fraction."""
+    if value <= 0.0:
+        return Fraction(0, 1) if allow_zero else min_ql
+    candidates: list[tuple[float, int, Fraction]] = []
+    for div in (4, 3, 8, 6):
+        num = round(value * div)
+        if num == 0 and not allow_zero:
+            continue
+        candidates.append((abs(value - num / div), div, Fraction(num, div)))
+    if not candidates:
+        return Fraction(0, 1) if allow_zero else min_ql
+    candidates.sort(key=lambda item: (round(item[0], 6), item[1]))
+    snapped = candidates[0][2]
+    if not allow_zero and snapped <= 0:
+        return min_ql
+    return snapped
+
+
+def _exact_fraction_or_none(value: float | Fraction) -> Fraction | None:
+    if isinstance(value, Fraction):
+        return value
+    return Fraction(float(value)).limit_denominator(10000)
+
+
+def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) -> None:
+    """Repair unexportable durations and float-rounded offsets/gaps in a Measure, Voice, or Part."""
+    items = [el for el in list(st) if _is_playable_or_rest(el) and not el.duration.isGrace]
+    repaired_ids: set[int] = set()
+
+    for el in items:
+        ql_float = float(el.duration.quarterLength)
+        if isinstance(el, music21.note.Rest) and ql_float < 1 / 32:
+            st.remove(el)
+            continue
+
+        off_frac = _exact_fraction_or_none(el.offset)
+        if off_frac is not None and off_frac.denominator > 24:
+            new_off = _snap_clean_quarter_length(float(el.offset), allow_zero=True)
+            st.setElementOffset(el, new_off)
+            repaired_ids.add(id(el))
+
+        ql_frac = _exact_fraction_or_none(el.duration.quarterLength)
+        needs_dur_fix = _is_unexportable_element(el) or (
+            ql_frac is not None and ql_frac.denominator > 24
+        )
+        if needs_dur_fix:
+            new_ql = _snap_clean_quarter_length(ql_float, allow_zero=False)
+            if bar_ql is not None:
+                cur_off = Fraction(el.offset).limit_denominator(24)
+                if cur_off < bar_ql:
+                    new_ql = min(new_ql, bar_ql - cur_off)
+                else:
+                    new_ql = min(new_ql, bar_ql)
+                if new_ql <= 0:
+                    new_ql = Fraction(1, 8)
+            el.duration = music21.duration.Duration(new_ql)
+            repaired_ids.add(id(el))
+
+    if bar_ql is None or not repaired_ids:
+        return
+
+    # Rebuild rests cleanly in the repaired measure/voice so gaps never carry rounding artifacts
+    for r in list(st.getElementsByClass(music21.note.Rest)):
+        if not r.duration.isGrace:
+            st.remove(r)
+
+    notes_only = sorted(
+        [
+            el
+            for el in st
+            if _is_playable_or_rest(el)
+            and not isinstance(el, music21.note.Rest)
+            and not el.duration.isGrace
+        ],
+        key=lambda e: (float(e.offset), id(e)),
+    )
+    for idx, n in enumerate(notes_only):
+        if id(n) not in repaired_ids:
+            continue
+        n_off = Fraction(n.offset).limit_denominator(24)
+        if n_off >= bar_ql:
+            continue
+        next_off = (
+            Fraction(notes_only[idx + 1].offset).limit_denominator(24)
+            if idx + 1 < len(notes_only)
+            else bar_ql
+        )
+        if next_off > n_off:
+            max_dur = min(bar_ql, next_off) - n_off
+            cur_ql = Fraction(n.duration.quarterLength).limit_denominator(24)
+            if cur_ql > max_dur > 0:
+                n.duration = music21.duration.Duration(max_dur)
+
+    # Fill gaps with beat-split rests when non-binary offsets exist
+    cursor = Fraction(0, 1)
+    for n in notes_only:
+        n_off = Fraction(n.offset).limit_denominator(24)
+        n_end = n_off + Fraction(n.duration.quarterLength).limit_denominator(24)
+        if n_off > cursor:
+            _insert_split_rests(st, cursor, min(n_off, bar_ql))
+        cursor = max(cursor, min(n_end, bar_ql))
+    if cursor < bar_ql:
+        _insert_split_rests(st, cursor, bar_ql)
+
+
+def _insert_split_rests(st: music21.stream.Stream, start: Fraction, end: Fraction) -> None:
+    for seg_start, seg_end in split_tuplet_interval(start, end):
+        st.insert(seg_start, music21.note.Rest(quarterLength=seg_end - seg_start))
+
+
+def split_tuplet_interval(onset: Fraction, end: Fraction) -> list[tuple[Fraction, Fraction]]:
+    """Keep tuplet spans beat-local by splitting non-binary endpoints at integer beat boundaries."""
+    if onset >= end:
+        return []
+    if _is_pow2(onset.denominator) and _is_pow2(end.denominator):
+        return [(onset, end)]
+
+    segments: list[tuple[Fraction, Fraction]] = []
+    cur = onset
+    if not _is_pow2(cur.denominator):
+        first_beat_end = Fraction(math.floor(cur) + 1, 1)
+        if end <= first_beat_end:
+            return [(cur, end)]
+        segments.append((cur, first_beat_end))
+        cur = first_beat_end
+
+    if not _is_pow2(end.denominator):
+        last_beat_start = Fraction(math.floor(end), 1)
+        if cur < last_beat_start:
+            segments.append((cur, last_beat_start))
+            cur = last_beat_start
+    if cur < end:
+        segments.append((cur, end))
+    return segments
+
+
+def _is_pow2(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _repair_unexportable_durations(part: music21.stream.Part) -> None:
+    """Repair any unexportable Note/Chord/Rest durations so MusicXML export never fails."""
+    if not any(_is_unexportable_element(el) for el in part.recurse().notesAndRests):
+        return
+
+    measures = list(part.getElementsByClass(music21.stream.Measure))
+    if not measures:
+        _repair_stream_elements(part, bar_ql=None)
+        return
+
+    for m in measures:
+        if not any(_is_unexportable_element(el) for el in m.recurse().notesAndRests):
+            continue
+        bar_ql = (
+            Fraction(m.barDuration.quarterLength).limit_denominator(24)
+            if m.barDuration is not None
+            else Fraction(4, 1)
+        )
+        voices = list(m.getElementsByClass(music21.stream.Voice))
+        for st in voices or [m]:
+            _repair_stream_elements(st, bar_ql=bar_ql)
+
+
 def normalize_score_structure(
     score: music21.stream.Score,
     instrument: Instrument,
@@ -104,6 +292,9 @@ def normalize_score_structure(
 
         measures = list(part.getElementsByClass(music21.stream.Measure))
         if not measures:
+            if not part.getElementsByClass(music21.meter.TimeSignature):
+                part.insert(0, music21.meter.TimeSignature("4/4"))
+            _repair_unexportable_durations(part)
             part.makeMeasures(inPlace=True)
             measures = list(part.getElementsByClass(music21.stream.Measure))
 
@@ -119,7 +310,10 @@ def normalize_score_structure(
                 if ks is not None:
                     first_m.insert(0, ks)
 
+        _repair_unexportable_durations(part)
         part.makeNotation(inPlace=True)
+        # Final guard in case makeNotation introduced any unexportable duration/rest
+        _repair_unexportable_durations(part)
 
     if instrument == Instrument.PIANO and len(parts) == 2:
         has_brace = any(

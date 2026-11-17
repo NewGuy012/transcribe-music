@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+from fractions import Fraction
 from pathlib import Path
 
 import librosa
@@ -9,6 +11,7 @@ import music21
 import numpy as np
 import pretty_midi
 
+from transcribe_music.export.musicxml import split_tuplet_interval
 from transcribe_music.ingest.audio import load_mono_audio
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 
@@ -47,31 +50,42 @@ def _seconds_to_beats(t_sec: float, tempo_bpm: float, beat_times: np.ndarray) ->
     return max(0.0, t_sec * (tempo_bpm / 60.0))
 
 
-def _quantize_ql(value: float, divisors: tuple[int, ...] = (4, 3)) -> float:
-    """Snap quarterLength to nearest allowed rhythmic subdivision grid."""
-    candidates: list[float] = []
-    for div in divisors:
-        step = 1.0 / div
-        snapped = round(value / step) * step
-        candidates.append(snapped)
-    best = min(candidates, key=lambda c: abs(c - value))
-    return float(round(best, 4))
+def _snap_to_divisor(value: float, divisor: int) -> Fraction:
+    return Fraction(round(value * divisor), divisor)
 
 
-def _quantize_duration_ql(dur_ql: float, divisors: tuple[int, ...] = (4, 3)) -> float:
-    min_step = 1.0 / max(divisors)
-    snapped = _quantize_ql(max(min_step, dur_ql), divisors=divisors)
-    return max(min_step, snapped)
+def _select_beat_divisors(
+    raw_beats: list[tuple[float, float, int, int]],
+    divisors: tuple[int, ...],
+) -> dict[int, int]:
+    """Choose one consistent subdivision divisor per beat to avoid mixed-grid tuplets."""
+    divs = divisors or (4,)
+    onsets_by_beat: dict[int, list[float]] = {}
+    for sb, _, _, _ in raw_beats:
+        onsets_by_beat.setdefault(max(0, math.floor(sb)), []).append(sb)
+
+    beat_div: dict[int, int] = {}
+    for beat_idx, onsets in onsets_by_beat.items():
+        best_div = divs[0]
+        best_score = (float("inf"), 0)
+        for idx, div in enumerate(divs):
+            err = sum(abs(float(_snap_to_divisor(o, div)) - o) for o in onsets)
+            score = (round(err, 9), idx)
+            if score < best_score:
+                best_score = score
+                best_div = div
+        beat_div[beat_idx] = best_div
+    return beat_div
 
 
 def _split_piano_rh_lh(
-    events: list[tuple[float, float, int, int]],
-) -> tuple[list[tuple[float, float, int, int]], list[tuple[float, float, int, int]]]:
+    events: list[tuple[Fraction, Fraction, int, int]],
+) -> tuple[list[tuple[Fraction, Fraction, int, int]], list[tuple[Fraction, Fraction, int, int]]]:
     """Split piano notes into right-hand (Treble) and left-hand (Bass) streams."""
-    rh: list[tuple[float, float, int, int]] = []
-    lh: list[tuple[float, float, int, int]] = []
+    rh: list[tuple[Fraction, Fraction, int, int]] = []
+    lh: list[tuple[Fraction, Fraction, int, int]] = []
     # Group simultaneous onsets so chords stay ergonomically coherent
-    by_onset: dict[float, list[tuple[float, float, int, int]]] = {}
+    by_onset: dict[Fraction, list[tuple[Fraction, Fraction, int, int]]] = {}
     for ev in events:
         by_onset.setdefault(ev[0], []).append(ev)
 
@@ -100,43 +114,65 @@ def _split_piano_rh_lh(
 
 def _populate_part_from_events(
     part: music21.stream.Part,
-    events: list[tuple[float, float, int, int]],
-    total_beats: float,
+    events: list[tuple[Fraction, Fraction, int, int]],
+    total_beats: Fraction,
     transpose_semitones: int = 0,
-) -> None:
-    """Insert note/chord events cleanly by beat offset without colliding voices."""
-    by_onset: dict[float, list[tuple[float, float, int, int]]] = {}
+) -> Fraction:
+    """Insert note/chord events cleanly by beat offset without colliding voices or bad tuplets."""
+    by_onset: dict[Fraction, list[tuple[Fraction, Fraction, int, int]]] = {}
     for onset, dur, midi_pitch, vel in events:
-        by_onset.setdefault(onset, []).append((onset, dur, midi_pitch, vel))
+        onset_f = Fraction(onset)
+        dur_f = Fraction(dur)
+        by_onset.setdefault(onset_f, []).append((onset_f, dur_f, midi_pitch, vel))
 
     sorted_onsets = sorted(by_onset)
+    cursor = Fraction(0, 1)
     for idx, onset in enumerate(sorted_onsets):
-        group = sorted(by_onset[onset], key=lambda x: x[2])
-        # Trim duration if next onset on same staff overlaps excessively to avoid messy voices
-        next_onset = sorted_onsets[idx + 1] if idx + 1 < len(sorted_onsets) else total_beats
-        max_non_overlap = max(0.125, next_onset - onset)
+        if onset > cursor:
+            for r_start, r_end in split_tuplet_interval(cursor, onset):
+                part.insert(r_start, music21.note.Rest(quarterLength=r_end - r_start))
 
-        if len(group) == 1:
-            _, dur, midi_pitch, vel = group[0]
-            written_pitch = midi_pitch - transpose_semitones
-            n = music21.note.Note(written_pitch)
-            n.duration = music21.duration.Duration(min(dur, max_non_overlap))
-            n.volume.velocity = vel
-            part.insert(onset, n)
-        else:
-            # Deduplicate duplicate pitches in same onset bucket
-            unique_pitches: dict[int, tuple[float, int]] = {}
-            for _, dur, midi_pitch, vel in group:
-                if midi_pitch not in unique_pitches:
-                    unique_pitches[midi_pitch] = (dur, vel)
-            pitches = sorted(unique_pitches)
-            durs = [unique_pitches[p][0] for p in pitches]
-            chord_dur = min(max(durs), max_non_overlap)
-            written_pitches = [p - transpose_semitones for p in pitches]
-            ch = music21.chord.Chord(written_pitches)
-            ch.duration = music21.duration.Duration(chord_dur)
-            ch.volume.velocity = int(np.mean([unique_pitches[p][1] for p in pitches]))
-            part.insert(onset, ch)
+        group = sorted(by_onset[onset], key=lambda x: x[2])
+        # Trim duration to next onset on same staff so voices never collide
+        next_onset = sorted_onsets[idx + 1] if idx + 1 < len(sorted_onsets) else total_beats
+
+        unique_pitches: dict[int, tuple[Fraction, int]] = {}
+        for _, dur, midi_pitch, vel in group:
+            if midi_pitch not in unique_pitches:
+                unique_pitches[midi_pitch] = (dur, vel)
+            else:
+                prev_dur, prev_vel = unique_pitches[midi_pitch]
+                unique_pitches[midi_pitch] = (max(prev_dur, dur), max(prev_vel, vel))
+
+        pitches = sorted(unique_pitches)
+        raw_end = onset + max(unique_pitches[p][0] for p in pitches)
+        clipped_end = min(raw_end, next_onset)
+        if clipped_end <= onset:
+            clipped_end = next_onset
+
+        vel_avg = int(np.mean([unique_pitches[p][1] for p in pitches]))
+        written_pitches = [p - transpose_semitones for p in pitches]
+
+        segments = split_tuplet_interval(onset, clipped_end)
+        for seg_idx, (seg_start, seg_end) in enumerate(segments):
+            seg_dur = seg_end - seg_start
+            if len(written_pitches) == 1:
+                el: music21.note.Note | music21.chord.Chord = music21.note.Note(written_pitches[0])
+            else:
+                el = music21.chord.Chord(written_pitches)
+            el.duration = music21.duration.Duration(seg_dur)
+            el.volume.velocity = vel_avg
+            if len(segments) > 1:
+                tie_type = (
+                    "start"
+                    if seg_idx == 0
+                    else ("stop" if seg_idx == len(segments) - 1 else "continue")
+                )
+                el.tie = music21.tie.Tie(tie_type)
+            part.insert(seg_start, el)
+
+        cursor = max(cursor, clipped_end)
+    return cursor
 
 
 def _mark_tutti_rests(part: music21.stream.Part) -> None:
@@ -168,8 +204,8 @@ def _mark_tutti_rests(part: music21.stream.Part) -> None:
 
 def _build_part(
     part_id: str,
-    events: list[tuple[float, float, int, int]],
-    total_beats: float,
+    events: list[tuple[Fraction, Fraction, int, int]],
+    total_beats: Fraction,
     bpm: float,
     clef: music21.clef.Clef | None = None,
     include_tempo: bool = True,
@@ -181,12 +217,12 @@ def _build_part(
     part.insert(0, music21.meter.TimeSignature("4/4"))
     if include_tempo:
         part.insert(0, music21.tempo.MetronomeMark(number=round(bpm, 1)))
-    _populate_part_from_events(part, events, total_beats, transpose_semitones=transpose_semitones)
-    if part.highestTime < total_beats:
-        part.insert(
-            part.highestTime,
-            music21.note.Rest(quarterLength=max(0.25, total_beats - part.highestTime)),
-        )
+    cursor = _populate_part_from_events(
+        part, events, total_beats, transpose_semitones=transpose_semitones
+    )
+    if cursor < total_beats:
+        for r_start, r_end in split_tuplet_interval(cursor, total_beats):
+            part.insert(r_start, music21.note.Rest(quarterLength=r_end - r_start))
     part.makeMeasures(inPlace=True)
     part.makeRests(fillGaps=True, inPlace=True)
     return part
@@ -203,6 +239,7 @@ def midi_to_quantized_score(
 ) -> music21.stream.Score:
     """Convert raw MIDI events into a beat-quantized, bar-aligned music21 Score."""
     spec = INSTRUMENT_SPECS[instrument]
+    divs = quantize_divisors or (4,)
 
     if tempo_bpm is not None:
         bpm = float(tempo_bpm)
@@ -211,21 +248,35 @@ def midi_to_quantized_score(
         bpm, beat_times = estimate_tempo_and_beats(audio_wav_path, fallback_bpm=120.0)
 
     raw_notes = [n for inst in midi.instruments if not inst.is_drum for n in inst.notes]
-    events: list[tuple[float, float, int, int]] = []
-    max_beat = 4.0
-    for n in raw_notes:
-        if not (spec.midi_min <= n.pitch <= spec.midi_max):
-            continue
-        onset_b = _quantize_ql(
-            _seconds_to_beats(n.start, bpm, beat_times), divisors=quantize_divisors
+    raw_beats = [
+        (
+            _seconds_to_beats(n.start, bpm, beat_times),
+            _seconds_to_beats(n.end, bpm, beat_times),
+            int(n.pitch),
+            int(n.velocity),
         )
-        end_b = _seconds_to_beats(n.end, bpm, beat_times)
-        dur_b = _quantize_duration_ql(max(0.125, end_b - onset_b), divisors=quantize_divisors)
-        events.append((onset_b, dur_b, int(n.pitch), int(n.velocity)))
-        max_beat = max(max_beat, onset_b + dur_b)
+        for n in raw_notes
+        if spec.midi_min <= n.pitch <= spec.midi_max
+    ]
+    beat_div = _select_beat_divisors(raw_beats, divs)
 
-    total_measures = max(1, int(np.ceil(max_beat / 4.0)))
-    total_beats = float(total_measures * 4)
+    events: list[tuple[Fraction, Fraction, int, int]] = []
+    max_beat = Fraction(4, 1)
+    for sb, eb, pitch, vel in raw_beats:
+        d_start = beat_div.get(max(0, math.floor(sb)), divs[0])
+        onset_q = max(Fraction(0, 1), _snap_to_divisor(sb, d_start))
+        d_onset = beat_div.get(math.floor(onset_q), divs[0])
+
+        d_end = beat_div.get(max(0, math.floor(eb)), divs[0])
+        end_q = _snap_to_divisor(eb, d_end)
+        min_dur = Fraction(1, d_onset)
+        if end_q <= onset_q:
+            end_q = onset_q + min_dur
+        events.append((onset_q, end_q - onset_q, pitch, vel))
+        max_beat = max(max_beat, end_q)
+
+    total_measures = max(1, math.ceil(max_beat / 4))
+    total_beats = Fraction(total_measures * 4, 1)
 
     score = music21.stream.Score()
     score.metadata = music21.metadata.Metadata(title=title or f"{spec.display_name} Transcription")

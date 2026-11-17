@@ -241,3 +241,44 @@ def test_audio_normalization_and_pdf_rasterization(tmp_path: Path) -> None:
     pages = render_pdf_pages(pdf_path, tmp_path / "pages", dpi=150)
     assert len(pages) == 2
     assert all(p.exists() and p.suffix == ".png" for p in pages)
+
+
+def test_export_musicxml_repairs_inexpressible_and_zero_durations(tmp_path: Path) -> None:
+    # Measured score with float-rounded inexpressible durations, tiny gap rest, ChordSymbol, and grace note
+    score = music21.stream.Score()
+    part = music21.stream.Part()
+    m1 = music21.stream.Measure(number=1)
+    m1.append(music21.meter.TimeSignature("4/4"))
+    m1.insert(0.0, music21.harmony.ChordSymbol("D"))
+    grace = music21.note.Note("C#4", quarterLength=0.5).getGrace()
+    m1.insert(0.0, grace)
+    m1.insert(0.0, music21.chord.Chord(["D4", "F#4"], quarterLength=2.0))
+    m1.insert(2.0, music21.chord.Chord(["D4", "F#4"], quarterLength=0.3333))
+    m1.insert(2.3333, music21.chord.Chord(["E4", "G4"], quarterLength=0.4167))
+    m1.insert(2.7499, music21.note.Rest(quarterLength=1e-4))
+    m1.insert(2.75, music21.note.Note("G4", quarterLength=0.5))
+    m1.insert(3.25, music21.note.Note("A4", quarterLength=0.75))
+    part.append(m1)
+    score.insert(0, part)
+
+    out_xml = tmp_path / "repaired_measured.musicxml"
+    metrics, warnings = export_musicxml(score, out_xml, Instrument.CELLO)
+    assert not warnings
+    assert metrics.measure_count == 1
+    assert metrics.chord_count == 1
+    root = ET.parse(out_xml).getroot()
+    assert len(root.findall(".//note/grace")) == 1
+
+    # Flat score with zero, sub-minimal, and oversized (> maxima) durations
+    flat_score = music21.stream.Score()
+    flat_part = music21.stream.Part()
+    flat_part.append(music21.note.Note("C4", quarterLength=0.0))
+    flat_part.append(music21.note.Note("D4", quarterLength=0.001))
+    flat_part.append(music21.note.Note("E4", quarterLength=100.0))
+    flat_score.insert(0, flat_part)
+
+    flat_xml = tmp_path / "repaired_flat.musicxml"
+    flat_metrics, flat_warnings = export_musicxml(flat_score, flat_xml, Instrument.PIANO)
+    assert not flat_warnings
+    assert flat_metrics.measure_count >= 25
+    assert flat_metrics.note_count >= 3

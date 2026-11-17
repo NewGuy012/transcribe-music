@@ -289,3 +289,49 @@ def test_ensure_verified_checkpoint_replaces_corrupt_file(
     assert resolved == corrupt
     assert resolved.read_bytes() == payload
     assert not list(tmp_path.rglob("*.part"))
+
+
+def test_quantize_triplets_and_mixed_grids_export_cleanly(tmp_path: Path) -> None:
+    from transcribe_music.enrich.fingering import apply_fingering
+
+    # 120 BPM => 1 beat = 0.5s
+    midi = pretty_midi.PrettyMIDI(initial_tempo=120.0)
+    cello = pretty_midi.Instrument(program=42)
+    # Measure 1, beat 1: exact triplets (0, 1/3, 2/3 beats)
+    for k in range(3):
+        cello.notes.append(pretty_midi.Note(90, 50 + k, k / 6.0, (k + 1) / 6.0))
+    # Beat 2: 16th + dotted 8th (1.0, 1.25 beats)
+    cello.notes.append(pretty_midi.Note(90, 55, 0.5, 0.625))
+    cello.notes.append(pretty_midi.Note(90, 57, 0.625, 1.0))
+    # Beats 3-4: double stops with raw triplet-adjacent onsets crossing into binary beat
+    # (mirrors the Haydn concerto m.7 timing pattern that previously produced 0.3333 / 0.4167)
+    cello.notes.append(pretty_midi.Note(100, 62, 1.0, 1.1944))
+    cello.notes.append(pretty_midi.Note(100, 66, 1.0, 1.1944))
+    cello.notes.append(pretty_midi.Note(100, 64, 1.1944, 1.4302))
+    cello.notes.append(pretty_midi.Note(100, 67, 1.1944, 1.4302))
+    cello.notes.append(pretty_midi.Note(100, 67, 1.4302, 1.615))
+    cello.notes.append(pretty_midi.Note(100, 69, 1.615, 1.928))
+    # Cross-beat tie from triplet beat (beat 4 + 2/3 = 2.333s) into binary beat (beat 5 + 1/4 = 2.625s)
+    cello.notes.append(pretty_midi.Note(95, 60, 2.333, 2.625))
+    cello.notes.append(pretty_midi.Note(95, 62, 2.625, 3.0))
+    midi.instruments.append(cello)
+
+    score = midi_to_quantized_score(midi, Instrument.CELLO, tempo_bpm=120.0)
+    for el in score.recurse().notesAndRests:
+        assert el.duration.type not in {"inexpressible", "zero", "2048th", "duplex-maxima"}
+
+    apply_fingering(score, Instrument.CELLO)
+    out_xml = tmp_path / "triplets_mixed.musicxml"
+    metrics, warnings = export_musicxml(score, out_xml, Instrument.CELLO)
+    assert not warnings
+    assert metrics.measure_count == 2
+    assert metrics.note_count >= 12
+    assert metrics.fingering_count >= 12
+
+    root = ET.parse(out_xml).getroot()
+    time_mods = {
+        (tm.findtext("actual-notes"), tm.findtext("normal-notes"))
+        for tm in root.findall(".//time-modification")
+    }
+    assert time_mods <= {("3", "2")}
+    assert ("3", "2") in time_mods
