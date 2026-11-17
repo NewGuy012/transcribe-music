@@ -177,35 +177,58 @@ def _run_audio_pipeline(
     return score, warnings
 
 
+def _normalize_timestamp_input(value: str | float | None) -> str | float | None:
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
 def transcribe_youtube(
     url: str,
-    start: str | float,
-    end: str | float,
     instrument: Instrument | str,
+    start: str | float | None = None,
+    end: str | float | None = None,
     output_path: Path | None = None,
     config: TranscriptionConfig | None = None,
 ) -> TranscriptionResult:
-    """Download a [start, end] slice from YouTube and transcribe it to MusicXML."""
+    """Download a YouTube video (or optional [start, end] slice) and transcribe it to MusicXML."""
     t_start = time.perf_counter()
     inst = Instrument(instrument)
     cfg = config or TranscriptionConfig(instrument=inst)
     if cfg.instrument != inst:
         cfg = cfg.model_copy(update={"instrument": inst})
 
-    time_range = TimeRange.from_inputs(start, end)
+    start_val = _normalize_timestamp_input(start)
+    end_val = _normalize_timestamp_input(end)
+    time_range = (
+        None
+        if (start_val is None and end_val is None)
+        else TimeRange.from_inputs(start_val, end_val)
+    )
+    start_sec = time_range.start_sec if time_range is not None else None
+    end_sec = time_range.end_sec if time_range is not None else None
+
     video_id = extract_youtube_id(url)
     store = CatalogStore(cfg.cache_dir)
     job_hash = compute_job_hash(
         SourceType.YOUTUBE,
         video_id,
         cfg,
-        start_sec=time_range.start_sec,
-        end_sec=time_range.end_sec,
+        start_sec=start_sec,
+        end_sec=end_sec,
     )
     artifact_dir = store.artifact_dir(job_hash)
-    final_out = _resolve_output_path(
-        output_path, f"yt_{video_id}_{int(time_range.start_sec)}_{int(time_range.end_sec)}", inst, artifact_dir
-    )
+    if time_range is None:
+        default_stem = f"yt_{video_id}"
+        pipeline_title = f"YouTube {video_id}"
+    elif time_range.end_sec is None:
+        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_end"
+        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-end)"
+    else:
+        default_stem = f"yt_{video_id}_{int(time_range.start_sec)}_{int(time_range.end_sec)}"
+        pipeline_title = f"YouTube {video_id} ({int(time_range.start_sec)}s-{int(time_range.end_sec)}s)"
+
+    final_out = _resolve_output_path(output_path, default_stem, inst, artifact_dir)
 
     if cfg.use_cache:
         cached = store.get_cached_job(job_hash)
@@ -218,11 +241,9 @@ def transcribe_youtube(
                 }
             )
 
-    wav_path = artifact_dir / "yt_slice.wav"
+    wav_path = artifact_dir / ("yt_audio.wav" if time_range is None else "yt_slice.wav")
     download_youtube_slice(url, time_range, wav_path, sample_rate=44100)
-    score, warnings = _run_audio_pipeline(
-        wav_path, artifact_dir, cfg, title=f"YouTube {video_id} ({int(time_range.start_sec)}s-{int(time_range.end_sec)}s)"
-    )
+    score, warnings = _run_audio_pipeline(wav_path, artifact_dir, cfg, title=pipeline_title)
 
     return _enrich_and_export(
         score=score,
@@ -235,8 +256,8 @@ def transcribe_youtube(
         t_start=t_start,
         warnings=warnings,
         audio_wav_path=wav_path,
-        start_sec=time_range.start_sec,
-        end_sec=time_range.end_sec,
+        start_sec=start_sec,
+        end_sec=end_sec,
         title=f"YouTube {video_id}",
     )
 

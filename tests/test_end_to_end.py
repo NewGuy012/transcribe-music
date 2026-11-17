@@ -100,6 +100,112 @@ def test_end_to_end_youtube_slice_mocked(monkeypatch, tmp_path: Path) -> None:
     assert jobs[0]["end_sec"] == 12.0
 
 
+def test_end_to_end_youtube_defaults_to_whole_video_and_partial_ranges(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seen_ranges = []
+
+    def _fake_download_slice(url, time_range, output_wav, sample_rate=44100):
+        seen_ranges.append(time_range)
+        seconds = time_range.duration_sec if (time_range and time_range.duration_sec) else 2.0
+        _write_synthetic_piano_wav(output_wav, sr=sample_rate, seconds=seconds)
+        return output_wav
+
+    monkeypatch.setattr("transcribe_music.pipeline.download_youtube_slice", _fake_download_slice)
+
+    cfg = TranscriptionConfig(
+        instrument=Instrument.PIANO,
+        concerto_mode="solo",
+        device="cpu",
+        tempo_bpm=120.0,
+        cache_dir=tmp_path / ".cache",
+    )
+
+    # 1. Neither start nor end provided -> defaults to whole video (time_range=None)
+    res_full = transcribe_youtube(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        Instrument.PIANO,
+        config=cfg,
+    )
+    assert seen_ranges[-1] is None
+    assert res_full.musicxml_path.exists()
+    assert res_full.musicxml_path.name == "yt_dQw4w9WgXcQ_piano.musicxml"
+    assert res_full.measure_count >= 1
+
+    # 2. Only start provided -> start_sec to end of video
+    res_start_only = transcribe_youtube(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        Instrument.PIANO,
+        start="0:10",
+        config=cfg,
+    )
+    assert seen_ranges[-1] is not None
+    assert seen_ranges[-1].start_sec == 10.0
+    assert seen_ranges[-1].end_sec is None
+    assert res_start_only.musicxml_path.name == "yt_dQw4w9WgXcQ_10_end_piano.musicxml"
+
+    # 3. Only end provided -> 0.0 to end_sec
+    res_end_only = transcribe_youtube(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        Instrument.PIANO,
+        end="0:02",
+        config=cfg,
+    )
+    assert seen_ranges[-1] is not None
+    assert seen_ranges[-1].start_sec == 0.0
+    assert seen_ranges[-1].end_sec == 2.0
+    assert res_end_only.musicxml_path.name == "yt_dQw4w9WgXcQ_0_2_piano.musicxml"
+
+    assert len({res_full.job_hash, res_start_only.job_hash, res_end_only.job_hash}) == 3
+
+    store = CatalogStore(cfg.cache_dir)
+    jobs_by_hash = {j["job_hash"]: j for j in store.list_recent_jobs()}
+    assert jobs_by_hash[res_full.job_hash]["start_sec"] is None
+    assert jobs_by_hash[res_full.job_hash]["end_sec"] is None
+    assert jobs_by_hash[res_start_only.job_hash]["start_sec"] == 10.0
+    assert jobs_by_hash[res_start_only.job_hash]["end_sec"] is None
+    assert jobs_by_hash[res_end_only.job_hash]["start_sec"] == 0.0
+    assert jobs_by_hash[res_end_only.job_hash]["end_sec"] == 2.0
+
+    # 4. CLI youtube command without --start / --end
+    cli_out = tmp_path / "cli_yt_full.musicxml"
+    runner = CliRunner()
+    cli_res = runner.invoke(
+        app,
+        [
+            "youtube",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "--instrument",
+            "piano",
+            "--mode",
+            "solo",
+            "--device",
+            "cpu",
+            "--tempo",
+            "120",
+            "--cache-dir",
+            str(cfg.cache_dir),
+            "-o",
+            str(cli_out),
+        ],
+    )
+    assert cli_res.exit_code == 0, cli_res.output
+    assert cli_out.exists()
+    assert "Cache Hit" in cli_res.output
+    assert "Yes" in cli_res.output
+
+    # 5. Blank whitespace strings behave as omitted (hit whole-video cache)
+    res_blank = transcribe_youtube(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        Instrument.PIANO,
+        start="",
+        end="   ",
+        config=cfg,
+    )
+    assert res_blank.cached is True
+    assert res_blank.job_hash == res_full.job_hash
+
+
 def test_end_to_end_pdf_guitar_omr_mocked(monkeypatch, tmp_path: Path) -> None:
     pdf_path = tmp_path / "guitar_piece.pdf"
     c = canvas.Canvas(str(pdf_path))

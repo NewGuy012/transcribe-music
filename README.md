@@ -1,6 +1,6 @@
 # transcribe-music
 
-A fast, local-first Python CLI, SDK, and **Marimo** workbench that converts **YouTube video slices**, **audio files**, or **sheet music PDFs** into validated **MusicXML** containing **notes, durations, measures, chord symbols (`<harmony>`), guitar TAB (`<string>`, `<fret>`), and ergonomic fingerings (`<fingering>`)** for:
+A fast, local-first Python CLI, SDK, and **Marimo** workbench that converts **YouTube videos**, **audio files**, or **sheet music PDFs** into validated **MusicXML** containing **notes, durations, measures, chord symbols (`<harmony>`), guitar TAB (`<string>`, `<fret>`), and ergonomic fingerings (`<fingering>`)** for:
 
 - **Piano** (Grand Staff split, bundled `Transkun` v2 + `pianoplayer` in-memory optimization)
 - **Guitar** (Treble `8vb` transposition, fast `MR-MT3` + 6-string Viterbi TAB & chord-grip solver)
@@ -22,9 +22,11 @@ uv sync --all-extras
 ### CLI Usage
 
 ```bash
-# 1. YouTube slice (requires --start and --end; downloads only the requested audio range)
+# 1. YouTube video (defaults to the whole video; pass optional --start and/or --end to slice)
 uv run transcribe-music youtube "https://www.youtube.com/watch?v=..." \
-  --start 0:42 --end 2:15 --instrument cello -o suite_prelude.musicxml
+  --instrument cello -o suite_prelude.musicxml
+uv run transcribe-music youtube "https://www.youtube.com/watch?v=..." \
+  --start 0:42 --end 2:15 --instrument cello -o suite_prelude_slice.musicxml
 
 # 2. Full local audio file (WAV / MP3 / FLAC / M4A)
 uv run transcribe-music audio guitar_solo.mp3 \
@@ -53,9 +55,9 @@ from transcribe_music import Instrument, transcribe_audio, transcribe_pdf, trans
 
 res = transcribe_youtube(
     url="https://www.youtube.com/watch?v=...",
-    start="1:05",
-    end="2:30",
     instrument=Instrument.GUITAR,
+    start="1:05",  # optional; omit start & end for the whole video
+    end="2:30",
     output_path="out/guitar.musicxml",
 )
 print(res.musicxml_path, res.note_count, res.chord_count, res.fingering_count)

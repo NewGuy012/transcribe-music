@@ -17,7 +17,7 @@ from transcribe_music.storage.catalog import CatalogStore
 
 app = typer.Typer(
     name="transcribe-music",
-    help="Transcribe YouTube slices, audio files, or sheet music PDFs into enriched MusicXML.",
+    help="Transcribe YouTube videos, audio files, or sheet music PDFs into enriched MusicXML.",
     no_args_is_help=True,
 )
 cache_app = typer.Typer(help="Inspect or manage the DuckDB transcription cache.")
@@ -69,8 +69,18 @@ def _build_config(
 @app.command()
 def youtube(
     url: str = typer.Argument(..., help="YouTube video URL."),
-    start: str = typer.Option(..., "--start", "-s", help="Start timestamp (e.g. '0:42' or '42')."),
-    end: str = typer.Option(..., "--end", "-e", help="End timestamp (e.g. '2:15' or '135')."),
+    start: str | None = typer.Option(
+        None,
+        "--start",
+        "-s",
+        help="Optional start timestamp (e.g. '0:42' or '42'). Defaults to start of video.",
+    ),
+    end: str | None = typer.Option(
+        None,
+        "--end",
+        "-e",
+        help="Optional end timestamp (e.g. '2:15' or '135'). Defaults to end of video.",
+    ),
     instrument: Instrument = typer.Option(..., "--instrument", "-i", help="Target instrument."),
     output: Path | None = typer.Option(None, "--output", "-o", help="Output .musicxml path."),
     mode: Literal["auto", "solo", "concerto"] = typer.Option("auto", "--mode", help="Solo vs concerto handling."),
@@ -81,9 +91,9 @@ def youtube(
     tempo: float | None = typer.Option(None, "--tempo", help="Override BPM instead of auto beat tracking."),
     cache_dir: Path = typer.Option(Path(".transcribe_cache"), "--cache-dir", help="Cache directory."),
 ) -> None:
-    """Download a [start, end] YouTube audio slice and transcribe it to MusicXML."""
+    """Download a YouTube video (or optional start/end slice) and transcribe it to MusicXML."""
     cfg = _build_config(instrument, mode, device, chords, fingering, cache, tempo, cache_dir)
-    res = transcribe_youtube(url=url, start=start, end=end, instrument=instrument, output_path=output, config=cfg)
+    res = transcribe_youtube(url=url, instrument=instrument, start=start, end=end, output_path=output, config=cfg)
     _print_result(res)
 
 

@@ -26,7 +26,7 @@ def _():
     mo.md(
         """
         # transcribe-music Workbench
-        Convert **YouTube slices**, **audio files**, or **PDF sheet music** into validated **MusicXML**
+        Convert **YouTube videos**, **audio files**, or **PDF sheet music** into validated **MusicXML**
         with **notes, chord symbols, guitar TAB, and ergonomic fingerings** for Piano, Guitar, Violin, and Cello.
         """
     )
@@ -69,8 +69,16 @@ def _(Instrument, mo):
         label="YouTube URL",
         full_width=True,
     )
-    yt_start = mo.ui.text(value="0:00", label="Start Time (MM:SS or sec)")
-    yt_end = mo.ui.text(value="0:30", label="End Time (MM:SS or sec)")
+    yt_start = mo.ui.text(
+        value="",
+        placeholder="0:00 (optional)",
+        label="Start Time (MM:SS or sec, optional)",
+    )
+    yt_end = mo.ui.text(
+        value="",
+        placeholder="End of video (optional)",
+        label="End Time (MM:SS or sec, optional)",
+    )
 
     audio_upload = mo.ui.file(
         filetypes=[".wav", ".mp3", ".flac", ".m4a", ".ogg"],
@@ -85,7 +93,7 @@ def _(Instrument, mo):
 
     source_tabs = mo.ui.tabs(
         {
-            "YouTube (Sliced)": mo.vstack([yt_url, mo.hstack([yt_start, yt_end])]),
+            "YouTube": mo.vstack([yt_url, mo.hstack([yt_start, yt_end])]),
             "Audio File": audio_upload,
             "Sheet Music PDF": pdf_upload,
         }
@@ -120,12 +128,14 @@ def _(Instrument, mo):
 @app.cell
 def _(extract_youtube_id, mo, parse_timestamp, source_tabs, yt_start, yt_url):
     preview = None
-    if source_tabs.value == "YouTube (Sliced)" and yt_url.value.strip():
+    if source_tabs.value == "YouTube" and yt_url.value.strip():
         vid = extract_youtube_id(yt_url.value)
-        try:
-            start_s = int(parse_timestamp(yt_start.value))
-        except ValueError:
-            start_s = 0
+        start_s = 0
+        if yt_start.value.strip():
+            try:
+                start_s = int(parse_timestamp(yt_start.value))
+            except ValueError:
+                start_s = 0
         if len(vid) == 11:
             preview = mo.Html(
                 f'<iframe width="560" height="315" '
@@ -173,14 +183,14 @@ def _(
 
     tab_name = source_tabs.value
     result = None
-    if tab_name == "YouTube (Sliced)":
+    if tab_name == "YouTube":
         if not yt_url.value.strip():
             raise ValueError("Please enter a YouTube URL.")
         result = transcribe_youtube(
             url=yt_url.value.strip(),
-            start=yt_start.value.strip(),
-            end=yt_end.value.strip(),
             instrument=cfg.instrument,
+            start=yt_start.value.strip() or None,
+            end=yt_end.value.strip() or None,
             config=cfg,
         )
     elif tab_name == "Audio File":

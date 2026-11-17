@@ -143,26 +143,36 @@ def parse_timestamp(value: str | float) -> float:
 
 
 class TimeRange(BaseModel):
-    """Start and end timestamps (in seconds) for YouTube slicing."""
+    """Optional start and end timestamps (in seconds) for YouTube slicing."""
 
-    start_sec: float = Field(..., ge=0.0)
-    end_sec: float = Field(..., gt=0.0)
+    start_sec: float = Field(default=0.0, ge=0.0)
+    end_sec: float | None = Field(default=None, gt=0.0)
 
     @field_validator("end_sec")
     @classmethod
-    def _validate_order(cls, v: float, info) -> float:
+    def _validate_order(cls, v: float | None, info) -> float | None:
+        if v is None:
+            return None
         start = info.data.get("start_sec")
         if start is not None and v <= start:
             raise ValueError(f"end_sec ({v}) must be greater than start_sec ({start})")
         return v
 
     @property
-    def duration_sec(self) -> float:
+    def duration_sec(self) -> float | None:
+        if self.end_sec is None:
+            return None
         return self.end_sec - self.start_sec
 
     @classmethod
-    def from_inputs(cls, start: str | float, end: str | float) -> TimeRange:
-        return cls(start_sec=parse_timestamp(start), end_sec=parse_timestamp(end))
+    def from_inputs(
+        cls,
+        start: str | float | None = None,
+        end: str | float | None = None,
+    ) -> TimeRange:
+        start_sec = 0.0 if start is None else parse_timestamp(start)
+        end_sec = None if end is None else parse_timestamp(end)
+        return cls(start_sec=start_sec, end_sec=end_sec)
 
 
 class TranscriptionConfig(BaseModel):

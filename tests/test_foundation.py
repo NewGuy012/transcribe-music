@@ -2,6 +2,7 @@
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Self
 
 import music21
 import numpy as np
@@ -12,7 +13,7 @@ from reportlab.pdfgen import canvas
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.ingest.audio import normalize_audio_to_wav
 from transcribe_music.ingest.pdf import render_pdf_pages
-from transcribe_music.ingest.youtube import extract_youtube_id
+from transcribe_music.ingest.youtube import download_youtube_slice, extract_youtube_id
 from transcribe_music.models import (
     Instrument,
     SourceType,
@@ -35,14 +36,97 @@ def test_parse_timestamp_formats() -> None:
     assert tr.end_sec == 135.0
     assert tr.duration_sec == 93.0
 
+    tr_full = TimeRange.from_inputs()
+    assert tr_full.start_sec == 0.0
+    assert tr_full.end_sec is None
+    assert tr_full.duration_sec is None
+
+    tr_start_only = TimeRange.from_inputs("0:42", None)
+    assert tr_start_only.start_sec == 42.0
+    assert tr_start_only.end_sec is None
+    assert tr_start_only.duration_sec is None
+
+    tr_end_only = TimeRange.from_inputs(None, "2:15")
+    assert tr_end_only.start_sec == 0.0
+    assert tr_end_only.end_sec == 135.0
+    assert tr_end_only.duration_sec == 135.0
+
     with pytest.raises(ValueError):
         TimeRange.from_inputs("2:00", "1:00")
+
+    with pytest.raises(ValueError):
+        TimeRange.from_inputs(None, "0:00")
 
 
 def test_extract_youtube_id() -> None:
     assert extract_youtube_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=12") == "dQw4w9WgXcQ"
     assert extract_youtube_id("https://youtu.be/dQw4w9WgXcQ?si=abc") == "dQw4w9WgXcQ"
     assert extract_youtube_id("https://youtube.com/shorts/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+
+
+def test_download_youtube_slice_full_and_partial_ranges(monkeypatch, tmp_path: Path) -> None:
+    import yt_dlp
+
+    captured_opts: list[dict] = []
+    sr = 44100
+    t = np.linspace(0, 1.5, int(sr * 1.5), endpoint=False)
+    sample_wave = (0.3 * np.sin(2 * np.pi * 440.0 * t)).astype(np.float32)
+
+    class _FakeYoutubeDL:
+        def __init__(self, opts: dict) -> None:
+            self.opts = opts
+            captured_opts.append(opts)
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def download(self, urls: list[str]) -> None:
+            raw_path = Path(self.opts["outtmpl"].replace("%(ext)s", "wav"))
+            sf.write(raw_path, sample_wave, sr)
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _FakeYoutubeDL)
+
+    full_wav = tmp_path / "full" / "out.wav"
+    download_youtube_slice("https://youtu.be/dQw4w9WgXcQ", None, full_wav, sample_rate=sr)
+    assert full_wav.exists()
+    assert "download_ranges" not in captured_opts[-1]
+    assert "force_keyframes_at_cuts" not in captured_opts[-1]
+    full_data, _ = sf.read(full_wav)
+    assert len(full_data) == len(sample_wave)
+
+    zero_to_end_wav = tmp_path / "zero_end" / "out.wav"
+    download_youtube_slice(
+        "https://youtu.be/dQw4w9WgXcQ",
+        TimeRange(start_sec=0.0, end_sec=None),
+        zero_to_end_wav,
+        sample_rate=sr,
+    )
+    assert "download_ranges" not in captured_opts[-1]
+
+    start_only_wav = tmp_path / "start_only" / "out.wav"
+    download_youtube_slice(
+        "https://youtu.be/dQw4w9WgXcQ",
+        TimeRange.from_inputs("0:01", None),
+        start_only_wav,
+        sample_rate=sr,
+    )
+    assert "download_ranges" in captured_opts[-1]
+    assert captured_opts[-1]["download_ranges"].ranges == [(1.0, float("inf"))]
+
+    sliced_wav = tmp_path / "sliced" / "out.wav"
+    download_youtube_slice(
+        "https://youtu.be/dQw4w9WgXcQ",
+        TimeRange.from_inputs("0:00", "0:01"),
+        sliced_wav,
+        sample_rate=sr,
+    )
+    assert "download_ranges" in captured_opts[-1]
+    assert captured_opts[-1]["download_ranges"].ranges == [(0.0, 1.0)]
+    sliced_data, _ = sf.read(sliced_wav)
+    assert len(sliced_data) == sr
 
 
 def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:
