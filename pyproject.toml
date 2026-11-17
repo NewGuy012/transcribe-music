@@ -13,32 +13,30 @@ dependencies = [
     "typer",
     "pydantic",
     "duckdb",
-    "marimo",
-    "verovio",
     "music21",
-    "partitura",
     "librosa",
     "soundfile",
     "numpy",
-    "scipy",
+    "soxr",
     "pretty-midi",
-    "mido",
     "yt-dlp",
-    "static-ffmpeg",
+    "imageio-ffmpeg",
     "pymupdf",
     "mt3-infer[torch]",
     "transkun",
-    "pianoplayer",
 ]
 
 [tool.uv]
 environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [project.optional-dependencies]
+ui = [
+    "marimo",
+    "verovio",
+]
 dev = [
     "pytest",
     "ruff",
-    "reportlab",
 ]
 
 [project.scripts]

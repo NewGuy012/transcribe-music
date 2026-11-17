@@ -6,9 +6,9 @@ from typing import Self
 
 import music21
 import numpy as np
+import pymupdf
 import pytest
 import soundfile as sf
-from reportlab.pdfgen import canvas
 
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.ingest.audio import normalize_audio_to_wav
@@ -187,12 +187,11 @@ def test_audio_normalization_and_pdf_rasterization(tmp_path: Path) -> None:
     assert len(data) == int(sr * 0.5)
 
     pdf_path = tmp_path / "sheet.pdf"
-    c = canvas.Canvas(str(pdf_path))
-    c.drawString(100, 700, "Page 1")
-    c.showPage()
-    c.drawString(100, 700, "Page 2")
-    c.showPage()
-    c.save()
+    doc = pymupdf.open()
+    for label in ("Page 1", "Page 2"):
+        doc.new_page().insert_text((72, 72), label)
+    doc.save(str(pdf_path))
+    doc.close()
 
     pages = render_pdf_pages(pdf_path, tmp_path / "pages", dpi=150)
     assert len(pages) == 2

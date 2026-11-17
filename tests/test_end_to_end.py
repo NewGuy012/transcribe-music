@@ -5,9 +5,9 @@ from pathlib import Path
 
 import music21
 import numpy as np
+import pymupdf
+import pytest
 import soundfile as sf
-import verovio
-from reportlab.pdfgen import canvas
 from typer.testing import CliRunner
 
 from transcribe_music import (
@@ -53,7 +53,8 @@ def test_end_to_end_audio_piano_and_duckdb_cache(tmp_path: Path) -> None:
     assert res1.measure_count >= 1
     assert res1.fingering_count == res1.note_count
 
-    # Verify Verovio can engrave our generated MusicXML into SVG
+    # Verify Verovio can engrave our generated MusicXML into SVG when ui extra is installed
+    verovio = pytest.importorskip("verovio")
     tk = verovio.toolkit()
     assert tk.loadData(out_xml.read_text(encoding="utf-8"))
     svg = tk.renderToSVG(1)
@@ -208,12 +209,11 @@ def test_end_to_end_youtube_defaults_to_whole_video_and_partial_ranges(
 
 def test_end_to_end_pdf_guitar_omr_mocked(monkeypatch, tmp_path: Path) -> None:
     pdf_path = tmp_path / "guitar_piece.pdf"
-    c = canvas.Canvas(str(pdf_path))
-    c.drawString(100, 700, "Page 1")
-    c.showPage()
-    c.drawString(100, 700, "Page 2")
-    c.showPage()
-    c.save()
+    doc = pymupdf.open()
+    for label in ("Page 1", "Page 2"):
+        doc.new_page().insert_text((72, 72), label)
+    doc.save(str(pdf_path))
+    doc.close()
 
     def _fake_homr(image_path: Path) -> Path:
         s = music21.stream.Score()

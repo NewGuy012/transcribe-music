@@ -13,14 +13,13 @@ import soundfile as sf
 
 @lru_cache(maxsize=1)
 def get_ffmpeg_executable() -> str:
-    """Return system ffmpeg or auto-fetch static ARM64/x86_64 binary via static-ffmpeg."""
+    """Return system ffmpeg or bundled imageio-ffmpeg executable."""
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
         return system_ffmpeg
-    from static_ffmpeg import run as static_run
+    import imageio_ffmpeg
 
-    ffmpeg_path, _ = static_run.get_or_fetch_platform_executables_else_raise()
-    return ffmpeg_path
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def normalize_audio_to_wav(
@@ -82,12 +81,12 @@ def normalize_audio_to_wav(
 
 
 def load_mono_audio(wav_path: Path, target_sr: int) -> tuple[np.ndarray, int]:
-    """Load WAV as mono float32 array resampled cleanly if needed."""
+    """Load WAV as mono float32 array resampled if needed."""
     data, sr = sf.read(str(wav_path), dtype="float32", always_2d=True)
     mono = np.mean(data, axis=1).astype(np.float32)
     if sr != target_sr:
-        import librosa
+        import soxr
 
-        mono = librosa.resample(mono, orig_sr=sr, target_sr=target_sr).astype(np.float32)
+        mono = soxr.resample(mono, int(sr), target_sr).astype(np.float32)
         sr = target_sr
-    return mono, sr
+    return mono, int(sr)

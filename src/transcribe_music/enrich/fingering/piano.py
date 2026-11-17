@@ -1,140 +1,122 @@
-"""In-memory piano fingering optimizer using pianoplayer.hand.Hand + chord fallback."""
+"""O(N) Viterbi piano fingering solver for right- and left-hand Grand Staff parts."""
 
 from __future__ import annotations
 
-import music21
-from pianoplayer.hand import Hand
-from pianoplayer.models import INote, keypos_midi
+from dataclasses import dataclass
+from itertools import combinations
 
+import music21
+
+from transcribe_music.enrich.fingering.viterbi import solve_viterbi
 from transcribe_music.export.musicxml import sorted_playable_notes
 
-
-def _clear_fingerings(part: music21.stream.Part) -> None:
-    for el in sorted_playable_notes(part):
-        el.articulations = [
-            a for a in el.articulations if not isinstance(a, music21.articulations.Fingering)
-        ]
+# White-key x coordinates in white-key units (~2.35 cm); black keys sit at half-steps.
+_KEY_X = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0)
+_BLACK_PCS = frozenset({1, 3, 6, 8, 10})
+_FINGER_BIAS = {1: 0.0, 2: 0.05, 3: 0.05, 4: 0.2, 5: 0.3}
 
 
-def _step_fallback_finger(prev_midi: int | None, cur_midi: int, prev_finger: int, side: str) -> int:
-    if prev_midi is None:
-        return 3
-    diff = cur_midi - prev_midi
-    if diff == 0:
-        return prev_finger
-    direction = 1 if side == "right" else -1
-    step = diff * direction
-    candidate = prev_finger + (1 if step > 0 else -1)
-    if candidate > 5:
-        return 1
-    if candidate < 1:
-        return 5
-    return candidate
+@dataclass(frozen=True)
+class _PianoPose:
+    xs: tuple[float, ...]
+    is_black: tuple[bool, ...]
+    fingers: tuple[int, ...]
+
+
+def _key_geometry(midi: int) -> tuple[float, bool]:
+    octave, pc = divmod(midi, 12)
+    return octave * 7.0 + _KEY_X[pc], pc in _BLACK_PCS
+
+
+def _chord_poses(midis: tuple[int, ...], side: str) -> list[_PianoPose]:
+    geom = [_key_geometry(m) for m in midis]
+    xs = tuple(g[0] for g in geom)
+    is_black = tuple(g[1] for g in geom)
+    k = len(midis)
+    pool = (1, 2, 3, 4, 5) if side == "right" else (5, 4, 3, 2, 1)
+
+    if k == 1:
+        return [_PianoPose(xs=xs, is_black=is_black, fingers=(f,)) for f in pool]
+    if k > 5:
+        spread = tuple(pool[round(i * 4 / (k - 1))] for i in range(k))
+        return [_PianoPose(xs=xs, is_black=is_black, fingers=spread)]
+
+    return [_PianoPose(xs=xs, is_black=is_black, fingers=combo) for combo in combinations(pool, k)]
 
 
 def _annotate_single_part(part: music21.stream.Part, side: str) -> None:
-    _clear_fingerings(part)
-
-    # Flatten notes/chords in chronological order; keep mapping back to music21 objects
     elements = sorted_playable_notes(part)
     if not elements:
         return
 
-    inotes: list[INote] = []
-    target_slots: list[tuple[music21.note.NotRest, int]] = []
-    time_cursor = 0.0
-    note_id = 0
-
     for el in elements:
-        onset_beat = float(el.getOffsetInHierarchy(part))
-        dur_s = max(0.08, float(el.duration.quarterLength) * 0.5)
+        el.articulations = [
+            a for a in el.articulations if not isinstance(a, music21.articulations.Fingering)
+        ]
+
+    ordered_indices: list[list[int]] = []
+    steps: list[list[_PianoPose]] = []
+    for el in elements:
         if isinstance(el, music21.note.Note):
-            an = INote(
-                name=el.pitch.name,
-                isChord=False,
-                isBlack=bool(el.pitch.alter != 0),
-                pitch=int(el.pitch.midi),
-                octave=int(el.pitch.octave or 4),
-                x=float(keypos_midi(type("_P", (), {"pitch": int(el.pitch.midi)})())),
-                time=max(time_cursor, onset_beat * 0.5),
-                duration=dur_s,
-                noteID=note_id,
-            )
-            inotes.append(an)
-            target_slots.append((el, 0))
-            note_id += 1
-            time_cursor = an.time + 0.01
+            ordered_indices.append([0])
+            steps.append(_chord_poses((int(el.pitch.midi),), side))
         elif isinstance(el, music21.chord.Chord):
-            # Order chord notes ascending for RH, descending for LH ergonomic arpeggiation
-            ordered = sorted(
-                enumerate(el.notes),
-                key=lambda pair: pair[1].pitch.midi,
-                reverse=(side == "left"),
-            )
-            for stagger_idx, (orig_idx, n) in enumerate(ordered):
-                an = INote(
-                    name=n.pitch.name,
-                    isChord=True,
-                    isBlack=bool(n.pitch.alter != 0),
-                    pitch=int(n.pitch.midi),
-                    octave=int(n.pitch.octave or 4),
-                    x=float(keypos_midi(type("_P", (), {"pitch": int(n.pitch.midi)})())),
-                    time=max(time_cursor, onset_beat * 0.5 + stagger_idx * 0.04),
-                    duration=dur_s,
-                    noteID=note_id,
-                    chordID=id(el),
-                )
-                inotes.append(an)
-                target_slots.append((el, orig_idx))
-                note_id += 1
-            time_cursor = onset_beat * 0.5 + len(ordered) * 0.04
+            pairs = sorted(enumerate(el.notes), key=lambda p: int(p[1].pitch.midi))
+            ordered_indices.append([idx for idx, _ in pairs])
+            steps.append(_chord_poses(tuple(int(n.pitch.midi) for _, n in pairs), side))
 
-    if not inotes:
-        return
+    sign = 1.0 if side == "right" else -1.0
 
-    try:
-        hand = Hand(inotes, side=side, size="M")
-        hand.verbose = False
-        hand.autodepth = True
-        hand.generate(nmeasures=10000)
-    except Exception as exc:  # noqa: BLE001 — fallback to monotonic finger assignment
-        import logging
+    def _unary(_t: int, pose: _PianoPose) -> float:
+        cost = 0.0
+        for f, blk in zip(pose.fingers, pose.is_black, strict=True):
+            cost += _FINGER_BIAS[f]
+            if blk and f == 1:
+                cost += 0.9
+            elif blk and f == 5:
+                cost += 0.5
+        for i in range(len(pose.fingers) - 1):
+            dx = pose.xs[i + 1] - pose.xs[i]
+            df = abs(pose.fingers[i + 1] - pose.fingers[i])
+            max_span = df * (1.8 if 1 in (pose.fingers[i], pose.fingers[i + 1]) else 1.25)
+            if dx > max_span:
+                cost += 1.5 * (dx - max_span)
+            elif dx < df * 0.45:
+                cost += 0.6 * (df * 0.45 - dx)
+        return cost
 
-        logging.getLogger(__name__).debug("pianoplayer fallback: %s", exc)
+    def _transition(_t: int, prev: _PianoPose, cur: _PianoPose) -> float:
+        prev_x = sum(prev.xs) / len(prev.xs)
+        cur_x = sum(cur.xs) / len(cur.xs)
+        prev_f = sum(prev.fingers) / len(prev.fingers)
+        cur_f = sum(cur.fingers) / len(cur.fingers)
+        dx = cur_x - prev_x
+        if dx == 0.0:
+            return 0.0 if prev.fingers == cur.fingers else 0.4
 
-    # Map results back onto music21 Notes & Chords (ensuring valid 1..5 on every slot)
-    chord_fingers: dict[int, dict[int, int]] = {}
-    chord_refs: dict[int, music21.chord.Chord] = {}
-    prev_midi: int | None = None
-    prev_finger = 3
+        dir_dx = dx * sign
+        df = (cur_f - prev_f) * sign
+        # Thumb-under or finger-over crossing in scale motion
+        if len(prev.fingers) == 1 and len(cur.fingers) == 1:
+            pf, cf = prev.fingers[0], cur.fingers[0]
+            if cf == 1 and pf in (3, 4) and 0.0 < dir_dx <= 2.5:
+                return 0.9
+            if pf == 1 and cf in (3, 4) and -2.5 <= dir_dx < 0.0:
+                return 0.9
 
-    for an, (el, orig_idx) in zip(inotes, target_slots, strict=True):
-        raw_f = int(an.fingering) if isinstance(an.fingering, (int, float)) else 0
-        finger = raw_f if 1 <= raw_f <= 5 else _step_fallback_finger(prev_midi, int(an.pitch), prev_finger, side)
-        prev_midi = int(an.pitch)
-        prev_finger = finger
+        stretch = abs(dir_dx - df * 1.15)
+        if (dir_dx > 0.0 and df <= 0.0) or (dir_dx < 0.0 and df >= 0.0):
+            return 1.8 + 0.8 * stretch
+        return 0.55 * stretch
 
+    best = solve_viterbi(steps, _unary, _transition)
+    for el, orig_order, pose in zip(elements, ordered_indices, best, strict=True):
         if isinstance(el, music21.note.Note):
-            el.articulations.append(music21.articulations.Fingering(finger))
+            el.articulations.append(music21.articulations.Fingering(pose.fingers[0]))
         elif isinstance(el, music21.chord.Chord):
-            cid = id(el)
-            chord_refs[cid] = el
-            chord_fingers.setdefault(cid, {})[orig_idx] = finger
-
-    for cid, el in chord_refs.items():
-        slot_map = chord_fingers[cid]
-        # Attach in el.notes order so music21 distributes 1-to-1 across chord <note>s
-        used: set[int] = set()
-        for idx in range(len(el.notes)):
-            f = slot_map.get(idx, 1)
-            # Avoid identical finger on two simultaneous chord tones when 1..5 available
-            if f in used and len(used) < 5:
-                for alt in (1, 2, 3, 4, 5):
-                    if alt not in used:
-                        f = alt
-                        break
-            used.add(f)
-            el.articulations.append(music21.articulations.Fingering(f))
+            by_orig = dict(zip(orig_order, pose.fingers, strict=True))
+            for idx in range(len(el.notes)):
+                el.articulations.append(music21.articulations.Fingering(by_orig[idx]))
 
 
 def annotate_piano_fingering(score: music21.stream.Score) -> music21.stream.Score:
@@ -142,7 +124,6 @@ def annotate_piano_fingering(score: music21.stream.Score) -> music21.stream.Scor
     parts = list(score.parts)
     if not parts:
         return score
-
     _annotate_single_part(parts[0], side="right")
     if len(parts) >= 2:
         _annotate_single_part(parts[1], side="left")

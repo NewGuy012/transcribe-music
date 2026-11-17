@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -139,13 +140,26 @@ def ui(
     edit: bool = typer.Option(False, "--edit", help="Launch in Marimo notebook edit mode."),
 ) -> None:
     """Launch the interactive Marimo + Verovio + DuckDB workbench."""
+    missing = [pkg for pkg in ("marimo", "verovio") if importlib.util.find_spec(pkg) is None]
+    if missing:
+        console.print(
+            f"[red]Missing UI dependencies ({', '.join(missing)}).[/red] "
+            "Install them with: [bold]uv sync --extra ui[/bold]"
+        )
+        raise typer.Exit(code=1)
     notebook = Path(__file__).resolve().parents[2] / "notebooks" / "workbench.py"
     if not notebook.exists():
         notebook = Path.cwd() / "notebooks" / "workbench.py"
     if not notebook.exists():
         raise typer.BadParameter(f"Workbench notebook not found at {notebook}")
     mode_cmd = "edit" if edit else "run"
-    subprocess.run([sys.executable, "-m", "marimo", mode_cmd, str(notebook), "--port", str(port)], check=True)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "marimo", mode_cmd, str(notebook), "--port", str(port)],
+            check=True,
+        )
+    except KeyboardInterrupt:
+        pass
 
 
 @cache_app.command("list")
