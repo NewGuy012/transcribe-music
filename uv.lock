@@ -692,6 +692,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyguitarpro" },
     { name = "pymupdf" },
+    { name = "requests" },
     { name = "typer" },
 ]
 
@@ -716,6 +717,7 @@ requires-dist = [
     { name = "pyguitarpro" },
     { name = "pymupdf" },
     { name = "pytest", marker = "extra == 'dev'" },
+    { name = "requests" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "typer" },
     { name = "verovio", marker = "extra == 'ui'" },

@@ -12,7 +12,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from transcribe_music.models import Instrument, TranscriptionConfig, TranscriptionResult
+from transcribe_music.ingest.search import download_score_result, search_digital_scores
+from transcribe_music.models import (
+    Instrument,
+    ScoreSearchResult,
+    TranscriptionConfig,
+    TranscriptionResult,
+)
 from transcribe_music.pipeline import (
     convert_music,
     inspect_score,
@@ -69,6 +75,25 @@ def _print_result(res: TranscriptionResult) -> None:
     console.print(table)
     for warn in res.warnings:
         console.print(f"[yellow]Warning:[/yellow] {warn}")
+
+
+def _print_search_results(query: str, results: list[ScoreSearchResult]) -> None:
+    table = Table(title=f"Top {len(results)} Digital Scores for {query!r}")
+    table.add_column("#", no_wrap=True)
+    table.add_column("Format", no_wrap=True)
+    table.add_column("Title")
+    table.add_column("Composer")
+    table.add_column("Source", no_wrap=True)
+    for idx, item in enumerate(results, start=1):
+        fmt_label = item.format_ext.lstrip(".").upper()
+        table.add_row(
+            str(idx),
+            fmt_label,
+            item.title,
+            item.composer or "-",
+            item.source,
+        )
+    console.print(table)
 
 
 def _build_config(
@@ -235,6 +260,114 @@ def inspect(
             pitch_span,
         )
     console.print(table)
+
+
+@app.command()
+def search(
+    query: Annotated[
+        str,
+        typer.Argument(
+            help="Title, composer, or keywords to search (e.g. 'Moonlight Sonata', 'Bach Cello')."
+        ),
+    ],
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", min=1, max=25, help="Maximum number of top results.")
+    ] = 5,
+    select: Annotated[
+        int | None,
+        typer.Option("--select", "-s", min=1, help="1-based result index to download immediately."),
+    ] = None,
+    output: OutputOpt = None,
+    download_dir: Annotated[
+        Path,
+        typer.Option("--dir", "-d", help="Directory for downloaded file when --output is omitted."),
+    ] = Path("downloads"),
+    musicxml_only: Annotated[
+        bool,
+        typer.Option(
+            "--musicxml-only",
+            help="Only return native MusicXML (.musicxml/.mxl/.xml) results.",
+        ),
+    ] = False,
+    formats: Annotated[
+        str | None,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Comma-separated extension filter (e.g. 'mxl,musicxml' or 'krn,mid').",
+        ),
+    ] = None,
+    instrument: Annotated[
+        Instrument | None,
+        typer.Option(
+            "--instrument",
+            "-i",
+            help="Optionally convert the downloaded score into enriched MusicXML immediately.",
+        ),
+    ] = None,
+    offline: Annotated[
+        bool,
+        typer.Option("--offline", help="Search local corpus and cached indices without network calls."),
+    ] = False,
+    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
+) -> None:
+    """Search digital scores (preferring MusicXML) and download a selected result."""
+    parsed_formats = (
+        [tok.strip() for tok in formats.split(",") if tok.strip()] if formats else None
+    )
+    results = search_digital_scores(
+        query,
+        limit=limit,
+        musicxml_only=musicxml_only,
+        formats=parsed_formats,
+        include_remote=not offline,
+        cache_dir=cache_dir,
+    )
+    if not results:
+        console.print(f"[yellow]No matching digital scores found for {query!r}.[/yellow]")
+        return
+
+    _print_search_results(query, results)
+
+    chosen_idx: int
+    if select is not None:
+        if not (1 <= select <= len(results)):
+            raise typer.BadParameter(f"--select must be between 1 and {len(results)}, got {select}.")
+        chosen_idx = select
+    else:
+        raw_choice = typer.prompt(
+            f"Select result to download [1-{len(results)}] (Enter or 'q' to cancel)",
+            default="",
+            show_default=False,
+        ).strip()
+        if not raw_choice or raw_choice.lower() in {"q", "quit", "exit", "0", "n", "no"}:
+            console.print("Download cancelled.")
+            return
+        if not raw_choice.isdigit() or not (1 <= int(raw_choice) <= len(results)):
+            raise typer.BadParameter(
+                f"Invalid selection {raw_choice!r}. Enter a number from 1 to {len(results)}."
+            )
+        chosen_idx = int(raw_choice)
+
+    chosen = results[chosen_idx - 1]
+    saved_path = download_score_result(
+        chosen,
+        output_path=output,
+        download_dir=download_dir,
+    )
+    console.print(
+        f"[green]Downloaded:[/green] {saved_path} "
+        f"({chosen.format_ext.lstrip('.').upper()} from {chosen.source})"
+    )
+
+    if instrument is not None:
+        cfg = TranscriptionConfig(instrument=instrument, cache_dir=cache_dir)
+        res = convert_music(input_path=saved_path, instrument=instrument, config=cfg)
+        _print_result(res)
+    else:
+        console.print(
+            f"Next: [bold]transcribe-music convert \"{saved_path}\" --instrument piano[/bold]"
+        )
 
 
 @app.command()

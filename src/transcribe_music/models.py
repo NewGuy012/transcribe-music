@@ -145,3 +145,17 @@ class TranscriptionResult(BaseModel):
     backend: str | None = None
     selected_part: str | None = None
     warnings: list[str] = Field(default_factory=list)
+
+
+class ScoreSearchResult(BaseModel):
+    """Search hit for a downloadable digital symbolic music score."""
+
+    title: str
+    composer: str | None = None
+    format_ext: str
+    source: str
+    filename: str
+    download_url: str | None = None
+    local_corpus_path: str | None = None
+    archive_identifier: str | None = None
+    score: float = 0.0

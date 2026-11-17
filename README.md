@@ -47,6 +47,11 @@ uv sync --all-extras
 ### CLI Usage
 
 ```bash
+# 0. Search public digital score catalogs (MusicXML preferred), show top 5, and download your pick
+uv run transcribe-music search "Moonlight Sonata"
+# Or download selection #1 and enrich immediately for piano:
+uv run transcribe-music search "Moonlight Sonata" --select 1 --instrument piano
+
 # 1. Inspect parts/tracks inside a multi-part digital score
 uv run transcribe-music inspect haydn_cello_concerto.mxl
 

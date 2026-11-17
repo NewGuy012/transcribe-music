@@ -1,9 +1,11 @@
 """transcribe-music public Python SDK."""
 
+from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
     Instrument,
     PartInfo,
     ScoreInspection,
+    ScoreSearchResult,
     SourceType,
     TranscriptionConfig,
     TranscriptionResult,
@@ -21,12 +23,15 @@ __all__ = [
     "Instrument",
     "PartInfo",
     "ScoreInspection",
+    "ScoreSearchResult",
     "SourceType",
     "TranscriptionConfig",
     "TranscriptionResult",
     "__version__",
     "convert_music",
+    "download_score_result",
     "inspect_score",
+    "search_digital_scores",
     "transcribe_pdf",
     "transcribe_score",
 ]
