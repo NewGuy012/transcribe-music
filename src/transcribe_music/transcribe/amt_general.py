@@ -7,7 +7,6 @@ import urllib.request
 from pathlib import Path
 
 import pretty_midi
-import soundfile as sf
 
 from transcribe_music.ingest.audio import load_mono_audio
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
@@ -106,7 +105,7 @@ def transcribe_with_mt3(
     cache_dir: Path,
     output_midi_path: Path,
     device: str = "auto",
-) -> tuple[pretty_midi.PrettyMIDI, pretty_midi.PrettyMIDI, list[str]]:
+) -> tuple[pretty_midi.PrettyMIDI, list[str]]:
     """Run MR-MT3 (fast solo) or YourMT3 (concerto/multi-instrument) on WAV audio."""
     import mt3_infer
 
@@ -119,7 +118,7 @@ def transcribe_with_mt3(
     # Trim leading/trailing silence? No — preserve exact timeline for beat sync.
     if not mono.size:
         empty = pretty_midi.PrettyMIDI(initial_tempo=120.0)
-        return empty, empty, ["Input audio slice was empty."]
+        return empty, ["Input audio slice was empty."]
 
     # Ensure safe float range [-1, 1]
     peak = float(abs(mono).max())
@@ -179,9 +178,4 @@ def transcribe_with_mt3(
         solo_midi.instruments.append(inst)
 
     solo_midi.write(str(output_midi_path))
-    return solo_midi, full_midi, warnings
-
-
-def get_audio_duration_sec(wav_path: Path) -> float:
-    info = sf.info(str(wav_path))
-    return float(info.frames) / float(info.samplerate)
+    return solo_midi, warnings

@@ -93,10 +93,8 @@ def prune_concerto_notes(
         pruned.extend(cluster)
         idx = j
 
-    # Trim monophonic overlaps cleanly for bowed strings when not double-stopped
+    # Clamp notes longer than 4.5s on bowed strings (typical AMT bleed artifact)
     if spec.max_polyphony == 2 and len(pruned) > 1:
-        pruned.sort(key=lambda n: (n.start, n.pitch))
-        # Clamp notes running longer than 4.0s (unlikely single bow in AMT bleed)
         for n in pruned:
             if n.end - n.start > 4.5:
                 n.end = n.start + 4.5

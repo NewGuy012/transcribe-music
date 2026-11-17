@@ -163,7 +163,7 @@ def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:
         fingering_count=metrics.fingering_count,
         elapsed_sec=0.12,
     )
-    store.record_job(res, cfg, metrics.measures, metrics.notes, metrics.chords)
+    store.record_job(res, cfg)
 
     cached = store.get_cached_job(job_hash)
     assert cached is not None

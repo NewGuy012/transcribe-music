@@ -108,9 +108,6 @@ def _enrich_and_export(
     store.record_job(
         result=result,
         config=config,
-        measures=metrics.measures,
-        notes=metrics.notes,
-        chords=metrics.chords,
         start_sec=start_sec,
         end_sec=end_sec,
     )
@@ -135,7 +132,7 @@ def _run_audio_pipeline(
 
     if instrument == Instrument.PIANO:
         if is_concerto:
-            solo_midi, _, mt3_warn = transcribe_with_mt3(
+            solo_midi, mt3_warn = transcribe_with_mt3(
                 wav_path,
                 instrument=Instrument.PIANO,
                 use_multi_track=True,
@@ -154,7 +151,7 @@ def _run_audio_pipeline(
     else:
         # Guitar solo uses ultra-fast MR-MT3; concerto/strings with accompaniment use YourMT3
         use_multi = is_concerto
-        solo_midi, _, mt3_warn = transcribe_with_mt3(
+        solo_midi, mt3_warn = transcribe_with_mt3(
             wav_path,
             instrument=instrument,
             use_multi_track=use_multi,

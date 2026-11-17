@@ -42,8 +42,6 @@ class InstrumentSpec:
     gm_programs: tuple[int, ...]
     ensemble_fallback_programs: tuple[int, ...]
     open_string_midi: tuple[int, ...]  # Ordered string 1 (highest) -> string N (lowest)
-    supports_tab: bool
-    supports_thumb_fingering: bool
 
 
 INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
@@ -58,8 +56,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         gm_programs=tuple(range(8)),
         ensemble_fallback_programs=(),
         open_string_midi=(),
-        supports_tab=False,
-        supports_thumb_fingering=False,
     ),
     Instrument.GUITAR: InstrumentSpec(
         instrument=Instrument.GUITAR,
@@ -72,8 +68,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         gm_programs=tuple(range(24, 32)),
         ensemble_fallback_programs=(),
         open_string_midi=(64, 59, 55, 50, 45, 40),  # E4, B3, G3, D3, A2, E2
-        supports_tab=True,
-        supports_thumb_fingering=False,
     ),
     Instrument.VIOLIN: InstrumentSpec(
         instrument=Instrument.VIOLIN,
@@ -86,8 +80,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         gm_programs=(40,),
         ensemble_fallback_programs=(48, 49),
         open_string_midi=(76, 69, 62, 55),  # E5, A4, D4, G3
-        supports_tab=False,
-        supports_thumb_fingering=False,
     ),
     Instrument.CELLO: InstrumentSpec(
         instrument=Instrument.CELLO,
@@ -100,8 +92,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         gm_programs=(42,),
         ensemble_fallback_programs=(48, 49, 43),
         open_string_midi=(57, 50, 43, 36),  # A3, D3, G2, C2
-        supports_tab=False,
-        supports_thumb_fingering=True,
     ),
 }
 

@@ -1,10 +1,9 @@
-"""Embedded DuckDB catalog for content-addressed caching and score analytics."""
+"""Embedded DuckDB catalog for content-addressed job caching."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -36,71 +35,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     warnings_json VARCHAR NOT NULL,
     created_at TIMESTAMP NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS measures (
-    job_hash VARCHAR NOT NULL,
-    part_idx INTEGER NOT NULL,
-    measure_number INTEGER NOT NULL,
-    time_signature VARCHAR,
-    key_signature VARCHAR,
-    duration_ql DOUBLE NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS notes (
-    job_hash VARCHAR NOT NULL,
-    part_idx INTEGER NOT NULL,
-    measure_number INTEGER NOT NULL,
-    offset_ql DOUBLE NOT NULL,
-    duration_ql DOUBLE NOT NULL,
-    midi INTEGER NOT NULL,
-    pitch_name VARCHAR NOT NULL,
-    is_chord BOOLEAN NOT NULL,
-    finger VARCHAR,
-    string_num INTEGER,
-    fret_num INTEGER
-);
-
-CREATE TABLE IF NOT EXISTS chords (
-    job_hash VARCHAR NOT NULL,
-    measure_number INTEGER NOT NULL,
-    offset_ql DOUBLE NOT NULL,
-    symbol VARCHAR NOT NULL,
-    root VARCHAR NOT NULL,
-    kind VARCHAR NOT NULL
-);
 """
-
-
-@dataclass(frozen=True)
-class MeasureRow:
-    part_idx: int
-    measure_number: int
-    time_signature: str | None
-    key_signature: str | None
-    duration_ql: float
-
-
-@dataclass(frozen=True)
-class NoteRow:
-    part_idx: int
-    measure_number: int
-    offset_ql: float
-    duration_ql: float
-    midi: int
-    pitch_name: str
-    is_chord: bool
-    finger: str | None
-    string_num: int | None
-    fret_num: int | None
-
-
-@dataclass(frozen=True)
-class ChordRow:
-    measure_number: int
-    offset_ql: float
-    symbol: str
-    root: str
-    kind: str
 
 
 def hash_file(path: Path) -> str:
@@ -139,7 +74,7 @@ def compute_job_hash(
 
 
 class CatalogStore:
-    """Single-file DuckDB catalog for caching and score queryability."""
+    """Single-file DuckDB catalog for caching transcription jobs."""
 
     def __init__(self, cache_dir: Path = Path(".transcribe_cache")) -> None:
         self.cache_dir = Path(cache_dir)
@@ -200,120 +135,37 @@ class CatalogStore:
         self,
         result: TranscriptionResult,
         config: TranscriptionConfig,
-        measures: list[MeasureRow],
-        notes: list[NoteRow],
-        chords: list[ChordRow],
         start_sec: float | None = None,
         end_sec: float | None = None,
     ) -> None:
         now = datetime.now(UTC).replace(tzinfo=None)
-        config_json = config.model_dump_json()
-        warnings_json = json.dumps(result.warnings)
-
         with self._connect() as con:
-            con.begin()
-            try:
-                con.execute("DELETE FROM chords WHERE job_hash = ?", [result.job_hash])
-                con.execute("DELETE FROM notes WHERE job_hash = ?", [result.job_hash])
-                con.execute("DELETE FROM measures WHERE job_hash = ?", [result.job_hash])
-                con.execute("DELETE FROM jobs WHERE job_hash = ?", [result.job_hash])
-
-                con.execute(
-                    """
-                    INSERT INTO jobs (
-                        job_hash, source_type, source_ref, start_sec, end_sec, instrument,
-                        config_json, musicxml_path, measure_count, note_count, chord_count,
-                        fingering_count, elapsed_sec, warnings_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        result.job_hash,
-                        result.source_type.value,
-                        result.source_ref,
-                        start_sec,
-                        end_sec,
-                        result.instrument.value,
-                        config_json,
-                        str(result.musicxml_path),
-                        result.measure_count,
-                        result.note_count,
-                        result.chord_count,
-                        result.fingering_count,
-                        result.elapsed_sec,
-                        warnings_json,
-                        now,
-                    ],
-                )
-
-                if measures:
-                    con.executemany(
-                        """
-                        INSERT INTO measures (
-                            job_hash, part_idx, measure_number, time_signature, key_signature, duration_ql
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            (
-                                result.job_hash,
-                                m.part_idx,
-                                m.measure_number,
-                                m.time_signature,
-                                m.key_signature,
-                                m.duration_ql,
-                            )
-                            for m in measures
-                        ],
-                    )
-
-                if notes:
-                    con.executemany(
-                        """
-                        INSERT INTO notes (
-                            job_hash, part_idx, measure_number, offset_ql, duration_ql,
-                            midi, pitch_name, is_chord, finger, string_num, fret_num
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            (
-                                result.job_hash,
-                                n.part_idx,
-                                n.measure_number,
-                                n.offset_ql,
-                                n.duration_ql,
-                                n.midi,
-                                n.pitch_name,
-                                n.is_chord,
-                                n.finger,
-                                n.string_num,
-                                n.fret_num,
-                            )
-                            for n in notes
-                        ],
-                    )
-
-                if chords:
-                    con.executemany(
-                        """
-                        INSERT INTO chords (
-                            job_hash, measure_number, offset_ql, symbol, root, kind
-                        ) VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        [
-                            (
-                                result.job_hash,
-                                c.measure_number,
-                                c.offset_ql,
-                                c.symbol,
-                                c.root,
-                                c.kind,
-                            )
-                            for c in chords
-                        ],
-                    )
-                con.commit()
-            except Exception:
-                con.rollback()
-                raise
+            con.execute(
+                """
+                INSERT OR REPLACE INTO jobs (
+                    job_hash, source_type, source_ref, start_sec, end_sec, instrument,
+                    config_json, musicxml_path, measure_count, note_count, chord_count,
+                    fingering_count, elapsed_sec, warnings_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    result.job_hash,
+                    result.source_type.value,
+                    result.source_ref,
+                    start_sec,
+                    end_sec,
+                    result.instrument.value,
+                    config.model_dump_json(),
+                    str(result.musicxml_path),
+                    result.measure_count,
+                    result.note_count,
+                    result.chord_count,
+                    result.fingering_count,
+                    result.elapsed_sec,
+                    json.dumps(result.warnings),
+                    now,
+                ],
+            )
 
     def list_recent_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as con:
@@ -349,8 +201,5 @@ class CatalogStore:
         with self._connect() as con:
             count_row = con.execute("SELECT COUNT(*) FROM jobs").fetchone()
             count = int(count_row[0]) if count_row else 0
-            con.execute("DELETE FROM chords")
-            con.execute("DELETE FROM notes")
-            con.execute("DELETE FROM measures")
             con.execute("DELETE FROM jobs")
         return count

@@ -9,20 +9,16 @@ from pathlib import Path
 import music21
 
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
-from transcribe_music.storage.catalog import ChordRow, MeasureRow, NoteRow
 
 
 @dataclass(frozen=True)
 class ExportMetrics:
-    """Extracted structural counts and DuckDB rows from an exported MusicXML score."""
+    """Structural counts extracted from a validated MusicXML score."""
 
     measure_count: int
     note_count: int
     chord_count: int
     fingering_count: int
-    measures: list[MeasureRow]
-    notes: list[NoteRow]
-    chords: list[ChordRow]
 
 
 def is_playable_chord(el: object) -> bool:
@@ -179,10 +175,8 @@ def _redistribute_chord_technical_tags(xml_path: Path) -> None:
         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 
 
-def _extract_metrics_and_validate_xml(
-    score: music21.stream.Score, xml_path: Path
-) -> ExportMetrics:
-    """Validate serialized MusicXML structure and extract DuckDB rows."""
+def _extract_metrics_and_validate_xml(xml_path: Path) -> ExportMetrics:
+    """Validate serialized MusicXML structure and extract structural counts."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     if root.tag not in ("score-partwise", "score-timewise"):
@@ -193,137 +187,19 @@ def _extract_metrics_and_validate_xml(
         raise ValueError("Exported MusicXML contains zero <measure> elements")
 
     xml_notes = root.findall(".//note")
-    xml_harmonies = root.findall(".//harmony")
-    xml_fingerings = root.findall(".//technical/fingering")
-
-    # Ensure every <note> element has valid <duration>
     for note_el in xml_notes:
         if note_el.find("grace") is None and note_el.find("duration") is None:
             raise ValueError("Exported MusicXML contains a <note> missing <duration>")
 
-    measures: list[MeasureRow] = []
-    notes: list[NoteRow] = []
-    chords: list[ChordRow] = []
-
-    seen_measures: set[int] = set()
-    for part_idx, part in enumerate(score.parts):
-        cur_ts: str | None = None
-        cur_ks: str | None = None
-        for m in part.getElementsByClass(music21.stream.Measure):
-            m_num = int(m.number) if m.number is not None else 0
-            seen_measures.add(m_num)
-            ts_el = m.getElementsByClass(music21.meter.TimeSignature).first()
-            if ts_el is not None:
-                cur_ts = ts_el.ratioString
-            ks_el = m.getElementsByClass(music21.key.KeySignature).first()
-            if ks_el is not None:
-                cur_ks = str(ks_el)
-            measures.append(
-                MeasureRow(
-                    part_idx=part_idx,
-                    measure_number=m_num,
-                    time_signature=cur_ts,
-                    key_signature=cur_ks,
-                    duration_ql=float(m.duration.quarterLength),
-                )
-            )
-
-            for el in m.notesAndRests:
-                if isinstance(el, music21.note.Note):
-                    finger, string_num, fret_num = _extract_technical_from_note(el)
-                    notes.append(
-                        NoteRow(
-                            part_idx=part_idx,
-                            measure_number=m_num,
-                            offset_ql=float(el.offset),
-                            duration_ql=float(el.duration.quarterLength),
-                            midi=int(el.pitch.midi),
-                            pitch_name=el.pitch.nameWithOctave,
-                            is_chord=False,
-                            finger=finger,
-                            string_num=string_num,
-                            fret_num=fret_num,
-                        )
-                    )
-                elif is_playable_chord(el):
-                    fingers = [
-                        str(a.fingerNumber)
-                        for a in el.articulations
-                        if isinstance(a, music21.articulations.Fingering)
-                    ]
-                    strings = [
-                        int(a.number)
-                        for a in el.articulations
-                        if isinstance(a, music21.articulations.StringIndication)
-                    ]
-                    frets = [
-                        int(a.number)
-                        for a in el.articulations
-                        if isinstance(a, music21.articulations.FretIndication)
-                    ]
-                    for sub_idx, n in enumerate(el.notes):
-                        finger = fingers[sub_idx] if sub_idx < len(fingers) else None
-                        string_num = strings[sub_idx] if sub_idx < len(strings) else None
-                        fret_num = frets[sub_idx] if sub_idx < len(frets) else None
-                        notes.append(
-                            NoteRow(
-                                part_idx=part_idx,
-                                measure_number=m_num,
-                                offset_ql=float(el.offset),
-                                duration_ql=float(el.duration.quarterLength),
-                                midi=int(n.pitch.midi),
-                                pitch_name=n.pitch.nameWithOctave,
-                                is_chord=True,
-                                finger=finger,
-                                string_num=string_num,
-                                fret_num=fret_num,
-                            )
-                        )
-
-            if part_idx == 0:
-                for h in m.getElementsByClass(music21.harmony.ChordSymbol):
-                    root_name = h.root().name if h.root() is not None else ""
-                    chords.append(
-                        ChordRow(
-                            measure_number=m_num,
-                            offset_ql=float(h.offset),
-                            symbol=h.figure,
-                            root=root_name,
-                            kind=str(h.chordKind or ""),
-                        )
-                    )
-
+    parts = root.findall("part")
+    measure_count = len(parts[0].findall("measure")) if parts else len(xml_measures)
+    note_count = sum(1 for n in xml_notes if n.find("rest") is None)
     return ExportMetrics(
-        measure_count=len(seen_measures) if seen_measures else len(xml_measures),
-        note_count=len(notes),
-        chord_count=len(xml_harmonies),
-        fingering_count=len(xml_fingerings),
-        measures=measures,
-        notes=notes,
-        chords=chords,
+        measure_count=measure_count,
+        note_count=note_count,
+        chord_count=len(root.findall(".//harmony")),
+        fingering_count=len(root.findall(".//technical/fingering")),
     )
-
-
-def _extract_technical_from_note(
-    el: music21.note.NotRest,
-) -> tuple[str | None, int | None, int | None]:
-    finger: str | None = None
-    string_num: int | None = None
-    fret_num: int | None = None
-    for art in getattr(el, "articulations", ()):
-        if isinstance(art, music21.articulations.Fingering):
-            finger = str(art.fingerNumber)
-        elif isinstance(art, music21.articulations.StringIndication):
-            try:
-                string_num = int(art.number)
-            except (TypeError, ValueError):
-                pass
-        elif isinstance(art, music21.articulations.FretIndication):
-            try:
-                fret_num = int(art.number)
-            except (TypeError, ValueError):
-                pass
-    return finger, string_num, fret_num
 
 
 def export_musicxml(
@@ -347,5 +223,5 @@ def export_musicxml(
         normalized.write("musicxml", fp=str(output_path))
 
     _redistribute_chord_technical_tags(output_path)
-    metrics = _extract_metrics_and_validate_xml(normalized, output_path)
+    metrics = _extract_metrics_and_validate_xml(output_path)
     return metrics, warnings
