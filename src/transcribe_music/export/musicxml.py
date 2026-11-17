@@ -115,6 +115,51 @@ def _strip_non_note_articulations(score: music21.stream.Score) -> None:
             h.activeSite.remove(h)
 
 
+def _redistribute_chord_technical_tags(xml_path: Path) -> None:
+    """Fix music21 Chord serialization by pairing <string>/<fret> 1-to-1 across chord notes."""
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    changed = False
+
+    for measure in root.findall(".//measure"):
+        notes = measure.findall("note")
+        i = 0
+        while i < len(notes):
+            group = [notes[i]]
+            j = i + 1
+            while j < len(notes) and notes[j].find("chord") is not None:
+                group.append(notes[j])
+                j += 1
+
+            if len(group) > 1:
+                head_tech = group[0].find("notations/technical")
+                if head_tech is not None:
+                    strings = head_tech.findall("string")
+                    frets = head_tech.findall("fret")
+                    if len(strings) == len(group) or len(frets) == len(group):
+                        # Remove pooled string/fret tags from head note, keep only index 0
+                        for idx in range(1, len(group)):
+                            target_notations = group[idx].find("notations")
+                            if target_notations is None:
+                                target_notations = ET.SubElement(group[idx], "notations")
+                            target_tech = target_notations.find("technical")
+                            if target_tech is None:
+                                target_tech = ET.SubElement(target_notations, "technical")
+                            if idx < len(strings):
+                                head_tech.remove(strings[idx])
+                                target_tech.append(strings[idx])
+                                changed = True
+                            if idx < len(frets):
+                                head_tech.remove(frets[idx])
+                                target_tech.append(frets[idx])
+                                changed = True
+            i = j
+
+    if changed:
+        ET.indent(tree, space="  ")
+        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+
+
 def _extract_metrics_and_validate_xml(
     score: music21.stream.Score, xml_path: Path
 ) -> ExportMetrics:
@@ -182,11 +227,25 @@ def _extract_metrics_and_validate_xml(
                         )
                     )
                 elif isinstance(el, music21.chord.Chord):
-                    # Check note-level articulations on chord or sub-notes
+                    fingers = [
+                        str(a.fingerNumber)
+                        for a in el.articulations
+                        if isinstance(a, music21.articulations.Fingering)
+                    ]
+                    strings = [
+                        int(a.number)
+                        for a in el.articulations
+                        if isinstance(a, music21.articulations.StringIndication)
+                    ]
+                    frets = [
+                        int(a.number)
+                        for a in el.articulations
+                        if isinstance(a, music21.articulations.FretIndication)
+                    ]
                     for sub_idx, n in enumerate(el.notes):
-                        finger, string_num, fret_num = _extract_technical_from_note(n)
-                        if finger is None and sub_idx == 0:
-                            finger, string_num, fret_num = _extract_technical_from_note(el)
+                        finger = fingers[sub_idx] if sub_idx < len(fingers) else None
+                        string_num = strings[sub_idx] if sub_idx < len(strings) else None
+                        fret_num = frets[sub_idx] if sub_idx < len(frets) else None
                         notes.append(
                             NoteRow(
                                 part_idx=part_idx,
@@ -268,5 +327,6 @@ def export_musicxml(
         _strip_non_note_articulations(normalized)
         normalized.write("musicxml", fp=str(output_path))
 
+    _redistribute_chord_technical_tags(output_path)
     metrics = _extract_metrics_and_validate_xml(normalized, output_path)
     return metrics, warnings
