@@ -247,8 +247,19 @@ def _(Path, cache_dir_input, duckdb, mo):
     db_path = Path(cache_dir_input.value or ".transcribe_cache") / "catalog.duckdb"
     catalog_view = mo.md("*No DuckDB catalog recorded yet.*")
     if db_path.exists():
+        cols = (
+            "job_hash",
+            "source_type",
+            "instrument",
+            "measure_count",
+            "note_count",
+            "chord_count",
+            "fingering_count",
+            "elapsed_sec",
+            "created_at",
+        )
         with duckdb.connect(str(db_path), read_only=True) as con:
-            jobs_df = con.execute(
+            rows = con.execute(
                 """
                 SELECT job_hash, source_type, instrument, measure_count, note_count,
                        chord_count, fingering_count, elapsed_sec, created_at
@@ -256,8 +267,9 @@ def _(Path, cache_dir_input, duckdb, mo):
                 ORDER BY created_at DESC
                 LIMIT 25
                 """
-            ).df()
-        catalog_view = mo.vstack([mo.md("### DuckDB Catalog History"), mo.ui.table(jobs_df)])
+            ).fetchall()
+        jobs_rows = [dict(zip(cols, row, strict=True)) for row in rows]
+        catalog_view = mo.vstack([mo.md("### DuckDB Catalog History"), mo.ui.table(jobs_rows)])
     catalog_view
     return (catalog_view, db_path)
 
