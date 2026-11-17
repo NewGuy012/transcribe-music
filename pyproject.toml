@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "transcribe-music"
+version = "0.1.0"
+description = "Fast local Python CLI, SDK, and Marimo workbench to transcribe YouTube slices, audio, and PDF sheet music into MusicXML with chords and instrument fingerings."
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.15"
+dependencies = [
+    "typer",
+    "pydantic",
+    "duckdb",
+    "marimo",
+    "verovio",
+    "music21",
+    "partitura",
+    "librosa",
+    "soundfile",
+    "numpy",
+    "scipy",
+    "pretty-midi",
+    "mido",
+    "yt-dlp",
+    "static-ffmpeg",
+    "pymupdf",
+    "mt3-infer[torch]",
+    "transkun",
+    "pianoplayer",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "reportlab",
+]
+
+[project.scripts]
+transcribe-music = "transcribe_music.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/transcribe_music"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
