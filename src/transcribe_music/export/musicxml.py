@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-import xml.etree.ElementTree as ET
 
 import music21
 
@@ -23,6 +23,25 @@ class ExportMetrics:
     measures: list[MeasureRow]
     notes: list[NoteRow]
     chords: list[ChordRow]
+
+
+def is_playable_chord(el: object) -> bool:
+    """Return True for performed Chord objects, excluding Harmony ChordSymbols."""
+    return isinstance(el, music21.chord.Chord) and not isinstance(
+        el, music21.harmony.ChordSymbol
+    )
+
+
+def sorted_playable_notes(
+    part: music21.stream.Stream,
+) -> list[music21.note.Note | music21.chord.Chord]:
+    """Return all performed Notes and Chords (excluding ChordSymbol) ordered by part offset."""
+    items = [
+        el
+        for el in part.recurse().notes
+        if isinstance(el, music21.note.Note) or is_playable_chord(el)
+    ]
+    return sorted(items, key=lambda el: float(el.getOffsetInHierarchy(part)))
 
 
 def _make_music21_instrument(instrument: Instrument) -> music21.instrument.Instrument:
@@ -226,7 +245,7 @@ def _extract_metrics_and_validate_xml(
                             fret_num=fret_num,
                         )
                     )
-                elif isinstance(el, music21.chord.Chord):
+                elif is_playable_chord(el):
                     fingers = [
                         str(a.fingerNumber)
                         for a in el.articulations
@@ -322,7 +341,7 @@ def export_musicxml(
 
     try:
         normalized.write("musicxml", fp=str(output_path))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — guarantee valid baseline MusicXML output
         warnings.append(f"Enrichment tag fallback triggered during MusicXML write: {exc}")
         _strip_non_note_articulations(normalized)
         normalized.write("musicxml", fp=str(output_path))

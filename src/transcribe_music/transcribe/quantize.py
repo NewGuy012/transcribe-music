@@ -150,7 +150,9 @@ def _mark_tutti_rests(part: music21.stream.Part) -> None:
             measures[start_idx].insert(0, music21.expressions.RehearsalMark("Tutti"))
 
     for i, m in enumerate(measures):
-        has_notes = bool(m.notes)
+        has_notes = any(
+            not isinstance(n, music21.harmony.ChordSymbol) for n in m.notes
+        )
         if not has_notes:
             if run_start is None:
                 run_start = i
@@ -267,7 +269,9 @@ def midi_to_quantized_score(
                     elif isinstance(n, music21.chord.Chord):
                         for p in n.pitches:
                             p.simplifyEnharmonic(inPlace=True)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — optional key estimation fallback
+        import logging
+
+        logging.getLogger(__name__).debug("Key estimation skipped: %s", exc)
 
     return score

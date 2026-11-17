@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -206,7 +206,7 @@ class CatalogStore:
         start_sec: float | None = None,
         end_sec: float | None = None,
     ) -> None:
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        now = datetime.now(UTC).replace(tzinfo=None)
         config_json = config.model_dump_json()
         warnings_json = json.dumps(result.warnings)
 

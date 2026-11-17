@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -55,7 +55,7 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         clef_mode="grand",
         transpose_semitones=0,
         max_polyphony=10,
-        gm_programs=tuple(range(0, 8)),
+        gm_programs=tuple(range(8)),
         ensemble_fallback_programs=(),
         open_string_midi=(),
         supports_tab=False,
@@ -108,7 +108,7 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
 _TIME_RE = re.compile(r"^\s*(?:(\d+):)?(\d{1,2}):(\d{1,2}(?:\.\d+)?)\s*$")
 
 
-def parse_timestamp(value: str | int | float) -> float:
+def parse_timestamp(value: str | float) -> float:
     """Parse seconds or HH:MM:SS / MM:SS string into non-negative float seconds."""
     if isinstance(value, (int, float)):
         sec = float(value)
@@ -161,7 +161,7 @@ class TimeRange(BaseModel):
         return self.end_sec - self.start_sec
 
     @classmethod
-    def from_inputs(cls, start: str | int | float, end: str | int | float) -> TimeRange:
+    def from_inputs(cls, start: str | float, end: str | float) -> TimeRange:
         return cls(start_sec=parse_timestamp(start), end_sec=parse_timestamp(end))
 
 

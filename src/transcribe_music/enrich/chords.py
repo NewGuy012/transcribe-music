@@ -93,6 +93,8 @@ def _compute_symbolic_chroma_by_window(
 
     flat = score.flatten()
     for el in flat.notes:
+        if isinstance(el, music21.harmony.ChordSymbol):
+            continue
         onset = float(el.offset)
         dur = max(0.125, float(el.duration.quarterLength))
         end = onset + dur
@@ -227,7 +229,7 @@ def annotate_chords(
         beat_offset = w_idx * window_beats
         try:
             cs = music21.harmony.ChordSymbol(label)
-        except Exception:
+        except (music21.harmony.ChordSymbolException, ValueError):
             continue
 
         if measures:

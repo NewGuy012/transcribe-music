@@ -8,6 +8,7 @@ from itertools import product
 import music21
 
 from transcribe_music.enrich.fingering.viterbi import solve_viterbi
+from transcribe_music.export.musicxml import sorted_playable_notes
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 
 _CELLO_OPEN = INSTRUMENT_SPECS[Instrument.CELLO].open_string_midi  # A3(1), D3(2), G2(3), C2(4)
@@ -108,7 +109,7 @@ def annotate_cello_fingering(score: music21.stream.Score) -> music21.stream.Scor
     if not score.parts:
         return score
     part = score.parts[0]
-    elements = sorted(part.recurse().notes, key=lambda el: float(el.getOffsetInHierarchy(part)))
+    elements = sorted_playable_notes(part)
     if not elements:
         return score
 
@@ -151,13 +152,14 @@ def annotate_cello_fingering(score: music21.stream.Score) -> music21.stream.Scor
         thumb_toggle = 1.1 if cur.thumb_mode != prev.thumb_mode else 0.0
         string_cross = 0.3 * abs(cur.notes_pose[0][0] - prev.notes_pose[0][0])
         same_finger_cost = 0.0
-        if len(prev.notes_pose) == 1 and len(cur.notes_pose) == 1:
-            if (
-                prev.notes_pose[0][2] != "0"
-                and prev.notes_pose[0][2] == cur.notes_pose[0][2]
-                and prev.notes_pose[0][:2] != cur.notes_pose[0][:2]
-            ):
-                same_finger_cost = 1.1
+        if (
+            len(prev.notes_pose) == 1
+            and len(cur.notes_pose) == 1
+            and prev.notes_pose[0][2] != "0"
+            and prev.notes_pose[0][2] == cur.notes_pose[0][2]
+            and prev.notes_pose[0][:2] != cur.notes_pose[0][:2]
+        ):
+            same_finger_cost = 1.1
         return shift_cost + thumb_toggle + string_cross + same_finger_cost
 
     best = solve_viterbi(steps, _unary, _transition)

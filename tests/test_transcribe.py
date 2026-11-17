@@ -1,7 +1,7 @@
 """Tests for concerto pruning, quantization, multi-page stitching, and Transkun adapter."""
 
-from pathlib import Path
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import music21
 import numpy as np

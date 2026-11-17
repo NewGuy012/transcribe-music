@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import music21
 
@@ -38,7 +38,7 @@ def _run_homr_on_image(image_path: Path) -> Path:
             str(image_path),
         ]
 
-    proc = subprocess.run(cmd, cwd=str(image_path.parent), capture_output=True, text=True)
+    proc = subprocess.run(cmd, check=False, cwd=str(image_path.parent), capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"homr OMR failed on {image_path.name}: {proc.stderr.strip()}")
 

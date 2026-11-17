@@ -8,6 +8,7 @@ from itertools import product
 import music21
 
 from transcribe_music.enrich.fingering.viterbi import solve_viterbi
+from transcribe_music.export.musicxml import sorted_playable_notes
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 
 _GUITAR_OPEN_MIDI = INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi  # Strings 1..6 (E4..E2)
@@ -134,7 +135,7 @@ def annotate_guitar_fingering(score: music21.stream.Score) -> music21.stream.Sco
     part = score.parts[0]
     transpose = INSTRUMENT_SPECS[Instrument.GUITAR].transpose_semitones  # -12
 
-    elements = sorted(part.recurse().notes, key=lambda el: float(el.getOffsetInHierarchy(part)))
+    elements = sorted_playable_notes(part)
     if not elements:
         return score
 

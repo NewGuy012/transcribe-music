@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import urllib.request
+from pathlib import Path
 
 import pretty_midi
 import soundfile as sf

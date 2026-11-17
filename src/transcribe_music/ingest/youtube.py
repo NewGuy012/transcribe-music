@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import re
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from transcribe_music.ingest.audio import get_ffmpeg_executable, normalize_audio_to_wav
@@ -15,9 +15,7 @@ _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 def extract_youtube_id(url: str) -> str:
     """Extract canonical 11-character YouTube video ID for stable cache keys."""
     parsed = urlparse(url.strip())
-    host = parsed.netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
+    host = parsed.netloc.lower().removeprefix("www.")
 
     if host == "youtu.be":
         candidate = parsed.path.strip("/").split("/")[0]
@@ -30,9 +28,8 @@ def extract_youtube_id(url: str) -> str:
             if _YOUTUBE_ID_RE.match(vid):
                 return vid
         parts = [p for p in parsed.path.split("/") if p]
-        if len(parts) >= 2 and parts[0] in {"shorts", "live", "embed"}:
-            if _YOUTUBE_ID_RE.match(parts[1]):
-                return parts[1]
+        if len(parts) >= 2 and parts[0] in {"shorts", "live", "embed"} and _YOUTUBE_ID_RE.match(parts[1]):
+            return parts[1]
 
     # Fallback: use normalized URL if non-standard link
     return url.strip()

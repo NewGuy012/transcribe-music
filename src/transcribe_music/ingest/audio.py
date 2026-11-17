@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-from pathlib import Path
 import shutil
 import subprocess
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -73,7 +73,7 @@ def normalize_audio_to_wav(
             str(output_wav),
         ]
     )
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"FFmpeg audio decode failed: {proc.stderr.strip()}")
     if not output_wav.exists() or output_wav.stat().st_size == 0:

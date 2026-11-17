@@ -8,6 +8,7 @@ from itertools import product
 import music21
 
 from transcribe_music.enrich.fingering.viterbi import solve_viterbi
+from transcribe_music.export.musicxml import sorted_playable_notes
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 
 _VIOLIN_OPEN = INSTRUMENT_SPECS[Instrument.VIOLIN].open_string_midi  # E5(1), A4(2), D4(3), G3(4)
@@ -92,7 +93,7 @@ def annotate_violin_fingering(score: music21.stream.Score) -> music21.stream.Sco
     if not score.parts:
         return score
     part = score.parts[0]
-    elements = sorted(part.recurse().notes, key=lambda el: float(el.getOffsetInHierarchy(part)))
+    elements = sorted_playable_notes(part)
     if not elements:
         return score
 
@@ -140,13 +141,14 @@ def annotate_violin_fingering(score: music21.stream.Score) -> music21.stream.Sco
         string_cross = 0.3 * abs(cur_s - prev_s)
 
         same_finger_cost = 0.0
-        if len(prev.notes_pose) == 1 and len(cur.notes_pose) == 1:
-            if (
-                prev.notes_pose[0][2] != 0
-                and prev.notes_pose[0][2] == cur.notes_pose[0][2]
-                and prev.notes_pose[0][:2] != cur.notes_pose[0][:2]
-            ):
-                same_finger_cost = 1.2
+        if (
+            len(prev.notes_pose) == 1
+            and len(cur.notes_pose) == 1
+            and prev.notes_pose[0][2] != 0
+            and prev.notes_pose[0][2] == cur.notes_pose[0][2]
+            and prev.notes_pose[0][:2] != cur.notes_pose[0][:2]
+        ):
+            same_finger_cost = 1.2
 
         return shift_cost + string_cross + same_finger_cost
 

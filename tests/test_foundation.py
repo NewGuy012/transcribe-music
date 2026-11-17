@@ -1,13 +1,13 @@
 """Tests for domain models, timestamps, DuckDB catalog, ingestion, and MusicXML contract."""
 
-from pathlib import Path
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import music21
 import numpy as np
 import pytest
-from reportlab.pdfgen import canvas
 import soundfile as sf
+from reportlab.pdfgen import canvas
 
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.ingest.audio import normalize_audio_to_wav

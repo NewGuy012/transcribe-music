@@ -6,9 +6,11 @@ import music21
 from pianoplayer.hand import Hand
 from pianoplayer.models import INote, keypos_midi
 
+from transcribe_music.export.musicxml import sorted_playable_notes
+
 
 def _clear_fingerings(part: music21.stream.Part) -> None:
-    for el in part.recurse().notes:
+    for el in sorted_playable_notes(part):
         el.articulations = [
             a for a in el.articulations if not isinstance(a, music21.articulations.Fingering)
         ]
@@ -34,7 +36,7 @@ def _annotate_single_part(part: music21.stream.Part, side: str) -> None:
     _clear_fingerings(part)
 
     # Flatten notes/chords in chronological order; keep mapping back to music21 objects
-    elements = sorted(part.recurse().notes, key=lambda el: float(el.getOffsetInHierarchy(part)))
+    elements = sorted_playable_notes(part)
     if not elements:
         return
 
@@ -95,8 +97,10 @@ def _annotate_single_part(part: music21.stream.Part, side: str) -> None:
         hand.verbose = False
         hand.autodepth = True
         hand.generate(nmeasures=10000)
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 — fallback to monotonic finger assignment
+        import logging
+
+        logging.getLogger(__name__).debug("pianoplayer fallback: %s", exc)
 
     # Map results back onto music21 Notes & Chords (ensuring valid 1..5 on every slot)
     chord_fingers: dict[int, dict[int, int]] = {}

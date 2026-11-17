@@ -1,7 +1,7 @@
 """Tests for chord symbol recognition and all 4 instrument fingering solvers."""
 
-from pathlib import Path
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import music21
 

@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TypeVar
 
 import numpy as np
 
-S = TypeVar("S")
 
-
-def solve_viterbi(
+def solve_viterbi[S](
     states_per_step: Sequence[Sequence[S]],
     unary_cost: Callable[[int, S], float],
     transition_cost: Callable[[int, S, S], float],
