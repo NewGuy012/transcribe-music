@@ -128,7 +128,7 @@ def convert(
         typer.Argument(
             exists=True,
             readable=True,
-            help="Digital score (.musicxml/.mxl/.mid/.krn/.mei/.abc/.gp3-.gp5/.mscz) or fallback .pdf.",
+            help="Digital score (.musicxml/.mxl/.mid/.krn/.mei/.abc/.gp*/.mscz/.capx/.ly) or fallback .pdf.",
         ),
     ],
     instrument: InstrumentOpt,
@@ -165,7 +165,7 @@ def score(
         typer.Argument(
             exists=True,
             readable=True,
-            help="Digital score (.musicxml/.xml/.mxl/.mid/.midi/.krn/.mei/.abc/.gp3-.gp5/.mscz/.mscx).",
+            help="Digital score (.musicxml/.xml/.mxl/.mid/.krn/.mei/.abc/.gp3-.gp5/.gp/.gpx/.mscz/.cap/.capx/.ly).",
         ),
     ],
     instrument: InstrumentOpt,

@@ -25,7 +25,9 @@ CONVERTER21_EXTENSIONS: dict[str, str] = {
 MIDI_EXTENSIONS = frozenset({".mid", ".midi"})
 GUITARPRO_EXTENSIONS = frozenset({".gp3", ".gp4", ".gp5"})
 MUSESCORE_EXTENSIONS = frozenset({".mscz", ".mscx"})
-UNSUPPORTED_GUITARPRO_EXTENSIONS = frozenset({".gp", ".gpx"})
+MUSESCORE_GP_EXTENSIONS = frozenset({".gp", ".gpx"})
+CAPELLA_EXTENSIONS = frozenset({".cap", ".capx"})
+LILYPOND_EXTENSIONS = frozenset({".ly"})
 
 DIGITAL_EXTENSIONS = (
     MUSICXML_EXTENSIONS
@@ -33,6 +35,9 @@ DIGITAL_EXTENSIONS = (
     | MIDI_EXTENSIONS
     | GUITARPRO_EXTENSIONS
     | MUSESCORE_EXTENSIONS
+    | MUSESCORE_GP_EXTENSIONS
+    | CAPELLA_EXTENSIONS
+    | LILYPOND_EXTENSIONS
 )
 
 _CONVERTER21_REGISTERED = False
@@ -121,10 +126,17 @@ def _find_musescore_executable() -> str | None:
 def _load_musescore_file(path: Path) -> LoadedDigitalScore:
     mscore_bin = _find_musescore_executable()
     if mscore_bin is None:
-        raise RuntimeError(
-            f"Cannot parse {path.name} directly because MuseScore Studio CLI was not found. "
-            "Export the score as .mxl or .musicxml from MuseScore first, or install MuseScore 4."
-        )
+        suffix = path.suffix.lower()
+        if suffix in MUSESCORE_GP_EXTENSIONS:
+            hint = "Export as .musicxml, .mxl, or .gp5 from Guitar Pro/MuseScore first, or install MuseScore 4."
+            prefix = f"Cannot parse Guitar Pro 6/7/8 ({path.name}) directly because MuseScore Studio CLI was not found."
+        elif suffix in CAPELLA_EXTENSIONS:
+            hint = "Export as .musicxml or .mxl from Capella/MuseScore first, or install MuseScore 4."
+            prefix = f"Cannot parse Capella ({path.name}) directly because MuseScore Studio CLI was not found."
+        else:
+            hint = "Export the score as .mxl or .musicxml from MuseScore first, or install MuseScore 4."
+            prefix = f"Cannot parse {path.name} directly because MuseScore Studio CLI was not found."
+        raise RuntimeError(f"{prefix} {hint}")
 
     with tempfile.TemporaryDirectory(prefix="tm_mscore_") as tmp_dir:
         tmp_xml = Path(tmp_dir) / f"{path.stem}.musicxml"
@@ -147,6 +159,99 @@ def _load_musescore_file(path: Path) -> LoadedDigitalScore:
             is_sounding_pitch_source=False,
             warnings=warnings,
         )
+
+
+def _load_capella_file(path: Path) -> LoadedDigitalScore:
+    """Load Capella .capx via music21 native parser (falling back to MuseScore) or .cap via MuseScore."""
+    suffix = path.suffix.lower()
+    if suffix == ".capx":
+        try:
+            from music21.capella.fromCapellaXML import CapellaImporter
+
+            parsed = CapellaImporter().scoreFromFile(str(path))
+            score, warnings = _coerce_to_score(parsed, path.stem)
+            return LoadedDigitalScore(
+                score=score,
+                backend="capella_xml",
+                format_name="capx",
+                is_sounding_pitch_source=False,
+                warnings=warnings,
+            )
+        except Exception as exc:
+            if _find_musescore_executable() is not None:
+                loaded = _load_musescore_file(path)
+                loaded.warnings.append(f"Native .capx parser failed ({exc}); converted via MuseScore CLI.")
+                return loaded
+            raise RuntimeError(
+                f"Failed parsing Capella XML file {path.name}: {exc}. "
+                "Install MuseScore 4 or export as .musicxml/.mxl."
+            ) from exc
+    return _load_musescore_file(path)
+
+
+def _load_lilypond_file(
+    path: Path,
+    quantize_divisors: tuple[int, ...] = (4, 3),
+) -> LoadedDigitalScore:
+    """Convert LilyPond (.ly) via python-ly ('ly musicxml') or lilypond CLI ('--midi')."""
+    ly_bin = shutil.which("ly")
+    if ly_bin is not None:
+        proc = subprocess.run(
+            [ly_bin, "musicxml", str(path.resolve())],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        xml_text = proc.stdout or ""
+        if proc.returncode == 0 and ("<score-partwise" in xml_text or "<score-timewise" in xml_text):
+            with tempfile.TemporaryDirectory(prefix="tm_ly_") as tmp_dir:
+                tmp_xml = Path(tmp_dir) / f"{path.stem}.musicxml"
+                tmp_xml.write_text(xml_text, encoding="utf-8")
+                parsed = music21.converter.parse(str(tmp_xml), format="musicxml")
+                score, warnings = _coerce_to_score(parsed, path.stem)
+                return LoadedDigitalScore(
+                    score=score,
+                    backend="python_ly",
+                    format_name="ly",
+                    is_sounding_pitch_source=False,
+                    warnings=warnings,
+                )
+
+    lilypond_bin = shutil.which("lilypond")
+    if lilypond_bin is not None:
+        with tempfile.TemporaryDirectory(prefix="tm_lily_") as tmp_dir:
+            out_prefix = Path(tmp_dir) / path.stem
+            proc = subprocess.run(
+                [lilypond_bin, "-dno-print-pages", "-o", str(out_prefix), str(path.resolve())],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            midi_files = sorted(Path(tmp_dir).glob("*.mid")) + sorted(Path(tmp_dir).glob("*.midi"))
+            if proc.returncode == 0 and midi_files:
+                parsed = music21.converter.parse(
+                    str(midi_files[0]),
+                    format="midi",
+                    quantizePost=True,
+                    quarterLengthDivisors=quantize_divisors or (4, 3),
+                )
+                score, warnings = _coerce_to_score(parsed, path.stem)
+                return LoadedDigitalScore(
+                    score=score,
+                    backend="lilypond_midi",
+                    format_name="ly",
+                    is_sounding_pitch_source=True,
+                    warnings=warnings,
+                )
+            detail = proc.stderr.strip() or proc.stdout.strip() or "no MIDI output produced (missing \\midi block?)"
+            raise RuntimeError(f"LilyPond failed converting {path.name}: {detail}")
+
+    raise RuntimeError(
+        f"Cannot parse LilyPond ({path.name}) because neither 'ly' (python-ly) nor 'lilypond' CLI was found. "
+        "Install python-ly or LilyPond, or download the score's .mid/.musicxml version."
+    )
 
 
 def _gp_instrument_from_program(program: int, track_name: str) -> music21.instrument.Instrument:
@@ -352,11 +457,6 @@ def load_digital_score(
             f"Expected a digital score file, got PDF ({src.name}). "
             "Use the PDF fallback command (`transcribe-music pdf`) or unified `convert`."
         )
-    if suffix in UNSUPPORTED_GUITARPRO_EXTENSIONS:
-        raise ValueError(
-            f"Guitar Pro 6/7/8 ({suffix}) is not directly supported. "
-            "Export as .musicxml, .mxl, or .gp5 from Guitar Pro or MuseScore first."
-        )
     if suffix not in DIGITAL_EXTENSIONS:
         supported = ", ".join(sorted(DIGITAL_EXTENSIONS))
         raise ValueError(f"Unsupported digital score format {suffix!r}. Supported: {supported}")
@@ -364,8 +464,14 @@ def load_digital_score(
     if suffix in GUITARPRO_EXTENSIONS:
         return _load_guitarpro_score(src)
 
-    if suffix in MUSESCORE_EXTENSIONS:
+    if suffix in (MUSESCORE_EXTENSIONS | MUSESCORE_GP_EXTENSIONS):
         return _load_musescore_file(src)
+
+    if suffix in CAPELLA_EXTENSIONS:
+        return _load_capella_file(src)
+
+    if suffix in LILYPOND_EXTENSIONS:
+        return _load_lilypond_file(src, quantize_divisors=quantize_divisors)
 
     if suffix in MIDI_EXTENSIONS:
         parsed = music21.converter.parse(

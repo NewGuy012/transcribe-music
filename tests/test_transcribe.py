@@ -119,22 +119,93 @@ def test_digital_formats_musicxml_mxl_krn_mei_abc_and_errors(
         "D4",
     ]
 
-    # 5. Clear error paths for unsupported / PDF / missing MuseScore binary
-    gpx_path = tmp_path / "modern.gpx"
-    gpx_path.write_bytes(b"stub")
-    with pytest.raises(ValueError, match="Guitar Pro 6/7/8"):
-        load_digital_score(gpx_path)
+    # 5. Native .capx, MuseScore bridges (.gp/.gpx/.mscz/.cap), LilyPond (.ly), and clear error paths
+    import zipfile
+
+    capx_path = tmp_path / "study.capx"
+    with zipfile.ZipFile(capx_path, "w") as zf:
+        zf.writestr(
+            "score.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<score xmlns="http://www.capella.de/schema/capx/1.0">
+  <info><title>Capella Study</title></info>
+  <systems>
+    <system>
+      <staves>
+        <staff layout="1">
+          <voices>
+            <voice>
+              <noteObjects>
+                <clefSign clef="G2"/>
+                <chord><duration base="1/4"/><heads><head pitch="G4"/></heads></chord>
+                <chord><duration base="1/4"/><heads><head pitch="A4"/></heads></chord>
+                <chord><duration base="1/4"/><heads><head pitch="B4"/></heads></chord>
+                <chord><duration base="1/4"/><heads><head pitch="D5"/></heads></chord>
+              </noteObjects>
+            </voice>
+          </voices>
+        </staff>
+      </staves>
+    </system>
+  </systems>
+</score>""",
+        )
+    loaded_capx = load_digital_score(capx_path)
+    assert loaded_capx.backend == "capella_xml"
+    assert len(list(loaded_capx.score.recurse().notes)) == 4
 
     pdf_path = tmp_path / "sheet.pdf"
     pdf_path.write_bytes(b"%PDF-1.4")
     with pytest.raises(ValueError, match="PDF fallback"):
         load_digital_score(pdf_path)
 
+    unknown_path = tmp_path / "unknown.xyz"
+    unknown_path.write_bytes(b"stub")
+    with pytest.raises(ValueError, match="Unsupported digital score format"):
+        load_digital_score(unknown_path)
+
+    gpx_path = tmp_path / "modern.gpx"
+    gpx_path.write_bytes(b"stub")
     mscz_path = tmp_path / "piece.mscz"
     mscz_path.write_bytes(b"stub")
+    cap_path = tmp_path / "legacy.cap"
+    cap_path.write_bytes(b"stub")
+
     monkeypatch.setattr("transcribe_music.ingest.digital._find_musescore_executable", lambda: None)
+    with pytest.raises(RuntimeError, match="Guitar Pro 6/7/8"):
+        load_digital_score(gpx_path)
     with pytest.raises(RuntimeError, match="MuseScore"):
         load_digital_score(mscz_path)
+    with pytest.raises(RuntimeError, match="Capella"):
+        load_digital_score(cap_path)
+
+    # Mocked MuseScore bridge converts .gpx -> MusicXML seamlessly
+    def _fake_mscore_run(cmd, **_kwargs):
+        out_xml = Path(cmd[-1])
+        v_score.write("musicxml", fp=str(out_xml))
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("transcribe_music.ingest.digital._find_musescore_executable", lambda: "/usr/bin/mscore")
+    monkeypatch.setattr("subprocess.run", _fake_mscore_run)
+    loaded_gpx = load_digital_score(gpx_path)
+    assert loaded_gpx.backend == "musescore"
+    assert loaded_gpx.format_name == "gpx"
+
+    # LilyPond (.ly) via python-ly and clean error when neither ly nor lilypond is installed
+    ly_path = tmp_path / "etude.ly"
+    ly_path.write_text('\\version "2.24.0"\n{ c4 d4 e4 f4 }\n', encoding="utf-8")
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    with pytest.raises(RuntimeError, match="LilyPond"):
+        load_digital_score(ly_path)
+
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ly" if name == "ly" else None)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout=xml_path.read_text(encoding="utf-8"), stderr=""),
+    )
+    loaded_ly = load_digital_score(ly_path)
+    assert loaded_ly.backend == "python_ly"
+    assert len(list(loaded_ly.score.recurse().notes)) >= 4
 
 
 def test_guitarpro_gp5_ingestion_skips_drums_and_adapts_guitar_tab(tmp_path: Path) -> None:
