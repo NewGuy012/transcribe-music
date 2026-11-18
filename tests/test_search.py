@@ -40,6 +40,7 @@ def _stub_remote_sources(
     when_in_rome: Callable[[], list[dict[str, Any]]] = list,
     humdrum: Callable[[], list[dict[str, Any]]] = list,
     mutopia: Callable[..., list[dict[str, Any]]] | None = None,
+    imslp: Callable[..., list[dict[str, Any]]] | None = None,
     archive: Callable[..., list[dict[str, Any]]] | None = None,
 ) -> None:
     monkeypatch.setattr(search_mod, "_fetch_openscore_orchestra_index", orchestra)
@@ -51,6 +52,11 @@ def _stub_remote_sources(
         search_mod,
         "_search_mutopia",
         mutopia if mutopia is not None else (lambda *_a, **_kw: []),
+    )
+    monkeypatch.setattr(
+        search_mod,
+        "_search_imslp",
+        imslp if imslp is not None else (lambda *_a, **_kw: []),
     )
     monkeypatch.setattr(
         search_mod,
@@ -402,3 +408,170 @@ def test_new_catalog_parsers_orchestra_when_in_rome_humdrum_and_mutopia(
     assert saved_mid.exists()
     assert saved_mid.read_bytes().startswith(b"MThd")
     assert (tmp_path / "mutopia_dl" / "02_adagio.mid").exists()
+
+
+def test_imslp_solo_typeset_ranking_archive_pdf_and_gate_handling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from transcribe_music.ingest import imslp as imslp_mod
+
+    wikitext = """
+{{#fte:imslpfile
+|File Name 1=PMLP18850-Haydn_Manuscript.pdf
+|File Description 1=Complete Score
+|Image Type=Manuscript Scan
+}}
+{{#fte:imslpfile
+|File Name 1=PMLP18850-Haydn_Oboe1.pdf
+|File Description 1=Oboe 1 Part
+|Image Type=Normal Scan
+}}
+{{#fte:imslpfile
+|File Name 1=PMLP18850-Haydn_Cello_Solo_Mandozzi.pdf
+|File Description 1=Complete Part
+|Editor={{LinkEd|Orfeo|Mandozzi|1968|}}
+|Image Type=Typeset
+}}
+{{#fte:imslpfile
+|File Name 1=PMLP18850-Haydn_Cadenza_Popper.pdf
+|File Description 1=Cadenza
+|Image Type=Normal Scan
+}}
+"""
+
+    def _fake_imslp_get(url: str, params=None, **_kwargs):
+        action = (params or {}).get("list") or (params or {}).get("prop")
+        if action == "search":
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "query": {
+                        "search": [
+                            {"title": "Cello Concerto No.2 in D major, Hob.VIIb:2 (Haydn, Joseph)"}
+                        ]
+                    }
+                },
+            )
+        if action == "revisions":
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {
+                    "query": {
+                        "pages": {
+                            "18850": {
+                                "title": "Cello Concerto No.2 in D major, Hob.VIIb:2 (Haydn, Joseph)",
+                                "revisions": [{"*": wikitext}],
+                            }
+                        }
+                    }
+                },
+            )
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                "query": {
+                    "pages": {
+                        "1": {
+                            "title": "File:PMLP18850-Haydn_Cello_Solo_Mandozzi.pdf",
+                            "imageinfo": [
+                                {"url": "//imslp.org/images/c/cf/PMLP18850-Haydn_Cello_Solo_Mandozzi.pdf"}
+                            ],
+                        }
+                    }
+                }
+            },
+        )
+
+    monkeypatch.setattr(imslp_mod.requests, "get", _fake_imslp_get)
+    imslp_hits = imslp_mod.search_imslp_works(
+        "Haydn Cello Concerto D major",
+        frozenset({".pdf", ".mxl", ".mid"}),
+        user_agent="test",
+    )
+    assert len(imslp_hits) == 4
+    # Solo Typeset edition must rank first above Manuscript, Oboe, and Cadenza
+    assert imslp_hits[0]["filename"] == "PMLP18850-Haydn_Cello_Solo_Mandozzi.pdf"
+    assert imslp_hits[0]["composer"] == "Joseph Haydn"
+    assert "Typeset" in (imslp_hits[0]["edition_note"] or "")
+    assert imslp_hits[0]["download_url"] == "https://imslp.org/images/c/cf/PMLP18850-Haydn_Cello_Solo_Mandozzi.pdf"
+
+    # Digital results still outrank IMSLP PDFs, and include_pdf=False excludes PDFs
+    _stub_remote_sources(
+        monkeypatch,
+        imslp=lambda *_a, **_kw: imslp_hits,
+        mutopia=lambda *_a, **_kw: [
+            {
+                "title": "Haydn Cello Concerto in D major (MIDI)",
+                "composer": "Joseph Haydn",
+                "format_ext": ".mid",
+                "source": "Mutopia Project",
+                "filename": "haydn_cello.mid",
+                "download_url": "https://example.com/haydn_cello.mid",
+            }
+        ],
+    )
+    mixed = search_digital_scores(
+        "Haydn Cello Concerto",
+        limit=5,
+        include_local=False,
+        cache_dir=tmp_path / "cache",
+    )
+    assert mixed[0].format_ext == ".mid"
+    assert any(r.format_ext == ".pdf" and r.source == "IMSLP" for r in mixed)
+
+    no_pdf = search_digital_scores(
+        "Haydn Cello Concerto",
+        limit=5,
+        include_pdf=False,
+        include_local=False,
+        cache_dir=tmp_path / "cache",
+    )
+    assert all(r.format_ext != ".pdf" for r in no_pdf)
+
+    # Anti-bot friendlytest.html gate raises ManualDownloadRequiredError & CLI handles it gracefully
+    monkeypatch.setattr(
+        search_mod.requests,
+        "get",
+        lambda *_a, **_kw: SimpleNamespace(
+            content=b"<!DOCTYPE html><html><body>Verify</body></html>",
+            url="https://imslp.org/friendlytest.html",
+            headers={"content-type": "text/html"},
+            raise_for_status=lambda: None,
+        ),
+    )
+    pdf_hit = next(r for r in mixed if r.source == "IMSLP")
+    with pytest.raises(search_mod.ManualDownloadRequiredError) as exc_info:
+        download_score_result(pdf_hit, download_dir=tmp_path / "dl_gate")
+    assert "imslp.org/wiki/File:" in exc_info.value.url
+
+    runner = CliRunner()
+    cli_res = runner.invoke(
+        app,
+        [
+            "search",
+            "Haydn Cello Concerto",
+            "--format",
+            "pdf",
+            "--select",
+            "1",
+            "--instrument",
+            "cello",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ],
+    )
+    assert cli_res.exit_code == 0, cli_res.stdout
+    assert "browser verification" in cli_res.stdout
+    assert "transcribe-music convert" in cli_res.stdout
+
+    # Archive.org query excludes audio/lp_ items and picks solo PDF from collection:imslp
+    picked = search_mod._pick_best_archive_file(
+        [
+            {"name": "item_meta.xml"},
+            {"name": "PMLP_piano.pdf"},
+            {"name": "PMLP_cello_solo.pdf"},
+        ],
+        frozenset({".pdf", ".mid"}),
+        query_tokens=("haydn", "cello"),
+    )
+    assert picked == ("PMLP_cello_solo.pdf", ".pdf")

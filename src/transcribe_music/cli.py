@@ -12,7 +12,11 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from transcribe_music.ingest.search import download_score_result, search_digital_scores
+from transcribe_music.ingest.search import (
+    ManualDownloadRequiredError,
+    download_score_result,
+    search_digital_scores,
+)
 from transcribe_music.models import (
     Instrument,
     OmrBackend,
@@ -311,9 +315,16 @@ def search(
         typer.Option(
             "--format",
             "-f",
-            help="Comma-separated extension filter (e.g. 'mxl,musicxml' or 'krn,mid').",
+            help="Comma-separated extension filter (e.g. 'mxl,musicxml', 'krn,mid', or 'pdf').",
         ),
     ] = None,
+    include_pdf: Annotated[
+        bool,
+        typer.Option(
+            "--pdf/--no-pdf",
+            help="Include IMSLP/Mutopia/Archive.org PDF fallback results (ranked after digital scores).",
+        ),
+    ] = True,
     instrument: Annotated[
         Instrument | None,
         typer.Option(
@@ -328,7 +339,7 @@ def search(
     ] = False,
     cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
-    """Search digital scores (preferring MusicXML) and download a selected result."""
+    """Search digital scores (preferring MusicXML, with solo PDF fallback) and download a pick."""
     parsed_formats = (
         [tok.strip() for tok in formats.split(",") if tok.strip()] if formats else None
     )
@@ -337,6 +348,7 @@ def search(
         limit=limit,
         musicxml_only=musicxml_only,
         formats=parsed_formats,
+        include_pdf=include_pdf,
         include_remote=not offline,
         cache_dir=cache_dir,
     )
@@ -367,11 +379,20 @@ def search(
         chosen_idx = int(raw_choice)
 
     chosen = results[chosen_idx - 1]
-    saved_path = download_score_result(
-        chosen,
-        output_path=output,
-        download_dir=download_dir,
-    )
+    try:
+        saved_path = download_score_result(
+            chosen,
+            output_path=output,
+            download_dir=download_dir,
+        )
+    except ManualDownloadRequiredError as exc:
+        console.print(f"[yellow]{exc.reason}[/yellow]")
+        console.print(f"Open in browser to download: [bold cyan]{exc.url}[/bold cyan]")
+        inst_flag = instrument.value if instrument is not None else "cello"
+        console.print(
+            f"Then convert it with: [bold]transcribe-music convert \"<downloaded_file>\" --instrument {inst_flag}[/bold]"
+        )
+        return
     console.print(
         f"[green]Downloaded:[/green] {saved_path} "
         f"({chosen.format_ext.lstrip('.').upper()} from {chosen.source})"

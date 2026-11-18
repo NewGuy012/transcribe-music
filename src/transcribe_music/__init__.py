@@ -1,6 +1,10 @@
 """transcribe-music public Python SDK."""
 
-from transcribe_music.ingest.search import download_score_result, search_digital_scores
+from transcribe_music.ingest.search import (
+    ManualDownloadRequiredError,
+    download_score_result,
+    search_digital_scores,
+)
 from transcribe_music.models import (
     Instrument,
     OmrBackend,
@@ -22,6 +26,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "Instrument",
+    "ManualDownloadRequiredError",
     "OmrBackend",
     "PartInfo",
     "ScoreInspection",

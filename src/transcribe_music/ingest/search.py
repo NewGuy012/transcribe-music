@@ -25,12 +25,25 @@ import music21
 import requests
 
 from transcribe_music.ingest.digital import DIGITAL_EXTENSIONS
+from transcribe_music.ingest.imslp import search_imslp_works
 from transcribe_music.models import ScoreSearchResult
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_SEARCH_EXTENSIONS: frozenset[str] = DIGITAL_EXTENSIONS
+PDF_SEARCH_EXTENSIONS: frozenset[str] = frozenset({".pdf"})
+ALL_SEARCH_EXTENSIONS: frozenset[str] = SUPPORTED_SEARCH_EXTENSIONS | PDF_SEARCH_EXTENSIONS
 MUSICXML_SEARCH_EXTENSIONS: frozenset[str] = frozenset({".musicxml", ".mxl", ".xml"})
+
+
+class ManualDownloadRequiredError(RuntimeError):
+    """Raised when a source gates direct downloads behind browser verification."""
+
+    def __init__(self, result: ScoreSearchResult, url: str, reason: str) -> None:
+        self.result = result
+        self.url = url
+        self.reason = reason
+        super().__init__(f"{reason} Open in browser: {url}")
 
 _FORMAT_PRIORITY: dict[str, float] = {
     ".musicxml": 1.00,
@@ -51,6 +64,7 @@ _FORMAT_PRIORITY: dict[str, float] = {
     ".gp3": 0.60,
     ".mid": 0.55,
     ".midi": 0.55,
+    ".pdf": 0.15,
 }
 
 _SOURCE_BIAS: dict[str, float] = {
@@ -61,6 +75,7 @@ _SOURCE_BIAS: dict[str, float] = {
     "Mutopia Project": 0.75,
     "music21 Corpus": 0.6,
     "Humdrum GitHub": 0.55,
+    "IMSLP": 0.45,
     "Archive.org": 0.4,
 }
 
@@ -174,7 +189,7 @@ def _safe_filename(name: str, fallback_ext: str = ".musicxml") -> str:
     if not cleaned:
         cleaned = f"score{fallback_ext}"
     suffix = Path(cleaned).suffix.lower()
-    if suffix not in SUPPORTED_SEARCH_EXTENSIONS:
+    if suffix not in ALL_SEARCH_EXTENSIONS:
         cleaned = f"{cleaned}{fallback_ext}"
     return cleaned
 
@@ -725,9 +740,22 @@ def _search_music21_corpus(query: str) -> list[dict[str, Any]]:
     return records
 
 
+def _search_imslp(query: str, allowed_exts: frozenset[str]) -> list[dict[str, Any]]:
+    records = search_imslp_works(
+        query,
+        allowed_exts,
+        user_agent=_USER_AGENT,
+        timeout=_REQUEST_TIMEOUT_SEC,
+    )
+    for rec in records:
+        rec["filename"] = _safe_filename(str(rec["filename"]), fallback_ext=str(rec["format_ext"]))
+    return records
+
+
 def _pick_best_archive_file(
     files: list[dict[str, Any]],
     allowed_exts: frozenset[str],
+    query_tokens: tuple[str, ...] = (),
 ) -> tuple[str, str] | None:
     best: tuple[float, str, str] | None = None
     for f in files:
@@ -744,6 +772,11 @@ def _pick_best_archive_file(
         ):
             continue
         prio = _FORMAT_PRIORITY.get(ext, 0.1)
+        if ext == ".pdf":
+            if any(tok in lower_name for tok in ("solo", "cello", "violin", "guitar", "piano")):
+                prio += 0.04
+            if any(tok in lower_name for tok in query_tokens):
+                prio += 0.02
         if best is None or prio > best[0]:
             best = (prio, fname, ext)
     if best is None:
@@ -754,17 +787,18 @@ def _pick_best_archive_file(
 def _resolve_archive_item(
     doc: dict[str, Any],
     allowed_exts: frozenset[str],
+    query_tokens: tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
     identifier = str(doc.get("identifier", "")).strip()
     if not identifier:
         return None
     try:
         meta = _http_get_json(_ARCHIVE_METADATA_URL.format(identifier=quote(identifier)), timeout=5.0)
-    except Exception:  # noqa: BLE001 — skip slow/failing Archive metadata calls
+    except (requests.RequestException, ValueError):
         return None
 
     files = meta.get("files", []) if isinstance(meta, dict) else []
-    picked = _pick_best_archive_file(files, allowed_exts)
+    picked = _pick_best_archive_file(files, allowed_exts, query_tokens=query_tokens)
     if picked is None:
         return None
     fname, ext = picked
@@ -784,6 +818,7 @@ def _resolve_archive_item(
             identifier=quote(identifier),
             filename=quote(fname, safe="/"),
         ),
+        "page_url": f"https://archive.org/details/{quote(identifier)}",
         "archive_identifier": identifier,
     }
 
@@ -801,9 +836,11 @@ def _search_archive_org(
     term_expr = " AND ".join(tokens)
     if musicxml_only:
         fmt_clause = 'format:"MusicXML"'
+    elif ".pdf" in allowed_exts:
+        fmt_clause = '((format:"MusicXML" OR format:"MIDI") OR (collection:imslp AND format:"Text PDF"))'
     else:
         fmt_clause = '(format:"MusicXML" OR format:"MIDI")'
-    q_expr = f"({term_expr}) AND {fmt_clause}"
+    q_expr = f"({term_expr}) AND {fmt_clause} AND NOT mediatype:audio AND NOT identifier:lp_*"
 
     try:
         data = _http_get_json(
@@ -816,23 +853,30 @@ def _search_archive_org(
             },
             timeout=6.0,
         )
-    except Exception:  # noqa: BLE001 — keep search working if Archive.org is unavailable
+    except (requests.RequestException, ValueError):
         return []
 
     docs = data.get("response", {}).get("docs", []) if isinstance(data, dict) else []
     if not docs:
         return []
 
-    # Prioritize docs explicitly advertising MusicXML before resolving metadata
+    # Prioritize docs explicitly advertising MusicXML or MIDI before IMSLP PDFs
     docs.sort(
-        key=lambda d: "MusicXML" in (d.get("format") or []),
+        key=lambda d: (
+            "MusicXML" in (d.get("format") or []),
+            "MIDI" in (d.get("format") or []),
+        ),
         reverse=True,
     )
     top_docs = docs[:6]
+    token_tuple = tuple(tokens)
 
     records: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [pool.submit(_resolve_archive_item, doc, allowed_exts) for doc in top_docs]
+        futures = [
+            pool.submit(_resolve_archive_item, doc, allowed_exts, token_tuple)
+            for doc in top_docs
+        ]
         for fut in as_completed(futures):
             resolved = fut.result()
             if resolved is not None:
@@ -891,9 +935,10 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
         score += 3.0
 
     score += 2.0 * (title_hits / max(1, len(title_words)))
-    # Strongly prioritize MusicXML (.musicxml/.mxl/.xml) over other digital formats
+    # Strongly prioritize MusicXML (.musicxml/.mxl/.xml) over other digital formats and PDFs
     score += 18.0 * _FORMAT_PRIORITY.get(ext, 0.2)
     score += _SOURCE_BIAS.get(source, 0.0)
+    score += float(record.get("source_bonus", 0.0) or 0.0)
     if ".omr" in filename.lower() or str(record.get("archive_identifier", "")).endswith(".omr"):
         score -= 1.2
     return round(score, 4)
@@ -903,6 +948,7 @@ def _normalize_allowed_formats(
     formats: Iterable[str] | None,
     *,
     musicxml_only: bool,
+    include_pdf: bool = True,
 ) -> frozenset[str]:
     if formats is not None:
         cleaned = {
@@ -910,14 +956,16 @@ def _normalize_allowed_formats(
             for f in formats
             if f.strip()
         }
-        valid = frozenset(cleaned & SUPPORTED_SEARCH_EXTENSIONS)
+        valid = frozenset(cleaned & ALL_SEARCH_EXTENSIONS)
         if not valid:
-            supported = ", ".join(sorted(SUPPORTED_SEARCH_EXTENSIONS))
+            supported = ", ".join(sorted(ALL_SEARCH_EXTENSIONS))
             raise ValueError(f"No supported score formats in {list(formats)!r}. Supported: {supported}")
         if musicxml_only:
             valid = frozenset(valid & MUSICXML_SEARCH_EXTENSIONS)
         return valid
-    return MUSICXML_SEARCH_EXTENSIONS if musicxml_only else SUPPORTED_SEARCH_EXTENSIONS
+    if musicxml_only:
+        return MUSICXML_SEARCH_EXTENSIONS
+    return ALL_SEARCH_EXTENSIONS if include_pdf else SUPPORTED_SEARCH_EXTENSIONS
 
 
 def search_digital_scores(
@@ -926,18 +974,23 @@ def search_digital_scores(
     limit: int = 5,
     musicxml_only: bool = False,
     formats: Iterable[str] | None = None,
+    include_pdf: bool = True,
     include_remote: bool = True,
     include_local: bool = True,
     cache_dir: Path = Path(".transcribe_cache"),
 ) -> list[ScoreSearchResult]:
-    """Search local and open online score catalogs, ranking MusicXML formats first."""
+    """Search local and open online score catalogs, ranking MusicXML > digital > solo PDFs."""
     clean_query = query.strip()
     if not clean_query:
         raise ValueError("Search query cannot be empty.")
     if limit <= 0:
         raise ValueError("limit must be a positive integer.")
 
-    allowed_exts = _normalize_allowed_formats(formats, musicxml_only=musicxml_only)
+    allowed_exts = _normalize_allowed_formats(
+        formats,
+        musicxml_only=musicxml_only,
+        include_pdf=include_pdf,
+    )
     raw_records: list[dict[str, Any]] = []
 
     def _safe_index(
@@ -969,6 +1022,7 @@ def search_digital_scores(
         tasks.append(lambda: _search_music21_corpus(clean_query))
     if include_remote:
         tasks.append(lambda: _search_mutopia(clean_query, allowed_exts))
+        tasks.append(lambda: _search_imslp(clean_query, allowed_exts))
         tasks.append(
             lambda: _search_archive_org(clean_query, allowed_exts, musicxml_only=musicxml_only)
         )
@@ -978,8 +1032,7 @@ def search_digital_scores(
         for fut in as_completed(futures):
             raw_records.extend(fut.result())
 
-    ranked: list[ScoreSearchResult] = []
-    seen_keys: set[tuple[str, str, str]] = set()
+    scored_candidates: list[ScoreSearchResult] = []
     for rec in raw_records:
         ext = str(rec.get("format_ext", "")).lower()
         if ext not in allowed_exts:
@@ -988,16 +1041,7 @@ def search_digital_scores(
         if score <= 0.0:
             continue
 
-        dedup_key = (
-            _normalize_text(str(rec.get("title", ""))),
-            _normalize_text(str(rec.get("composer") or "")),
-            ext,
-        )
-        if dedup_key in seen_keys:
-            continue
-        seen_keys.add(dedup_key)
-
-        ranked.append(
+        scored_candidates.append(
             ScoreSearchResult(
                 title=str(rec["title"]),
                 composer=rec.get("composer"),
@@ -1013,15 +1057,30 @@ def search_digital_scores(
             )
         )
 
-    ranked.sort(
+    scored_candidates.sort(
         key=lambda r: (
             r.score,
             _FORMAT_PRIORITY.get(r.format_ext, 0.0),
-            r.source != "Archive.org",
+            r.source not in {"Archive.org", "IMSLP"},
         ),
         reverse=True,
     )
-    return ranked[:limit]
+
+    ranked: list[ScoreSearchResult] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+    for item in scored_candidates:
+        dedup_key = (
+            _normalize_text(item.title),
+            _normalize_text(item.composer or ""),
+            item.format_ext,
+        )
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        ranked.append(item)
+        if len(ranked) >= limit:
+            break
+    return ranked
 
 
 def download_score_result(
@@ -1052,7 +1111,7 @@ def download_score_result(
     if not download_url and result.archive_identifier:
         resolved = _resolve_archive_item(
             {"identifier": result.archive_identifier, "title": result.title, "creator": result.composer},
-            SUPPORTED_SEARCH_EXTENSIONS,
+            ALL_SEARCH_EXTENSIONS,
         )
         if resolved is not None:
             download_url = resolved.get("download_url")
@@ -1066,6 +1125,27 @@ def download_score_result(
         raise RuntimeError(f"Downloaded file was empty: {download_url}")
 
     payload = resp.content
+    final_url_lower = str(getattr(resp, "url", download_url)).lower()
+    headers_map = getattr(resp, "headers", None) or {}
+    content_type = str(headers_map.get("content-type", "")).lower()
+    head_bytes = payload.lstrip()[:32].lower()
+    is_html_gate = (
+        "friendlytest" in final_url_lower
+        or "friendlyredirect" in final_url_lower
+        or (
+            result.format_ext not in {".xml", ".musicxml"}
+            and (
+                content_type.startswith("text/html")
+                or head_bytes.startswith((b"<!doctype html", b"<html"))
+            )
+        )
+    )
+    if is_html_gate:
+        raise ManualDownloadRequiredError(
+            result=result,
+            url=result.page_url or download_url,
+            reason=f"{result.source} requires browser verification before downloading this file.",
+        )
     if result.format_ext in {".mid", ".midi"} and payload[:4] == b"PK\x03\x04":
         with zipfile.ZipFile(io.BytesIO(payload)) as zf:
             midi_members = sorted(
