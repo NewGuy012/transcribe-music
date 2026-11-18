@@ -359,3 +359,77 @@ def test_gp5_chord_tab_alignment_techniques_gpif_and_ascii_tab(
     not_tab.write_text("Just some lyrics or notes without tab lines.\n", encoding="utf-8")
     with pytest.raises(ValueError, match="No valid ASCII guitar tab"):
         load_digital_score(not_tab)
+
+
+def test_guitar_lead_rhythm_part_selection_and_omr_tab_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    score = music21.stream.Score()
+    rhythm = music21.stream.Part(id="Rhythm")
+    rhythm.partName = "Rhythm Guitar"
+    rhythm.insert(0, music21.instrument.AcousticGuitar())
+    for p in ("E2", "B2", "E3", "E2"):
+        rhythm.append(music21.note.Note(p, quarterLength=1.0))
+    rhythm.makeMeasures(inPlace=True)
+
+    lead = music21.stream.Part(id="Lead")
+    lead.partName = "Lead Guitar"
+    lead.insert(0, music21.instrument.ElectricGuitar())
+    for p in ("E4", "G4", "A4", "B4"):
+        lead.append(music21.note.Note(p, quarterLength=1.0))
+    lead.makeMeasures(inPlace=True)
+
+    score.insert(0, rhythm)
+    score.insert(0, lead)
+
+    auto_sel = select_and_adapt_parts(score, Instrument.GUITAR, is_sounding_pitch_source=True)
+    assert "Lead Guitar" in auto_sel.selected_part
+
+    rhythm_sel = select_and_adapt_parts(
+        score, Instrument.GUITAR, part_selector="rhythm", is_sounding_pitch_source=True
+    )
+    assert "Rhythm Guitar" in rhythm_sel.selected_part
+
+    # Dual Notation + TAB PDF OMR guard filters noisy OMR'd TabClef part
+    pdf_path = write_pdf_file(tmp_path / "dual_guitar.pdf", labels=("Page 1",))
+
+    def _fake_dual_homr(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        img = next(Path(arg) for arg in cmd if arg.endswith(".png"))
+        s = music21.stream.Score()
+        p_not = music21.stream.Part(id="Notation")
+        p_not.insert(0, music21.clef.Treble8vbClef())
+        for pch in ("E3", "G3", "B3", "E4"):
+            p_not.append(music21.note.Note(pch, quarterLength=1.0))
+        p_not.makeMeasures(inPlace=True)
+        p_tab = music21.stream.Part(id="Tab")
+        p_tab.insert(0, music21.clef.TabClef())
+        for pch in ("C4", "D4", "E4", "F4"):
+            p_tab.append(music21.note.Note(pch, quarterLength=1.0))
+        p_tab.makeMeasures(inPlace=True)
+        s.insert(0, p_not)
+        s.insert(0, p_tab)
+        s.write("musicxml", fp=str(img.with_suffix(".musicxml")))
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("transcribe_music.transcribe.omr_pdf._find_audiveris_executable", lambda: None)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/homr" if name == "homr" else None)
+    monkeypatch.setattr("subprocess.run", _fake_dual_homr)
+
+    omr_score, _, omr_warns = run_pdf_omr(pdf_path, tmp_path / "w_dual", Instrument.GUITAR, dpi=150)
+    assert len(omr_score.parts) == 1
+    assert any("Filtered out OMR-recognized TAB staff" in w for w in omr_warns)
+
+    def _fake_tab_only_homr(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        img = next(Path(arg) for arg in cmd if arg.endswith(".png"))
+        s = music21.stream.Score()
+        p_tab = music21.stream.Part(id="TabOnly")
+        p_tab.insert(0, music21.clef.TabClef())
+        p_tab.append(music21.note.Note("E4", quarterLength=4.0))
+        p_tab.makeMeasures(inPlace=True)
+        s.insert(0, p_tab)
+        s.write("musicxml", fp=str(img.with_suffix(".musicxml")))
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("subprocess.run", _fake_tab_only_homr)
+    _, _, tab_only_warns = run_pdf_omr(pdf_path, tmp_path / "w_tabonly", Instrument.GUITAR, dpi=150)
+    assert any("guitar TAB or unrecognized staves" in w for w in tab_only_warns)

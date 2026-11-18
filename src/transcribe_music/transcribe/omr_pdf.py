@@ -12,7 +12,7 @@ import music21
 
 from transcribe_music.ingest.pdf import render_pdf_pages
 from transcribe_music.models import Instrument, OmrBackend
-from transcribe_music.score_utils import coerce_to_score
+from transcribe_music.score_utils import coerce_to_score, iter_playable_notes
 
 
 def _find_audiveris_executable() -> str | None:
@@ -213,6 +213,37 @@ def stitch_musicxml_pages(
     return merged_score
 
 
+def _is_omr_tab_part(part: music21.stream.Part) -> bool:
+    if any(isinstance(c, music21.clef.TabClef) for c in part.recurse().getElementsByClass(music21.clef.Clef)):
+        return True
+    for sl in part.recurse().getElementsByClass(music21.layout.StaffLayout):
+        if getattr(sl, "staffLines", None) == 6:
+            return True
+    return False
+
+
+def _filter_guitar_omr_tab_staves(
+    score: music21.stream.Score,
+    warnings: list[str],
+) -> None:
+    """Drop noisy OMR'd 6-line TAB staves when a paired standard notation staff exists."""
+    parts = list(score.parts)
+    if not parts:
+        return
+    notation_parts = [p for p in parts if not _is_omr_tab_part(p) and any(iter_playable_notes(p))]
+    tab_parts = [p for p in parts if _is_omr_tab_part(p)]
+    if notation_parts and tab_parts:
+        for tp in tab_parts:
+            score.remove(tp)
+        warnings.append(
+            "Filtered out OMR-recognized TAB staff in favor of paired standard notation staff."
+        )
+    elif not notation_parts:
+        warnings.append(
+            "PDF appears to contain guitar TAB or unrecognized staves; prefer digital .gp/.gp5/.tab/.mxl input for exact TAB accuracy."
+        )
+
+
 def run_pdf_omr(
     pdf_path: Path,
     work_dir: Path,
@@ -229,6 +260,8 @@ def run_pdf_omr(
         try:
             xml_paths = _run_audiveris_batch(pdf_path, work_dir)
             score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
+            if instrument == Instrument.GUITAR:
+                _filter_guitar_omr_tab_staves(score, warnings)
             return score, "audiveris", warnings
         except Exception as exc:
             if pref == OmrBackend.AUDIVERIS:
@@ -239,4 +272,6 @@ def run_pdf_omr(
     image_paths = render_pdf_pages(pdf_path, pages_dir, dpi=dpi)
     xml_paths = _run_homr_batch(image_paths, pages_dir)
     score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
+    if instrument == Instrument.GUITAR:
+        _filter_guitar_omr_tab_staves(score, warnings)
     return score, "homr", warnings

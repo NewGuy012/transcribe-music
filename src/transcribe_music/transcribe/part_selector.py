@@ -11,8 +11,10 @@ import music21
 from transcribe_music.ingest.digital import summarize_score_parts
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument, PartInfo
 from transcribe_music.score_utils import (
+    GuitarTrackMeta,
     element_midis,
     fill_stream_rest_gaps,
+    get_guitar_track_meta,
     iter_playable_notes,
     make_clef,
     replace_or_insert_initial_clef,
@@ -20,7 +22,19 @@ from transcribe_music.score_utils import (
 
 _INSTRUMENT_KEYWORDS: dict[Instrument, tuple[str, ...]] = {
     Instrument.PIANO: ("piano", "klavier", "pno", "keyboard", "rh", "lh", "right", "left"),
-    Instrument.GUITAR: ("guitar", "chitarra", "gitarre", "guitare", "gtr"),
+    Instrument.GUITAR: (
+        "guitar",
+        "chitarra",
+        "gitarre",
+        "guitare",
+        "gtr",
+        "lead",
+        "rhythm",
+        "acoustic",
+        "electric",
+        "nylon",
+        "steel",
+    ),
     Instrument.VIOLIN: ("violin", "violino", "violine", "violon", "vln", "vl"),
     Instrument.CELLO: ("cello", "violoncello", "violoncelle", "vc"),
 }
@@ -90,7 +104,14 @@ def _match_by_explicit_selector(
 
     if len(matched) > 1:
         matched_infos = [infos[i] for i in matched]
-        best = max(matched_infos, key=lambda p: ("solo" in p.name.lower(), p.note_count))
+        best = max(
+            matched_infos,
+            key=lambda p: (
+                "solo" in p.name.lower()
+                or (instrument == Instrument.GUITAR and "lead" in p.name.lower()),
+                p.note_count,
+            ),
+        )
         warnings.append(
             f"Part selector {selector!r} matched multiple parts "
             f"({', '.join(p.name for p in matched_infos)}); selected {best.index}: {best.name}."
@@ -105,6 +126,7 @@ def _score_part_for_instrument(
     instrument: Instrument,
     *,
     is_sounding_pitch_source: bool,
+    guitar_meta: GuitarTrackMeta | None = None,
 ) -> tuple[float, bool]:
     spec = INSTRUMENT_SPECS[instrument]
     keywords = _INSTRUMENT_KEYWORDS[instrument]
@@ -125,11 +147,20 @@ def _score_part_for_instrument(
 
     if "solo" in haystack:
         score += 25.0
+    if instrument == Instrument.GUITAR:
+        if "lead" in haystack:
+            score += 15.0
+        if "rhythm" in haystack or "backing" in haystack:
+            score -= 5.0
     if any(tok in haystack for tok in _ENSEMBLE_PENALTY_TOKENS):
         score -= 20.0
 
     if info.pitch_min is not None and info.pitch_max is not None:
-        lo, hi = spec.midi_min, spec.midi_max
+        if instrument == Instrument.GUITAR and guitar_meta is not None:
+            lo = min(guitar_meta.open_string_midi) + guitar_meta.capo_fret
+            hi = max(guitar_meta.open_string_midi) + guitar_meta.capo_fret + 24
+        else:
+            lo, hi = spec.midi_min, spec.midi_max
         if instrument == Instrument.GUITAR and not is_sounding_pitch_source:
             lo, hi = lo + 12, hi + 12
         if info.pitch_min >= lo - 2 and info.pitch_max <= hi + 2:
@@ -170,7 +201,10 @@ def _auto_select_parts(
         (
             idx,
             *_score_part_for_instrument(
-                info, instrument, is_sounding_pitch_source=is_sounding_pitch_source
+                info,
+                instrument,
+                is_sounding_pitch_source=is_sounding_pitch_source,
+                guitar_meta=get_guitar_track_meta(parts[idx]),
             ),
         )
         for idx, info in enumerate(infos)
@@ -318,12 +352,16 @@ def _adapt_guitar_part(
 
     pitches = [m for el in iter_playable_notes(part) for m in element_midis(el)]
     min_pitch = min(pitches) if pitches else None
+    meta = get_guitar_track_meta(part)
+    written_floor = (
+        (min(meta.open_string_midi) + meta.capo_fret + 12) if meta is not None else 52
+    )
 
     needs_octave_up = is_sounding_pitch_source or (
         existing_transposition is None
         and not isinstance(first_clef, music21.clef.Treble8vbClef)
         and min_pitch is not None
-        and min_pitch < 52
+        and min_pitch < written_floor
     )
     if needs_octave_up:
         for el in iter_playable_notes(part):

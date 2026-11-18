@@ -75,6 +75,7 @@ def _produce_enrich_and_export(
                 score,
                 harmonic_reference_score=raw_score,
                 preserve_existing=cfg.preserve_existing_chords,
+                instrument=cfg.instrument,
             )
         except Exception as exc:  # noqa: BLE001 — non-fatal enrichment fallback
             warnings.append(f"Chord enrichment skipped safely: {exc}")
@@ -85,6 +86,7 @@ def _produce_enrich_and_export(
                 score,
                 cfg.instrument,
                 preserve_existing=cfg.preserve_existing_fingering,
+                preserve_existing_tab=cfg.preserve_existing_tab,
             )
         except Exception as exc:  # noqa: BLE001 — non-fatal enrichment fallback
             warnings.append(f"Fingering enrichment skipped safely: {exc}")

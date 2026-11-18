@@ -12,6 +12,7 @@ from transcribe_music.enrich.chords import annotate_chords
 from transcribe_music.enrich.fingering import apply_fingering
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.models import Instrument
+from transcribe_music.score_utils import GuitarTrackMeta, set_guitar_track_meta
 
 
 def test_chord_recognition_viterbi_and_ensemble_reference(tmp_path: Path) -> None:
@@ -121,6 +122,92 @@ def test_guitar_fingering_tab_and_sounding_pitch_handling(tmp_path: Path) -> Non
     s_pres.insert(0, p_pres)
     apply_fingering(s_pres, Instrument.GUITAR, preserve_existing=True)
     assert [a.fingerNumber for a in next(s_pres.recurse().notes).articulations] == ["4"]
+
+
+def test_guitar_locked_tab_custom_tuning_24th_fret_and_power_sus_chords(tmp_path: Path) -> None:
+    import copy
+
+    # 1. Locked-TAB preserves authored (6, 5), (6, 7) and adds fingerings; recompute moves to open/2nd fret
+    s_locked = music21.stream.Score()
+    p_locked = music21.stream.Part()
+    p_locked.insert(0, music21.clef.Treble8vbClef())
+    p_locked.atSoundingPitch = False
+    for written_pitch, fret in (("A3", 5), ("B3", 7)):
+        n = music21.note.Note(written_pitch, quarterLength=2.0)
+        n.articulations.append(music21.articulations.StringIndication(6))
+        n.articulations.append(music21.articulations.FretIndication(fret))
+        p_locked.append(n)
+    p_locked.makeMeasures(inPlace=True)
+    s_locked.insert(0, p_locked)
+
+    s_recomputed = copy.deepcopy(s_locked)
+    apply_fingering(s_locked, Instrument.GUITAR, preserve_existing_tab=True)
+    locked_notes = list(s_locked.parts[0].recurse().notes)
+    assert [
+        next(a.number for a in n.articulations if isinstance(a, music21.articulations.StringIndication))
+        for n in locked_notes
+    ] == [6, 6]
+    assert [
+        next(a.number for a in n.articulations if isinstance(a, music21.articulations.FretIndication))
+        for n in locked_notes
+    ] == [5, 7]
+    assert all(
+        any(
+            isinstance(a, music21.articulations.Fingering)
+            and str(a.fingerNumber) in {"1", "2", "3", "4"}
+            for a in n.articulations
+        )
+        for n in locked_notes
+    )
+
+    apply_fingering(s_recomputed, Instrument.GUITAR, preserve_existing_tab=False)
+    recomp_strings = [
+        next(a.number for a in n.articulations if isinstance(a, music21.articulations.StringIndication))
+        for n in s_recomputed.parts[0].recurse().notes
+    ]
+    assert recomp_strings == [5, 5]  # Recomputed onto open A string (5,0) and (5,2)
+
+    # 2. Drop-D tuning + 24th fret E6 (= written E7) solved cleanly without clamping
+    s_drop = music21.stream.Score()
+    p_drop = music21.stream.Part()
+    p_drop.insert(0, music21.clef.Treble8vbClef())
+    p_drop.atSoundingPitch = False
+    set_guitar_track_meta(p_drop, GuitarTrackMeta(open_string_midi=(64, 59, 55, 50, 45, 38), capo_fret=0))
+    p_drop.append(music21.note.Note("D3", quarterLength=2.0))  # Sounds D2 (38) -> string 6 fret 0
+    p_drop.append(music21.note.Note("E7", quarterLength=2.0))  # Sounds E6 (88) -> string 1 fret 24
+    p_drop.makeMeasures(inPlace=True)
+    s_drop.insert(0, p_drop)
+
+    apply_fingering(s_drop, Instrument.GUITAR, preserve_existing_tab=False)
+    drop_notes = list(s_drop.parts[0].recurse().notes)
+    assert [
+        next(a.number for a in n.articulations if isinstance(a, music21.articulations.StringIndication))
+        for n in drop_notes
+    ] == [6, 1]
+    assert [
+        next(a.number for a in n.articulations if isinstance(a, music21.articulations.FretIndication))
+        for n in drop_notes
+    ] == [0, 24]
+
+    # 3. Guitar chord recognition handles E5, Dsus4, Cadd9 while preserving major/minor triads
+    s_gtr_chords = music21.stream.Score()
+    p_gc = music21.stream.Part()
+    p_gc.append(music21.chord.Chord(["E2", "B2", "E3"], quarterLength=4.0))
+    p_gc.append(music21.chord.Chord(["D3", "A3", "D4", "G4"], quarterLength=4.0))
+    p_gc.append(music21.chord.Chord(["C3", "E3", "G3", "D4"], quarterLength=4.0))
+    p_gc.makeMeasures(inPlace=True)
+    s_gtr_chords.insert(0, p_gc)
+    annotate_chords(s_gtr_chords, window_beats=4.0, instrument=Instrument.GUITAR)
+    figures = [cs.figure for cs in s_gtr_chords.recurse().getElementsByClass(music21.harmony.ChordSymbol)]
+    assert figures == ["E5", "Dsus4", "Cadd9"]
+
+    triads = make_progression_score()
+    annotate_chords(triads, window_beats=4.0, instrument=Instrument.GUITAR)
+    triad_xml = tmp_path / "triads_guitar.musicxml"
+    export_musicxml(triads, triad_xml, Instrument.PIANO)
+    triad_root = ET.parse(triad_xml).getroot()
+    assert [h.findtext("root/root-step") for h in triad_root.findall(".//harmony")] == ["C", "A", "F", "G"]
+    assert [h.findtext("kind") for h in triad_root.findall(".//harmony")] == ["major", "minor", "major", "major"]
 
 
 def test_violin_and_cello_fingering_including_thumb_position(tmp_path: Path) -> None:

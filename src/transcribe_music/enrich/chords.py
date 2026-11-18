@@ -7,11 +7,12 @@ from dataclasses import dataclass
 
 import music21
 
+from transcribe_music.models import Instrument
 from transcribe_music.score_utils import is_playable_chord, iter_playable_notes
 
 _ROOT_NAMES = ("C", "C#", "D", "E-", "E", "F", "F#", "G", "A-", "A", "B-", "B")
 
-_QUALITIES: list[tuple[str, tuple[int, ...], float]] = [
+_BASE_QUALITIES: list[tuple[str, tuple[int, ...], float]] = [
     ("", (0, 4, 7), 1.0),  # Major triad
     ("m", (0, 3, 7), 1.0),  # Minor triad
     ("7", (0, 4, 7, 10), 0.92),  # Dominant 7
@@ -19,19 +20,26 @@ _QUALITIES: list[tuple[str, tuple[int, ...], float]] = [
     ("m7", (0, 3, 7, 10), 0.92),  # Minor 7
     ("dim", (0, 3, 6), 0.85),  # Diminished
 ]
+_GUITAR_QUALITIES: list[tuple[str, tuple[int, ...], float]] = [
+    ("5", (0, 7), 0.90),  # Power chord
+    ("sus4", (0, 5, 7), 0.91),
+    ("sus2", (0, 2, 7), 0.90),
+    ("add9", (0, 4, 7, 2), 0.88),
+]
 
 
 @dataclass(frozen=True)
 class _ChordTemplate:
     symbol: str
+    suffix: str
     root_pc: int
     vector: tuple[float, ...]
 
 
-def _build_templates() -> list[_ChordTemplate]:
+def _build_templates(qualities: list[tuple[str, tuple[int, ...], float]]) -> list[_ChordTemplate]:
     templates: list[_ChordTemplate] = []
     for root_pc, root_name in enumerate(_ROOT_NAMES):
-        for suffix, intervals, prior_weight in _QUALITIES:
+        for suffix, intervals, prior_weight in qualities:
             vec = [0.0] * 12
             for idx, interval in enumerate(intervals):
                 pc = (root_pc + interval) % 12
@@ -40,6 +48,7 @@ def _build_templates() -> list[_ChordTemplate]:
             templates.append(
                 _ChordTemplate(
                     symbol=f"{root_name}{suffix}",
+                    suffix=suffix,
                     root_pc=root_pc,
                     vector=tuple(v * scale for v in vec),
                 )
@@ -47,7 +56,8 @@ def _build_templates() -> list[_ChordTemplate]:
     return templates
 
 
-_TEMPLATES = _build_templates()
+_BASE_TEMPLATES = _build_templates(_BASE_QUALITIES)
+_GUITAR_TEMPLATES = _build_templates(_BASE_QUALITIES + _GUITAR_QUALITIES)
 
 
 def _compute_symbolic_chroma_by_window(
@@ -102,10 +112,11 @@ def _viterbi_chords(
     chroma_windows: list[list[float]],
     bass_pcs: list[int | None] | None = None,
     switch_penalty: float = 0.14,
+    templates: list[_ChordTemplate] = _BASE_TEMPLATES,
 ) -> list[str | None]:
     """Decode smoothest chord sequence via Viterbi over cosine similarity + bass/root priors."""
     n_win = len(chroma_windows)
-    n_states = len(_TEMPLATES)
+    n_states = len(templates)
 
     sims: list[list[float]] = []
     energies: list[float] = []
@@ -113,13 +124,17 @@ def _viterbi_chords(
         energies.append(math.hypot(*chroma))
         bass = bass_pcs[t] if bass_pcs is not None else None
         row: list[float] = []
-        for tmpl in _TEMPLATES:
+        for tmpl in templates:
             sim = sum(c * tv for c, tv in zip(chroma, tmpl.vector, strict=True))
             if bass_pcs is not None:
                 if bass == tmpl.root_pc:
                     sim += 0.12
                 if chroma[tmpl.root_pc] < 1e-3:
                     sim -= 0.20
+            if tmpl.suffix == "5" and (
+                chroma[(tmpl.root_pc + 3) % 12] >= 0.15 or chroma[(tmpl.root_pc + 4) % 12] >= 0.15
+            ):
+                sim -= 0.12
             row.append(sim)
         sims.append(row)
 
@@ -144,7 +159,7 @@ def _viterbi_chords(
         best_states[t - 1] = back[t - 1][best_states[t]]
 
     return [
-        None if energies[t] < 1e-6 else _TEMPLATES[best_states[t]].symbol
+        None if energies[t] < 1e-6 else templates[best_states[t]].symbol
         for t in range(n_win)
     ]
 
@@ -154,6 +169,7 @@ def annotate_chords(
     harmonic_reference_score: music21.stream.Score | None = None,
     window_beats: float = 2.0,
     preserve_existing: bool = False,
+    instrument: Instrument | None = None,
 ) -> music21.stream.Score:
     """Annotate score with smoothed <harmony> ChordSymbol objects at beat/half-bar offsets."""
     if not score.parts:
@@ -174,7 +190,8 @@ def annotate_chords(
 
     ref_score = harmonic_reference_score if harmonic_reference_score is not None else score
     chroma, bass_pcs = _compute_symbolic_chroma_by_window(ref_score, total_beats, window_beats)
-    labels = _viterbi_chords(chroma, bass_pcs=bass_pcs)
+    templates = _GUITAR_TEMPLATES if instrument == Instrument.GUITAR else _BASE_TEMPLATES
+    labels = _viterbi_chords(chroma, bass_pcs=bass_pcs, templates=templates)
     measures = list(target_part.getElementsByClass(music21.stream.Measure))
     measure_has_notes = {
         id(m): any(
