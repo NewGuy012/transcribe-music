@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import time
+import urllib.error
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -17,17 +18,17 @@ from typing import Any
 from urllib.parse import quote
 
 import music21
-import requests
 
+from transcribe_music.ingest._io import (
+    atomic_write_text,
+    download_https_stream,
+    http_get_json,
+    http_get_text,
+    normalize_ascii,
+)
 from transcribe_music.ingest.digital import DIGITAL_EXTENSIONS
 from transcribe_music.ingest.gp_catalog import extract_gp_catalog_member, search_gp_catalog
-from transcribe_music.ingest.pdmx import (
-    USER_AGENT,
-    extract_pdmx_member,
-    normalize_ascii,
-    search_pdmx_catalog,
-    validate_https_url,
-)
+from transcribe_music.ingest.pdmx import extract_pdmx_member, search_pdmx_catalog
 from transcribe_music.models import Instrument, ScoreSearchResult
 
 logger = logging.getLogger(__name__)
@@ -144,36 +145,15 @@ def _encode_url_path(path: str) -> str:
 
 
 def _github_headers() -> dict[str, str]:
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
+    headers = {"Accept": "application/vnd.github+json"}
     token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
 
 
-def _http_get_json(
-    url: str,
-    timeout: float = _REQUEST_TIMEOUT_SEC,
-    headers: dict[str, str] | None = None,
-) -> Any:
-    req_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    if headers:
-        req_headers.update(headers)
-    resp = requests.get(validate_https_url(url), headers=req_headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _http_get_text(url: str, timeout: float = _REQUEST_TIMEOUT_SEC) -> str:
-    resp = requests.get(
-        validate_https_url(url), headers={"User-Agent": USER_AGENT}, timeout=timeout
-    )
-    resp.raise_for_status()
-    return resp.content.decode("utf-8", errors="replace")
-
-
 def _fetch_github_tree(tree_url: str) -> list[dict[str, Any]]:
-    data = _http_get_json(tree_url, headers=_github_headers(), timeout=12.0)
+    data = http_get_json(tree_url, headers=_github_headers(), timeout=12.0)
     tree = data.get("tree", []) if isinstance(data, dict) else []
     return [node for node in tree if isinstance(node, dict) and node.get("type") == "blob"]
 
@@ -204,10 +184,7 @@ def _load_or_fetch_index(
 
     records = fetcher()
     try:
-        index_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = cache_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(records), encoding="utf-8")
-        tmp_path.replace(cache_path)
+        atomic_write_text(cache_path, json.dumps(records))
     except OSError:
         pass
     return records
@@ -265,7 +242,7 @@ def _fetch_when_in_rome_index() -> list[dict[str, Any]]:
 
 
 def _fetch_openscore_lieder_index() -> list[dict[str, Any]]:
-    data = _http_get_json(_OPENSCORE_LIEDER_INDEX_URL)
+    data = http_get_json(_OPENSCORE_LIEDER_INDEX_URL, timeout=_REQUEST_TIMEOUT_SEC)
     if not isinstance(data, list):
         return []
     records: list[dict[str, Any]] = []
@@ -295,7 +272,7 @@ def _fetch_openscore_lieder_index() -> list[dict[str, Any]]:
 
 
 def _fetch_openscore_sq_index() -> list[dict[str, Any]]:
-    text = _http_get_text(_OPENSCORE_SQ_TSV_URL)
+    text = http_get_text(_OPENSCORE_SQ_TSV_URL, timeout=_REQUEST_TIMEOUT_SEC)
     records: list[dict[str, Any]] = []
     for row in csv.DictReader(text.splitlines(), delimiter="\t"):
         score_id = (row.get("id") or "").strip()
@@ -524,7 +501,7 @@ def search_digital_scores(
     def _safe_index(name: str, fetcher: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
         try:
             return _load_or_fetch_index(cache_dir, name, fetcher, allow_network=include_remote)
-        except (requests.RequestException, ValueError, OSError, RuntimeError) as exc:
+        except (urllib.error.URLError, ValueError, OSError, RuntimeError) as exc:
             logger.debug("Skipping search index %s: %s", name, exc)
             return []
 
@@ -614,30 +591,6 @@ def search_digital_scores(
     return ranked
 
 
-def _read_bounded_response(resp: Any, max_bytes: int = _MAX_DOWNLOAD_BYTES) -> bytes:
-    headers = getattr(resp, "headers", None) or {}
-    content_len = headers.get("content-length")
-    if content_len and str(content_len).isdigit() and int(content_len) > max_bytes:
-        raise ValueError(f"Download exceeds {max_bytes // (1024 * 1024)} MiB safety limit.")
-
-    if callable(getattr(resp, "iter_content", None)):
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in resp.iter_content(chunk_size=65_536):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > max_bytes:
-                raise ValueError(f"Download exceeds {max_bytes // (1024 * 1024)} MiB safety limit.")
-            chunks.append(chunk)
-        return b"".join(chunks)
-
-    payload = getattr(resp, "content", b"")
-    if len(payload) > max_bytes:
-        raise ValueError(f"Download exceeds {max_bytes // (1024 * 1024)} MiB safety limit.")
-    return bytes(payload)
-
-
 def download_score_result(
     result: ScoreSearchResult,
     *,
@@ -670,28 +623,10 @@ def download_score_result(
     if not result.download_url:
         raise ValueError(f"Search result has no downloadable URL or local corpus path: {result.title}")
 
-    download_url = validate_https_url(result.download_url)
-    resp = requests.get(
-        download_url,
-        headers={"User-Agent": USER_AGENT},
-        stream=True,
+    return download_https_stream(
+        result.download_url,
+        dest,
         timeout=30.0,
+        max_bytes=_MAX_DOWNLOAD_BYTES,
+        require_non_empty=True,
     )
-    try:
-        resp.raise_for_status()
-        final_url = getattr(resp, "url", None)
-        if isinstance(final_url, str) and final_url:
-            validate_https_url(final_url)
-        payload = _read_bounded_response(resp)
-    finally:
-        close_fn = getattr(resp, "close", None)
-        if callable(close_fn):
-            close_fn()
-
-    if not payload:
-        raise RuntimeError(f"Downloaded file was empty: {download_url}")
-
-    tmp_dest = dest.with_suffix(f"{dest.suffix}.tmp")
-    tmp_dest.write_bytes(payload)
-    tmp_dest.replace(dest)
-    return dest

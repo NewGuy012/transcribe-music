@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import io
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +22,20 @@ from transcribe_music import (
     sync_gp_catalog,
 )
 from transcribe_music.cli import app
+from transcribe_music.ingest import _io as io_mod
 from transcribe_music.ingest import search as search_mod
+
+
+def _fake_opener(payload: bytes, url: str, headers: dict[str, str] | None = None) -> Callable[..., Any]:
+    class _FakeResp(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(payload)
+            self.headers = headers or {}
+
+        def geturl(self) -> str:
+            return url
+
+    return lambda *_handlers: SimpleNamespace(open=lambda *_a, **_kw: _FakeResp())
 
 
 def _stub_remote_sources(
@@ -174,14 +190,9 @@ def test_cli_search_and_download_security_guards(
         ],
     )
     monkeypatch.setattr(
-        search_mod.requests,
-        "get",
-        lambda *_a, **_kw: SimpleNamespace(
-            url="https://example.com/moonlight.mxl",
-            headers={},
-            content=mxl_bytes,
-            raise_for_status=lambda: None,
-        ),
+        urllib.request,
+        "build_opener",
+        _fake_opener(mxl_bytes, "https://example.com/moonlight.mxl"),
     )
 
     runner = CliRunner()
@@ -224,26 +235,33 @@ def test_cli_search_and_download_security_guards(
 
     valid = insecure.model_copy(update={"download_url": "https://example.com/score.mxl"})
     monkeypatch.setattr(
-        search_mod.requests,
-        "get",
-        lambda *_a, **_kw: SimpleNamespace(
-            url="http://downgraded.example.com/score.mxl",
-            headers={},
-            content=b"PK",
-            raise_for_status=lambda: None,
-        ),
+        urllib.request,
+        "build_opener",
+        _fake_opener(b"PK", "http://downgraded.example.com/score.mxl"),
     )
     with pytest.raises(ValueError, match="Only HTTPS"):
         download_score_result(valid, download_dir=tmp_path)
 
+    # Pre-hop redirect guard blocks http:// downgrade and strips Authorization across hosts
+    handler = io_mod._SafeHttpsRedirectHandler()
+    auth_req = urllib.request.Request(
+        "https://api.example.com/data", headers={"Authorization": "Bearer secret"}
+    )
+    with pytest.raises(ValueError, match="Only HTTPS"):
+        handler.redirect_request(auth_req, None, 302, "Found", {}, "http://evil.example.com/x")
+    redir_req = handler.redirect_request(
+        auth_req, None, 302, "Found", {}, "https://cdn.other.com/x"
+    )
+    assert redir_req is not None
+    assert "Authorization" not in redir_req.headers
+
     monkeypatch.setattr(
-        search_mod.requests,
-        "get",
-        lambda *_a, **_kw: SimpleNamespace(
-            url="https://example.com/score.mxl",
-            headers={"content-length": str(search_mod._MAX_DOWNLOAD_BYTES + 1)},
-            content=b"PK",
-            raise_for_status=lambda: None,
+        urllib.request,
+        "build_opener",
+        _fake_opener(
+            b"PK",
+            "https://example.com/score.mxl",
+            headers={"Content-Length": str(search_mod._MAX_DOWNLOAD_BYTES + 1)},
         ),
     )
     with pytest.raises(ValueError, match="safety limit"):
@@ -333,10 +351,13 @@ def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
     with pytest.raises(ValueError, match="Unsafe archive member"):
         gp_mod.extract_gp_catalog_member(gp_dir, "file::../../etc/passwd", tmp_path / "x.gp5")
 
+    def _raise_403(*_a: object, **_kw: object) -> object:
+        raise urllib.error.HTTPError("https://zenodo.org/api/records/4789123", 403, "Forbidden", {}, None)
+
     monkeypatch.setattr(
-        gp_mod.requests,
-        "get",
-        lambda *_a, **_kw: SimpleNamespace(status_code=403),
+        urllib.request,
+        "build_opener",
+        lambda *_h: SimpleNamespace(open=_raise_403),
     )
     with pytest.raises(RuntimeError, match="approved researcher access"):
         sync_gp_catalog(cache_dir=cache_dir, zenodo_record="4789123")

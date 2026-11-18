@@ -8,6 +8,7 @@ from pathlib import Path
 
 import music21
 
+from transcribe_music.ingest._io import MAX_MEMBER_BYTES
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 from transcribe_music.score_utils import (
     GuitarTrackMeta,
@@ -110,6 +111,8 @@ def _snap_offset(raw: float, bar_ql: Fraction, step: Fraction = Fraction(1, 4)) 
 
 def parse_ascii_tab_file(path: Path) -> tuple[music21.stream.Score, list[str]]:
     """Parse a plain-text ASCII guitar tablature file into a measured music21 Score."""
+    if path.stat().st_size > MAX_MEMBER_BYTES:
+        raise ValueError(f"ASCII tab file {path.name} exceeds {MAX_MEMBER_BYTES} byte limit.")
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
 

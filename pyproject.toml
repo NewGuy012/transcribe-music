@@ -15,7 +15,6 @@ dependencies = [
     "duckdb",
     "music21",
     "converter21",
-    "requests",
 ]
 
 [tool.uv]

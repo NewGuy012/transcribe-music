@@ -7,22 +7,24 @@ import logging
 import os
 import shutil
 import tarfile
+import urllib.error
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import duckdb
-import requests
 
-from transcribe_music.ingest.pdmx import (
-    MAX_MEMBER_BYTES,
-    USER_AGENT,
+from transcribe_music.ingest._io import (
     download_https_stream,
+    http_get_json,
+    is_zip_symlink,
     normalize_ascii,
     read_bounded_tar_member,
+    read_bounded_zip_member,
+    resolve_catalog_dir,
     safe_resolve_member_path,
-    validate_https_url,
+    save_catalog_dir,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,29 +47,9 @@ class GpCatalogStatus:
     archive_available: bool
 
 
-def _config_file(cache_dir: Path) -> Path:
-    return Path(cache_dir) / "dadagp" / "config.json"
-
-
 def resolve_gp_catalog_dir(cache_dir: Path = Path(".transcribe_cache")) -> Path:
     """Resolve active Guitar Pro catalog dir (custom configured dir or `<cache_dir>/dadagp`)."""
-    default_dir = Path(cache_dir) / "dadagp"
-    cfg_path = _config_file(cache_dir)
-    if cfg_path.exists():
-        try:
-            data = json.loads(cfg_path.read_text(encoding="utf-8"))
-            custom = data.get("gp_dir")
-            if isinstance(custom, str) and custom.strip():
-                return Path(custom)
-        except (OSError, ValueError):
-            pass
-    return default_dir
-
-
-def _save_gp_dir_config(cache_dir: Path, gp_dir: Path) -> None:
-    cfg_path = _config_file(cache_dir)
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(json.dumps({"gp_dir": str(gp_dir.resolve())}), encoding="utf-8")
+    return resolve_catalog_dir(cache_dir, "dadagp", "gp_dir")
 
 
 def _has_gp_sources(gp_dir: Path) -> bool:
@@ -138,6 +120,24 @@ def _infer_entry_metadata(rel_path: str) -> tuple[str, str | None, str | None]:
     return title or p.stem, artist, genre
 
 
+def _is_safe_archive_member_name(name: str) -> str | None:
+    clean = name.removeprefix("./").replace("\\", "/")
+    parts = Path(clean).parts
+    if not clean or "\x00" in clean or Path(clean).is_absolute() or ".." in parts:
+        return None
+    return clean
+
+
+def _make_gp_row(
+    parts: tuple[str, ...],
+    rel_member: str,
+    ext: str,
+) -> tuple[str, str, str | None, str | None, str, str]:
+    title, artist, genre = _infer_entry_metadata(rel_member)
+    search_text = normalize_ascii(f"{title} {artist or ''} {genre or ''} {Path(rel_member).stem}")
+    return (json.dumps(parts), ext, artist, genre, title, search_text)
+
+
 def _collect_gp_entries(target_dir: Path) -> list[tuple[str, str, str | None, str | None, str, str]]:
     """Scan local files, `.tar.gz`, and `.zip` archives inside `target_dir` for GP scores."""
     rows: list[tuple[str, str, str | None, str | None, str, str]] = []
@@ -150,37 +150,35 @@ def _collect_gp_entries(target_dir: Path) -> list[tuple[str, str, str | None, st
         name_l = path.name.lower()
 
         if ext in GP_CATALOG_EXTENSIONS:
-            title, artist, genre = _infer_entry_metadata(rel)
-            search_text = normalize_ascii(f"{title} {artist or ''} {genre or ''} {Path(rel).stem}")
-            rows.append((f"file::{rel}", ext, artist, genre, title, search_text))
+            rows.append(_make_gp_row(("file", rel), rel, ext))
         elif name_l.endswith((".tar.gz", ".tgz")):
-            with tarfile.open(path, "r:gz") as tf:
-                for member in tf.getmembers():
-                    if not member.isfile():
-                        continue
-                    clean_m = member.name.lstrip("./")
-                    m_ext = Path(clean_m).suffix.lower()
-                    if m_ext not in GP_CATALOG_EXTENSIONS:
-                        continue
-                    title, artist, genre = _infer_entry_metadata(clean_m)
-                    search_text = normalize_ascii(
-                        f"{title} {artist or ''} {genre or ''} {Path(clean_m).stem}"
-                    )
-                    rows.append((f"tar::{rel}::{clean_m}", m_ext, artist, genre, title, search_text))
+            try:
+                with tarfile.open(path, "r:gz") as tf:
+                    for member in tf.getmembers():
+                        if not member.isfile():
+                            continue
+                        clean_m = _is_safe_archive_member_name(member.name)
+                        if clean_m is None:
+                            continue
+                        m_ext = Path(clean_m).suffix.lower()
+                        if m_ext in GP_CATALOG_EXTENSIONS:
+                            rows.append(_make_gp_row(("tar", rel, clean_m), clean_m, m_ext))
+            except (tarfile.TarError, OSError) as exc:
+                logger.debug("Skipping unreadable tar archive %s: %s", path, exc)
         elif ext == ".zip":
-            with zipfile.ZipFile(path, "r") as zf:
-                for info in zf.infolist():
-                    if info.is_dir():
-                        continue
-                    clean_m = info.filename.lstrip("./")
-                    m_ext = Path(clean_m).suffix.lower()
-                    if m_ext not in GP_CATALOG_EXTENSIONS:
-                        continue
-                    title, artist, genre = _infer_entry_metadata(clean_m)
-                    search_text = normalize_ascii(
-                        f"{title} {artist or ''} {genre or ''} {Path(clean_m).stem}"
-                    )
-                    rows.append((f"zip::{rel}::{clean_m}", m_ext, artist, genre, title, search_text))
+            try:
+                with zipfile.ZipFile(path, "r") as zf:
+                    for info in zf.infolist():
+                        if info.is_dir() or is_zip_symlink(info):
+                            continue
+                        clean_m = _is_safe_archive_member_name(info.filename)
+                        if clean_m is None:
+                            continue
+                        m_ext = Path(clean_m).suffix.lower()
+                        if m_ext in GP_CATALOG_EXTENSIONS:
+                            rows.append(_make_gp_row(("zip", rel, clean_m), clean_m, m_ext))
+            except (zipfile.BadZipFile, OSError) as exc:
+                logger.debug("Skipping unreadable zip archive %s: %s", path, exc)
 
     return rows
 
@@ -196,22 +194,19 @@ def _download_zenodo_record_archives(
     if not clean_id.isdigit():
         raise ValueError(f"Zenodo record ID must be numeric, got: {record_id!r}")
 
-    api_url = validate_https_url(f"https://zenodo.org/api/records/{clean_id}")
-    headers: dict[str, str] = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    resp = requests.get(api_url, headers=headers, timeout=20.0)
-    if resp.status_code in (401, 403):
-        raise RuntimeError(
-            f"Zenodo record {clean_id} requires approved researcher access (HTTP {resp.status_code}). "
-            "Set ZENODO_TOKEN / --zenodo-token after access approval, or index local tabs with --gp-dir."
-        )
-    resp.raise_for_status()
-    data = resp.json()
+    api_url = f"https://zenodo.org/api/records/{clean_id}"
+    auth_headers = {"Authorization": f"Bearer {token}"} if token else None
+    try:
+        data = http_get_json(api_url, headers=auth_headers, timeout=20.0)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise RuntimeError(
+                f"Zenodo record {clean_id} requires approved researcher access (HTTP {exc.code}). "
+                "Set ZENODO_TOKEN after access approval, or index local tabs with --gp-dir."
+            ) from exc
+        raise
     files = data.get("files", []) if isinstance(data, dict) else []
 
-    auth_headers = {"Authorization": f"Bearer {token}"} if token else None
     downloaded = 0
     for entry in files:
         key = str(entry.get("key") or entry.get("filename") or "").strip()
@@ -283,7 +278,7 @@ def sync_gp_catalog(
     target_dir = Path(gp_dir) if gp_dir is not None else (Path(cache_dir) / "dadagp")
     target_dir.mkdir(parents=True, exist_ok=True)
     if gp_dir is not None:
-        _save_gp_dir_config(cache_dir, target_dir)
+        save_catalog_dir(cache_dir, "dadagp", "gp_dir", target_dir)
 
     if zenodo_record:
         resolved_token = (zenodo_token or os.environ.get("ZENODO_TOKEN") or "").strip() or None
@@ -356,12 +351,20 @@ def search_gp_catalog(
     return records
 
 
+def _decode_member_ref(member_ref: str) -> list[str]:
+    if member_ref.startswith("["):
+        parsed = json.loads(member_ref)
+        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+            return parsed
+    return member_ref.split("::")
+
+
 def extract_gp_catalog_member(gp_dir: Path | str, member_ref: str, dest: Path) -> Path:
     """Safely extract a Guitar Pro / tab file from a catalog dir, `.tar.gz`, or `.zip`."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    parts = member_ref.split("::")
+    parts = _decode_member_ref(member_ref)
     kind = parts[0]
     if kind == "file" and len(parts) == 2:
         _, _, src = safe_resolve_member_path(gp_dir, parts[1])
@@ -379,26 +382,10 @@ def extract_gp_catalog_member(gp_dir: Path | str, member_ref: str, dest: Path) -
         if kind == "tar":
             data = read_bounded_tar_member(archive_path, clean_member)
         else:
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                info = None
-                for cand in (clean_member, f"./{clean_member}"):
-                    try:
-                        info = zf.getinfo(cand)
-                        break
-                    except KeyError:
-                        continue
-                if info is None:
-                    raise FileNotFoundError(
-                        f"Member '{clean_member}' not found inside {archive_path}"
-                    )
-                if info.is_dir():
-                    raise ValueError(f"Archive entry '{clean_member}' is not a regular file.")
-                if info.file_size > MAX_MEMBER_BYTES:
-                    raise ValueError(f"Archive entry '{clean_member}' exceeds size limit.")
-                with zf.open(info, "r") as fh:
-                    data = fh.read(MAX_MEMBER_BYTES + 1)
-                if len(data) > MAX_MEMBER_BYTES:
-                    raise ValueError(f"Archive entry '{clean_member}' exceeds size limit.")
+            targets = {clean_member, f"./{clean_member}"}
+            data = read_bounded_zip_member(archive_path, lambda name: name in targets)
+            if data is None:
+                raise FileNotFoundError(f"Member '{clean_member}' not found inside {archive_path}")
         dest.write_bytes(data)
         return dest
 

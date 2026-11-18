@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 import tarfile
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 import duckdb
-import requests
 
+from transcribe_music.ingest._io import (
+    download_https_stream,
+    normalize_ascii,
+    read_bounded_tar_member,
+    resolve_catalog_dir,
+    safe_resolve_member_path,
+    save_catalog_dir,
+)
 from transcribe_music.models import Instrument
 
 logger = logging.getLogger(__name__)
@@ -23,9 +27,6 @@ PDMX_ZENODO_RECORD_ID = "15571083"
 PDMX_CSV_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/files/PDMX.csv/content"
 PDMX_MXL_TAR_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/files/mxl.tar.gz/content"
 PDMX_MID_TAR_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/files/mid.tar.gz/content"
-
-USER_AGENT = "transcribe-music/0.2 (+https://github.com/transcribe-music)"
-MAX_MEMBER_BYTES = 50 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -40,44 +41,9 @@ class PdmxStatus:
     mid_available: bool
 
 
-def validate_https_url(url: str) -> str:
-    """Require an HTTPS URL with a network host before or after redirects."""
-    parsed = urlparse(url)
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
-        raise ValueError(f"Only HTTPS download URLs are permitted, got: {url!r}")
-    return url
-
-
-def normalize_ascii(text: str) -> str:
-    """Fold Unicode accents to ASCII and normalize whitespace/casing."""
-    decomposed = unicodedata.normalize("NFKD", text)
-    ascii_only = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return " ".join(ascii_only.lower().split())
-
-
-def _config_file(cache_dir: Path) -> Path:
-    return Path(cache_dir) / "pdmx" / "config.json"
-
-
 def resolve_pdmx_dir(cache_dir: Path = Path(".transcribe_cache")) -> Path:
     """Resolve the active PDMX directory (custom configured dir or `<cache_dir>/pdmx`)."""
-    default_dir = Path(cache_dir) / "pdmx"
-    cfg_path = _config_file(cache_dir)
-    if cfg_path.exists():
-        try:
-            data = json.loads(cfg_path.read_text(encoding="utf-8"))
-            custom = data.get("pdmx_dir")
-            if isinstance(custom, str) and custom.strip():
-                return Path(custom)
-        except (OSError, ValueError):
-            pass
-    return default_dir
-
-
-def _save_pdmx_dir_config(cache_dir: Path, pdmx_dir: Path) -> None:
-    cfg_path = _config_file(cache_dir)
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(json.dumps({"pdmx_dir": str(pdmx_dir.resolve())}), encoding="utf-8")
+    return resolve_catalog_dir(cache_dir, "pdmx", "pdmx_dir")
 
 
 def _pdmx_archive_available(pdmx_dir: Path, kind: str) -> bool:
@@ -199,74 +165,6 @@ def build_pdmx_duckdb(
     return count
 
 
-def download_https_stream(
-    url: str,
-    dest: Path,
-    *,
-    headers: dict[str, str] | None = None,
-) -> Path:
-    """Stream an HTTPS download atomically into `dest`, checking redirect schemes."""
-    validate_https_url(url)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(f"{dest.suffix}.tmp")
-    req_headers = {"User-Agent": USER_AGENT}
-    if headers:
-        req_headers.update(headers)
-    with requests.get(
-        url,
-        headers=req_headers,
-        stream=True,
-        timeout=60.0,
-    ) as resp:
-        resp.raise_for_status()
-        validate_https_url(str(resp.url))
-        with tmp.open("wb") as fh:
-            for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
-    tmp.replace(dest)
-    return dest
-
-
-def safe_resolve_member_path(base_dir: Path | str, member_rel: str) -> tuple[Path, str, Path]:
-    """Validate `member_rel` stays strictly inside `base_dir` and return (base, clean_rel, target)."""
-    base_resolved = Path(base_dir).resolve()
-    clean_rel = member_rel.removeprefix("./")
-    rel_parts = Path(clean_rel).parts
-    if not clean_rel or Path(clean_rel).is_absolute() or ".." in rel_parts:
-        raise ValueError(f"Unsafe archive member path outside catalog directory: {member_rel!r}")
-    target = (base_resolved / clean_rel).resolve()
-    if not target.is_relative_to(base_resolved) or target == base_resolved:
-        raise ValueError(f"Unsafe archive member path outside catalog directory: {member_rel!r}")
-    return base_resolved, clean_rel, target
-
-
-def read_bounded_tar_member(
-    tar_path: Path,
-    clean_rel: str,
-    *,
-    max_bytes: int = MAX_MEMBER_BYTES,
-) -> bytes:
-    """Safely extract a single regular file entry from a `.tar.gz` archive within size bounds."""
-    with tarfile.open(tar_path, "r:gz") as tf:
-        for candidate_name in (clean_rel, f"./{clean_rel}"):
-            try:
-                member = tf.getmember(candidate_name)
-            except KeyError:
-                continue
-            if not member.isfile():
-                raise ValueError(f"Archive entry '{clean_rel}' is not a regular file.")
-            if member.size > max_bytes:
-                raise ValueError(f"Archive entry '{clean_rel}' exceeds size limit.")
-            extracted = tf.extractfile(member)
-            if extracted is not None:
-                data = extracted.read(max_bytes + 1)
-                if len(data) > max_bytes:
-                    raise ValueError(f"Archive entry '{clean_rel}' exceeds size limit.")
-                return data
-    raise FileNotFoundError(f"Member '{clean_rel}' not found inside {tar_path}")
-
-
 def _extract_full_archive(archive_path: Path, dest_dir: Path) -> None:
     with tarfile.open(archive_path, "r:gz") as tf:
         tf.extractall(dest_dir, filter="data")
@@ -287,7 +185,7 @@ def sync_pdmx(
     target_dir = Path(pdmx_dir) if pdmx_dir is not None else (Path(cache_dir) / "pdmx")
     target_dir.mkdir(parents=True, exist_ok=True)
     if pdmx_dir is not None:
-        _save_pdmx_dir_config(cache_dir, target_dir)
+        save_catalog_dir(cache_dir, "pdmx", "pdmx_dir", target_dir)
 
     csv_path = target_dir / "PDMX.csv"
     if download_csv and (force or not csv_path.exists()):

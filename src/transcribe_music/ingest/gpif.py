@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-import zipfile
 from fractions import Fraction
 from pathlib import Path
 
 import music21
 
-from transcribe_music.ingest.pdmx import MAX_MEMBER_BYTES
+from transcribe_music.ingest._io import read_bounded_zip_member
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 from transcribe_music.score_utils import (
     GuitarTrackMeta,
@@ -33,27 +32,10 @@ _DEFAULT_GUITAR_TUNING = INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi
 
 
 def _find_gpif_xml_bytes(gp_path: Path) -> bytes | None:
-    if not zipfile.is_zipfile(gp_path):
-        return None
-    with zipfile.ZipFile(gp_path, "r") as zf:
-        target = next(
-            (
-                info
-                for info in zf.infolist()
-                if not info.is_dir()
-                and info.filename.lower().replace("\\", "/") in {"content/score.gpif", "score.gpif"}
-            ),
-            None,
-        )
-        if target is None:
-            return None
-        if target.file_size > MAX_MEMBER_BYTES:
-            raise ValueError(f"{gp_path.name} score.gpif exceeds {MAX_MEMBER_BYTES} byte limit.")
-        with zf.open(target, "r") as fh:
-            data = fh.read(MAX_MEMBER_BYTES + 1)
-        if len(data) > MAX_MEMBER_BYTES:
-            raise ValueError(f"{gp_path.name} score.gpif exceeds {MAX_MEMBER_BYTES} byte limit.")
-        return data
+    return read_bounded_zip_member(
+        gp_path,
+        lambda name: name.lower() in {"content/score.gpif", "score.gpif"},
+    )
 
 
 def _note_properties(note_el: ET.Element) -> dict[str, ET.Element]:
@@ -143,8 +125,14 @@ def parse_gpif_file(gp_path: Path) -> tuple[music21.stream.Score, list[str]] | N
     xml_bytes = _find_gpif_xml_bytes(gp_path)
     if xml_bytes is None:
         return None
+    head_upper = xml_bytes[:4096].upper()
+    if b"<!DOCTYPE" in head_upper or b"<!ENTITY" in head_upper:
+        raise ValueError(f"Unsafe XML DTD/entity declaration in {gp_path.name}")
 
-    root = ET.fromstring(xml_bytes)
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return None
     title = (root.findtext("./Score/Title") or "").strip() or gp_path.stem
     artist = (
         (root.findtext("./Score/Artist") or "").strip()
