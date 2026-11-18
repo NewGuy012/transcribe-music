@@ -117,7 +117,7 @@ def convert(
         typer.Argument(
             exists=True,
             readable=True,
-            help="Digital score (.musicxml/.mxl/.mid/.krn/.mei/.abc/.gp*/.mscz/.capx/.ly) or fallback .pdf.",
+            help="Digital score (.musicxml/.mxl/.mid/.krn/.mei/.abc/.gp*/.tab/.mscz/.capx/.ly) or fallback .pdf.",
         ),
     ],
     instrument: InstrumentOpt,
@@ -158,6 +158,7 @@ def inspect(
 ) -> None:
     """List all parts, instruments, clefs, and note counts in a digital score file."""
     info = inspect_digital_score(score_file)
+    show_guitar_meta = any(p.tuning or p.capo for p in info.parts)
     table = Table(title=f"{info.title or info.source_path.name} ({info.format_name})")
     table.add_column("#", no_wrap=True)
     table.add_column("Part", no_wrap=True)
@@ -167,13 +168,16 @@ def inspect(
     table.add_column("Bars", no_wrap=True)
     table.add_column("Notes", no_wrap=True)
     table.add_column("Range", no_wrap=True)
+    if show_guitar_meta:
+        table.add_column("Tuning", no_wrap=True)
+        table.add_column("Capo", no_wrap=True)
     for p in info.parts:
         pitch_span = (
             f"{p.pitch_min}..{p.pitch_max}"
             if p.pitch_min is not None and p.pitch_max is not None
             else "-"
         )
-        table.add_row(
+        row = [
             str(p.index),
             p.name,
             p.instrument_name or "-",
@@ -182,7 +186,11 @@ def inspect(
             str(p.measure_count),
             str(p.note_count),
             pitch_span,
-        )
+        ]
+        if show_guitar_meta:
+            row.append(p.tuning or "-")
+            row.append(str(p.capo) if p.capo else "-")
+        table.add_row(*row)
     console.print(table)
 
 

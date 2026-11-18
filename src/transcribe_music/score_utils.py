@@ -47,6 +47,79 @@ def format_tuning_label(open_string_midi: tuple[int, ...]) -> str:
     return "-".join(music21.pitch.Pitch(midi=m).nameWithOctave for m in reversed(open_string_midi))
 
 
+def build_fretted_element(
+    note_specs: list[tuple[int, int | None, int | None]],
+    duration: music21.duration.Duration,
+) -> music21.note.Note | music21.chord.Chord:
+    """Build a Note or Chord sorted ascending by MIDI pitch with aligned String/Fret tags."""
+    deduped: dict[int, tuple[int | None, int | None]] = {}
+    for midi_val, s_num, fret in note_specs:
+        if midi_val not in deduped:
+            deduped[midi_val] = (s_num, fret)
+    ordered = sorted(deduped.items(), key=lambda item: item[0])
+
+    pitches = [item[0] for item in ordered]
+    if len(pitches) == 1:
+        el: music21.note.Note | music21.chord.Chord = music21.note.Note(
+            pitches[0], duration=duration
+        )
+    else:
+        el = music21.chord.Chord(pitches, duration=duration)
+
+    tabs = [item[1] for item in ordered]
+    if all(s is not None and f is not None and s >= 1 and f >= 0 for s, f in tabs):
+        for s_num, fret in tabs:
+            assert s_num is not None and fret is not None
+            el.articulations.append(music21.articulations.StringIndication(s_num))
+            el.articulations.append(music21.articulations.FretIndication(fret))
+    return el
+
+
+def mark_tie(
+    prev_el: music21.note.Note | music21.chord.Chord,
+    cur_el: music21.note.Note | music21.chord.Chord,
+) -> None:
+    """Link two consecutive Note/Chord elements with MusicXML tie start/continue/stop."""
+    if prev_el.tie is None:
+        prev_el.tie = music21.tie.Tie("start")
+    elif prev_el.tie.type == "stop":
+        prev_el.tie = music21.tie.Tie("continue")
+    cur_el.tie = music21.tie.Tie("stop")
+
+
+def attach_guitar_techniques(
+    part: music21.stream.Part,
+    target_stream: music21.stream.Stream,
+    prev_el: music21.note.Note | music21.chord.Chord | None,
+    cur_el: music21.note.Note | music21.chord.Chord,
+    offset_ql: Fraction,
+    *,
+    hammer_from_prev: bool = False,
+    pull_from_prev: bool = False,
+    slide_from_prev: bool = False,
+    bend_semitones: float = 0.0,
+    harmonic: bool = False,
+    palm_mute: bool = False,
+    prev_palm_mute: bool = False,
+) -> None:
+    """Attach supported guitar expressive articulations/spanners to a Note or Chord."""
+    if prev_el is not None:
+        if hammer_from_prev:
+            part.insert(0, music21.articulations.HammerOn(prev_el, cur_el))
+        elif pull_from_prev:
+            part.insert(0, music21.articulations.PullOff(prev_el, cur_el))
+        if slide_from_prev:
+            part.insert(0, music21.spanner.Glissando(prev_el, cur_el, lineType="solid"))
+    if bend_semitones > 0.0:
+        bend = music21.articulations.FretBend()
+        bend.bendAlter = music21.interval.Interval(round(bend_semitones, 2))
+        cur_el.articulations.append(bend)
+    if harmonic:
+        cur_el.articulations.append(music21.articulations.Harmonic())
+    if palm_mute and not prev_palm_mute:
+        target_stream.insert(offset_ql, music21.expressions.TextExpression("P.M."))
+
+
 def is_playable_chord(el: object) -> bool:
     """Return True for performed Chord objects, excluding Harmony ChordSymbols."""
     return isinstance(el, music21.chord.Chord) and not isinstance(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import music21
@@ -111,7 +112,11 @@ def write_gp5_file(
     path: Path,
     *,
     notes: tuple[tuple[int, int], ...] = ((6, 0), (5, 0), (4, 0), (1, 0)),
+    chord_beats: tuple[tuple[tuple[int, int], ...], ...] = (),
     with_drums: bool = False,
+    tuning: tuple[int, ...] | None = None,
+    capo: int = 0,
+    with_effects: bool = False,
 ) -> Path:
     guitarpro = pytest.importorskip("guitarpro")
     gm = pytest.importorskip("guitarpro.models")
@@ -120,16 +125,163 @@ def write_gp5_file(
     gtr_track = song.tracks[0]
     gtr_track.name = "Nylon Guitar"
     gtr_track.channel.instrument = 24
+    gtr_track.offset = capo
+    if tuning is not None:
+        gtr_track.strings = [gm.GuitarString(i + 1, val) for i, val in enumerate(tuning)]
     if with_drums:
         drum_track = gm.Track(song, number=2, name="Drums", isPercussionTrack=True)
         drum_track.channel.channel = 9
         drum_track.measures.append(gm.Measure(drum_track, song.measureHeaders[0]))
         song.tracks.append(drum_track)
 
+    if with_effects:
+        song.measureHeaders[0].isRepeatOpen = True
+        song.measureHeaders[0].repeatClose = 2
+
     v0 = gtr_track.measures[0].voices[0]
-    for string_num, fret in notes:
+    beat_groups: list[tuple[tuple[int, int], ...]] = (
+        list(chord_beats) if chord_beats else [(nf,) for nf in notes]
+    )
+    for b_idx, group in enumerate(beat_groups):
         beat = gm.Beat(v0, duration=gm.Duration(value=4), status=gm.BeatStatus.normal)
-        beat.notes.append(gm.Note(beat, value=fret, string=string_num, type=gm.NoteType.normal))
+        for string_num, fret in group:
+            note = gm.Note(beat, value=fret, string=string_num, type=gm.NoteType.normal)
+            if with_effects:
+                if b_idx == 0:
+                    note.effect.hammer = True
+                    note.effect.palmMute = True
+                elif b_idx == 1:
+                    note.effect.slides = [gm.SlideType.shiftSlideTo]
+                    note.effect.harmonic = gm.NaturalHarmonic()
+                elif b_idx == 2:
+                    bend = gm.BendEffect(
+                        type=gm.BendType.bend,
+                        value=100,
+                        points=[gm.BendPoint(0, 0), gm.BendPoint(6, 4), gm.BendPoint(12, 4)],
+                    )
+                    note.effect.bend = bend
+            beat.notes.append(note)
         v0.beats.append(beat)
     guitarpro.write(song, str(path))
+    return path
+
+
+def write_gpif_file(
+    path: Path,
+    *,
+    title: str = "GPIF Study",
+    artist: str = "GPIF Artist",
+    tuning_low_to_high: str = "38 45 50 55 59 64",
+    capo: int = 2,
+) -> Path:
+    """Create a synthetic Guitar Pro 7/8 `.gp` archive with `Content/score.gpif`."""
+    gpif_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<GPIF>
+  <Score>
+    <Title>{title}</Title>
+    <Artist>{artist}</Artist>
+  </Score>
+  <MasterTrack>
+    <Automations>
+      <Automation><Type>Tempo</Type><Position>0</Position><Value>112 2</Value></Automation>
+    </Automations>
+  </MasterTrack>
+  <Tracks>
+    <Track id="0">
+      <Name>Lead Guitar</Name>
+      <InstrumentSet><Type>guitar</Type><Name>Electric Guitar</Name></InstrumentSet>
+      <GeneralMidi><Program>27</Program><PrimaryChannel>0</PrimaryChannel></GeneralMidi>
+      <Staves>
+        <Staff>
+          <Properties>
+            <Property name="Tuning"><Pitches>{tuning_low_to_high}</Pitches></Property>
+            <Property name="CapoFret"><Fret>{capo}</Fret></Property>
+          </Properties>
+        </Staff>
+      </Staves>
+    </Track>
+    <Track id="1">
+      <Name>Drumkit</Name>
+      <InstrumentSet><Type>drumKit</Type><Name>Drumkit</Name></InstrumentSet>
+      <GeneralMidi><Program>0</Program><PrimaryChannel>9</PrimaryChannel></GeneralMidi>
+    </Track>
+  </Tracks>
+  <MasterBars>
+    <MasterBar>
+      <Time>4/4</Time>
+      <Key><AccidentalCount>1</AccidentalCount></Key>
+      <Repeat start="true" end="true" count="2"/>
+      <Bars>0 1</Bars>
+    </MasterBar>
+  </MasterBars>
+  <Bars>
+    <Bar id="0"><Voices>0 -1</Voices></Bar>
+    <Bar id="1"><Voices>1 -1</Voices></Bar>
+  </Bars>
+  <Voices>
+    <Voice id="0"><Beats>0 1 2</Beats></Voice>
+    <Voice id="1"><Beats>3</Beats></Voice>
+  </Voices>
+  <Beats>
+    <Beat id="0"><Rhythm ref="0"/><Notes>0 1</Notes></Beat>
+    <Beat id="1"><Rhythm ref="0"/><Notes>2</Notes></Beat>
+    <Beat id="2"><Rhythm ref="1"/><Notes>3</Notes></Beat>
+    <Beat id="3"><Rhythm ref="2"/><Notes></Notes></Beat>
+  </Beats>
+  <Notes>
+    <Note id="0">
+      <Properties>
+        <Property name="String"><String>0</String></Property>
+        <Property name="Fret"><Fret>0</Fret></Property>
+        <Property name="PalmMuted"><Enable/></Property>
+      </Properties>
+    </Note>
+    <Note id="1">
+      <Properties>
+        <Property name="String"><String>5</String></Property>
+        <Property name="Fret"><Fret>3</Fret></Property>
+        <Property name="HopOOrigin"><Enable/></Property>
+      </Properties>
+    </Note>
+    <Note id="2">
+      <Properties>
+        <Property name="String"><String>5</String></Property>
+        <Property name="Fret"><Fret>5</Fret></Property>
+        <Property name="Bended"><Enable/></Property>
+        <Property name="BendDestinationValue"><Float>100</Float></Property>
+      </Properties>
+    </Note>
+    <Note id="3">
+      <Properties>
+        <Property name="String"><String>4</String></Property>
+        <Property name="Fret"><Fret>12</Fret></Property>
+        <Property name="Harmonic"><Enable/></Property>
+      </Properties>
+    </Note>
+  </Notes>
+  <Rhythms>
+    <Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>
+    <Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>
+    <Rhythm id="2"><NoteValue>Whole</NoteValue></Rhythm>
+  </Rhythms>
+</GPIF>"""
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("Content/score.gpif", gpif_xml)
+    return path
+
+
+def write_ascii_tab_file(path: Path, content: str | None = None) -> Path:
+    default_tab = """Title: Riff Study
+Artist: Tab Author
+Time: 4/4
+Capo: 2
+
+e|---0---3h5---7\\5---12b--|
+B|---1--------------------|
+G|---0--------------------|
+D|---2--------------------|
+A|---3--------------------|
+E|------------------------|
+"""
+    path.write_text(content if content is not None else default_tab, encoding="utf-8")
     return path

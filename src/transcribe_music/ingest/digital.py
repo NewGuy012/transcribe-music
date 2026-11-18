@@ -12,8 +12,21 @@ from pathlib import Path
 
 import music21
 
+from transcribe_music.ingest.ascii_tab import parse_ascii_tab_file
+from transcribe_music.ingest.gpif import parse_gpif_file
 from transcribe_music.models import PartInfo, ScoreInspection
-from transcribe_music.score_utils import coerce_to_score, element_midis, iter_playable_notes
+from transcribe_music.score_utils import (
+    GuitarTrackMeta,
+    attach_guitar_techniques,
+    build_fretted_element,
+    coerce_to_score,
+    element_midis,
+    format_tuning_label,
+    get_guitar_track_meta,
+    iter_playable_notes,
+    mark_tie,
+    set_guitar_track_meta,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +42,8 @@ MUSESCORE_EXTENSIONS = frozenset({".mscz", ".mscx"})
 MUSESCORE_GP_EXTENSIONS = frozenset({".gp", ".gpx"})
 CAPELLA_EXTENSIONS = frozenset({".cap", ".capx"})
 LILYPOND_EXTENSIONS = frozenset({".ly"})
+ASCII_TAB_EXTENSIONS = frozenset({".tab"})
+_LOCAL_ASCII_TAB_EXTENSIONS = frozenset({".tab", ".txt"})
 
 DIGITAL_EXTENSIONS = (
     MUSICXML_EXTENSIONS
@@ -39,6 +54,7 @@ DIGITAL_EXTENSIONS = (
     | MUSESCORE_GP_EXTENSIONS
     | CAPELLA_EXTENSIONS
     | LILYPOND_EXTENSIONS
+    | ASCII_TAB_EXTENSIONS
 )
 
 _CONVERTER21_REGISTERED = False
@@ -216,15 +232,19 @@ def _gp_instrument_from_program(program: int, track_name: str) -> music21.instru
     return inst
 
 
-def _mark_gp_tie(
-    prev_el: music21.note.Note | music21.chord.Chord,
-    cur_el: music21.note.Note | music21.chord.Chord,
-) -> None:
-    if prev_el.tie is None:
-        prev_el.tie = music21.tie.Tie("start")
-    elif prev_el.tie.type == "stop":
-        prev_el.tie = music21.tie.Tie("continue")
-    cur_el.tie = music21.tie.Tie("stop")
+def _gp_bend_semitones(effect: object) -> float:
+    if not getattr(effect, "isBend", False):
+        return 0.0
+    bend = getattr(effect, "bend", None)
+    if bend is None:
+        return 0.0
+    points = getattr(bend, "points", None) or []
+    if points:
+        max_q = max(float(getattr(pt, "value", 0) or 0) for pt in points)
+        if max_q > 0:
+            return max_q / 2.0
+    raw_val = float(getattr(bend, "value", 0) or 0)
+    return raw_val / 50.0 if raw_val > 0 else 0.0
 
 
 def _load_guitarpro_score(path: Path) -> LoadedDigitalScore:
@@ -259,6 +279,7 @@ def _load_guitarpro_score(path: Path) -> LoadedDigitalScore:
         warnings.append(f"Skipped {skipped} percussion track(s) from {path.name}.")
 
     quarter_ticks = gm.Duration.quarterTime or 960
+    slide_out_types = {gm.SlideType.shiftSlideTo, gm.SlideType.legatoSlideTo}
 
     for t_idx, track in enumerate(non_percussion):
         part = music21.stream.Part(id=f"P{track.number}")
@@ -271,10 +292,21 @@ def _load_guitarpro_score(path: Path) -> LoadedDigitalScore:
 
         capo_offset = int(getattr(track, "offset", 0) or 0)
         is_guitar_prog = 24 <= gm_prog <= 31
+        raw_strings = getattr(track, "strings", None) or ()
+        open_strings = tuple(
+            int(s.value)
+            for s in sorted(raw_strings, key=lambda st: int(getattr(st, "number", 0)))
+        )
+        n_strings = len(open_strings) if open_strings else 6
+        if is_guitar_prog and open_strings:
+            set_guitar_track_meta(
+                part, GuitarTrackMeta(open_string_midi=open_strings, capo_fret=capo_offset)
+            )
 
         prev_ts: tuple[int, int] | None = None
         prev_ks: int | None = None
         prev_el_by_voice: dict[int, music21.note.Note | music21.chord.Chord | None] = {}
+        prev_pending_by_voice: dict[int, tuple[bool, bool, bool]] = {}
 
         for m_idx, gp_measure in enumerate(track.measures):
             header = gp_measure.header
@@ -293,6 +325,15 @@ def _load_guitarpro_score(path: Path) -> LoadedDigitalScore:
             if prev_ks != fifths:
                 m21_measure.insert(0, music21.key.KeySignature(fifths))
                 prev_ks = fifths
+
+            if getattr(header, "isRepeatOpen", False):
+                m21_measure.leftBarline = music21.bar.Repeat(direction="start")
+            repeat_close = int(getattr(header, "repeatClose", -1) or -1)
+            if repeat_close >= 0:
+                rep = music21.bar.Repeat(direction="end")
+                if repeat_close > 0:
+                    rep.times = repeat_close
+                m21_measure.rightBarline = rep
 
             if m_idx == 0 and t_idx == 0 and song.tempo:
                 m21_measure.insert(0, music21.tempo.MetronomeMark(number=float(song.tempo)))
@@ -314,6 +355,9 @@ def _load_guitarpro_score(path: Path) -> LoadedDigitalScore:
                 )
                 offset_ql = Fraction(0, 1)
                 prev_el = prev_el_by_voice.get(v_idx)
+                pend_hop, pend_slide, prev_pm = prev_pending_by_voice.get(
+                    v_idx, (False, False, False)
+                )
 
                 for beat in gp_voice.beats:
                     ql = Fraction(beat.duration.time) / Fraction(quarter_ticks)
@@ -330,60 +374,88 @@ def _load_guitarpro_score(path: Path) -> LoadedDigitalScore:
                     if beat.status == gm.BeatStatus.rest or not playable_notes:
                         target_stream.insert(offset_ql, music21.note.Rest(duration=dur_obj))
                         prev_el = None
+                        pend_hop = pend_slide = prev_pm = False
                         offset_ql += ql
                         continue
 
-                    pitches: list[int] = []
-                    note_tab: list[tuple[int, int]] = []
+                    note_specs: list[tuple[int, int | None, int | None]] = []
                     is_tie = all(n.type == gm.NoteType.tie for n in playable_notes)
+                    next_hop = False
+                    next_slide = False
+                    bend_semis = 0.0
+                    harmonic = False
+                    palm_mute = False
+
                     for gp_note in playable_notes:
                         try:
                             sounding_midi = int(gp_note.realValue) + capo_offset
                         except IndexError:
                             sounding_midi = int(gp_note.value) + capo_offset
-                        if 0 <= sounding_midi <= 127:
-                            pitches.append(sounding_midi)
-                            if is_guitar_prog and 1 <= gp_note.string <= 6 and 0 <= gp_note.value <= 24:
-                                note_tab.append((int(gp_note.string), int(gp_note.value)))
+                        if not (0 <= sounding_midi <= 127):
+                            continue
+                        s_num = (
+                            int(gp_note.string)
+                            if (is_guitar_prog and 1 <= gp_note.string <= n_strings and 0 <= gp_note.value <= 24)
+                            else None
+                        )
+                        fret_num = int(gp_note.value) if s_num is not None else None
+                        note_specs.append((sounding_midi, s_num, fret_num))
 
-                    if not pitches:
+                        eff = getattr(gp_note, "effect", None)
+                        if eff is not None:
+                            if getattr(eff, "hammer", False):
+                                next_hop = True
+                            if any(sl in slide_out_types for sl in (getattr(eff, "slides", None) or ())):
+                                next_slide = True
+                            if getattr(eff, "isHarmonic", False):
+                                harmonic = True
+                            if getattr(eff, "palmMute", False):
+                                palm_mute = True
+                            bend_semis = max(bend_semis, _gp_bend_semitones(eff))
+
+                    if not note_specs:
                         target_stream.insert(offset_ql, music21.note.Rest(duration=dur_obj))
                         prev_el = None
+                        pend_hop = pend_slide = prev_pm = False
                     else:
-                        # Deduplicate unison pitches while preserving order
-                        seen_p: set[int] = set()
-                        dedup_pitches: list[int] = []
-                        dedup_tab: list[tuple[int, int]] = []
-                        for idx_p, p_val in enumerate(pitches):
-                            if p_val not in seen_p:
-                                seen_p.add(p_val)
-                                dedup_pitches.append(p_val)
-                                if idx_p < len(note_tab):
-                                    dedup_tab.append(note_tab[idx_p])
-
-                        if len(dedup_pitches) == 1:
-                            el: music21.note.Note | music21.chord.Chord = music21.note.Note(
-                                dedup_pitches[0], duration=dur_obj
-                            )
-                        else:
-                            el = music21.chord.Chord(dedup_pitches, duration=dur_obj)
-
-                        if len(dedup_tab) == len(dedup_pitches):
-                            for s_num, fret in dedup_tab:
-                                el.articulations.append(music21.articulations.StringIndication(s_num))
-                                el.articulations.append(music21.articulations.FretIndication(fret))
-
+                        el = build_fretted_element(note_specs, dur_obj)
                         if is_tie and prev_el is not None:
-                            _mark_gp_tie(prev_el, el)
+                            mark_tie(prev_el, el)
 
+                        hammer_now = False
+                        pull_now = False
+                        if pend_hop and prev_el is not None:
+                            if max(element_midis(el)) >= max(element_midis(prev_el)):
+                                hammer_now = True
+                            else:
+                                pull_now = True
+
+                        attach_guitar_techniques(
+                            part,
+                            target_stream,
+                            prev_el,
+                            el,
+                            offset_ql,
+                            hammer_from_prev=hammer_now,
+                            pull_from_prev=pull_now,
+                            slide_from_prev=pend_slide,
+                            bend_semitones=bend_semis,
+                            harmonic=harmonic,
+                            palm_mute=palm_mute,
+                            prev_palm_mute=prev_pm,
+                        )
                         target_stream.insert(offset_ql, el)
                         prev_el = el
+                        pend_hop = next_hop
+                        pend_slide = next_slide
+                        prev_pm = palm_mute
                     offset_ql += ql
 
                 if offset_ql < bar_ql:
                     target_stream.insert(offset_ql, music21.note.Rest(quarterLength=bar_ql - offset_ql))
 
                 prev_el_by_voice[v_idx] = prev_el
+                prev_pending_by_voice[v_idx] = (pend_hop, pend_slide, prev_pm)
                 if multi_voice:
                     m21_measure.insert(0, target_stream)
 
@@ -415,12 +487,34 @@ def load_digital_score(
             f"Expected a digital score file, got PDF ({src.name}). "
             "Use the PDF fallback command (`transcribe-music pdf`) or unified `convert`."
         )
-    if suffix not in DIGITAL_EXTENSIONS:
+    if suffix not in (DIGITAL_EXTENSIONS | _LOCAL_ASCII_TAB_EXTENSIONS):
         supported = ", ".join(sorted(DIGITAL_EXTENSIONS))
         raise ValueError(f"Unsupported digital score format {suffix!r}. Supported: {supported}")
 
+    if suffix in _LOCAL_ASCII_TAB_EXTENSIONS:
+        score, warnings = parse_ascii_tab_file(src)
+        return LoadedDigitalScore(
+            score=score,
+            backend="ascii_tab",
+            format_name=suffix.lstrip("."),
+            is_sounding_pitch_source=True,
+            warnings=warnings,
+        )
+
     if suffix in GUITARPRO_EXTENSIONS:
         return _load_guitarpro_score(src)
+
+    if suffix == ".gp":
+        gpif_res = parse_gpif_file(src)
+        if gpif_res is not None:
+            score, warnings = gpif_res
+            return LoadedDigitalScore(
+                score=score,
+                backend="gpif",
+                format_name="gp",
+                is_sounding_pitch_source=True,
+                warnings=warnings,
+            )
 
     if suffix in (MUSESCORE_EXTENSIONS | MUSESCORE_GP_EXTENSIONS):
         return _load_musescore_file(src)
@@ -467,6 +561,9 @@ def summarize_score_parts(score: music21.stream.Score) -> list[PartInfo]:
             or f"Part {idx}"
         )
         clef_name = type(clef).__name__ if clef is not None else None
+        meta = get_guitar_track_meta(part)
+        tuning = format_tuning_label(meta.open_string_midi) if meta is not None else None
+        capo = meta.capo_fret if meta is not None and meta.capo_fret > 0 else None
 
         infos.append(
             PartInfo(
@@ -480,6 +577,8 @@ def summarize_score_parts(score: music21.stream.Score) -> list[PartInfo]:
                 note_count=len(pitches),
                 pitch_min=min(pitches) if pitches else None,
                 pitch_max=max(pitches) if pitches else None,
+                tuning=tuning,
+                capo=capo,
             )
         )
     return infos

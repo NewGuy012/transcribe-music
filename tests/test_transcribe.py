@@ -10,7 +10,13 @@ from types import SimpleNamespace
 
 import music21
 import pytest
-from conftest import make_concerto_score, write_gp5_file, write_pdf_file
+from conftest import (
+    make_concerto_score,
+    write_ascii_tab_file,
+    write_gp5_file,
+    write_gpif_file,
+    write_pdf_file,
+)
 
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.ingest.digital import inspect_digital_score, load_digital_score
@@ -269,3 +275,87 @@ def test_pdf_omr_homr_and_audiveris_backends(
         isinstance(c, music21.clef.TenorClef)
         for c in aud_score.parts[0].recurse().getElementsByClass(music21.clef.Clef)
     )
+
+
+def test_gp5_chord_tab_alignment_techniques_gpif_and_ascii_tab(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 1. GP5 chord (listed high string 1 -> low string 5) must sort ascending to match Chord.notes
+    gp5_chord_path = write_gp5_file(
+        tmp_path / "chord_order.gp5",
+        chord_beats=(((1, 0), (2, 1), (3, 0), (4, 2), (5, 3)), ((6, 0),), ((6, 2),), ((6, 3),)),
+        tuning=(64, 59, 55, 50, 45, 38),
+        capo=2,
+        with_effects=True,
+    )
+    insp_gp5 = inspect_digital_score(gp5_chord_path)
+    assert insp_gp5.parts[0].tuning == "D2-A2-D3-G3-B3-E4"
+    assert insp_gp5.parts[0].capo == 2
+
+    loaded_gp5 = load_digital_score(gp5_chord_path)
+    first_chord = next(loaded_gp5.score.parts[0].recurse().getElementsByClass(music21.chord.Chord))
+    chord_strings = [
+        a.number
+        for a in first_chord.articulations
+        if isinstance(a, music21.articulations.StringIndication)
+    ]
+    chord_frets = [
+        a.number
+        for a in first_chord.articulations
+        if isinstance(a, music21.articulations.FretIndication)
+    ]
+    assert chord_strings == [5, 4, 3, 2, 1]
+    assert chord_frets == [3, 2, 0, 1, 0]
+
+    gp5_xml = tmp_path / "gp5_effects.musicxml"
+    export_musicxml(loaded_gp5.score, gp5_xml, Instrument.GUITAR)
+    xml_txt = gp5_xml.read_text(encoding="utf-8")
+    assert "<pull-off" in xml_txt
+    assert "<glissando" in xml_txt
+    assert "<bend-alter>2</bend-alter>" in xml_txt
+    assert "<harmonic" in xml_txt
+    assert "P.M." in xml_txt
+    assert "<repeat" in xml_txt
+
+    # 2. Native stdlib .gp (GP7/8 GPIF XML) loads without MuseScore CLI
+    monkeypatch.setattr("transcribe_music.ingest.digital._find_musescore_executable", lambda: None)
+    gp_path = write_gpif_file(tmp_path / "modern.gp")
+    loaded_gp = load_digital_score(gp_path)
+    assert loaded_gp.backend == "gpif"
+    assert loaded_gp.format_name == "gp"
+    assert loaded_gp.is_sounding_pitch_source is True
+    assert len(loaded_gp.score.parts) == 1
+    assert any("Skipped 1 percussion track" in w for w in loaded_gp.warnings)
+
+    gp_insp = inspect_digital_score(gp_path)
+    assert gp_insp.parts[0].tuning == "D2-A2-D3-G3-B3-E4"
+    assert gp_insp.parts[0].capo == 2
+    gp_xml = tmp_path / "gpif_out.musicxml"
+    export_musicxml(loaded_gp.score, gp_xml, Instrument.GUITAR)
+    gp_txt = gp_xml.read_text(encoding="utf-8")
+    assert "<hammer-on" in gp_txt and "<bend-alter>2</bend-alter>" in gp_txt
+
+    # Non-GPIF .gp archive falls back to MuseScore error when MuseScore is missing
+    bad_gp = tmp_path / "legacy_container.gp"
+    bad_gp.write_bytes(b"not a zip")
+    with pytest.raises(RuntimeError, match="MuseScore"):
+        load_digital_score(bad_gp)
+
+    # 3. ASCII .tab / .txt parsing & validation
+    tab_path = write_ascii_tab_file(tmp_path / "riff.tab")
+    loaded_tab = load_digital_score(tab_path)
+    assert loaded_tab.backend == "ascii_tab"
+    assert loaded_tab.score.metadata.title == "Riff Study"
+    assert loaded_tab.score.metadata.composer == "Tab Author"
+    tab_xml = tmp_path / "tab_out.musicxml"
+    tab_metrics, tab_warns = export_musicxml(loaded_tab.score, tab_xml, Instrument.GUITAR)
+    assert not tab_warns
+    assert tab_metrics.measure_count == 1
+    assert tab_metrics.note_count == 10  # 5-note C shape + 5 melody notes (3,5,7,5,12)
+    tab_txt = tab_xml.read_text(encoding="utf-8")
+    assert "<hammer-on" in tab_txt and "<glissando" in tab_txt and "<bend-alter>2</bend-alter>" in tab_txt
+
+    not_tab = tmp_path / "readme.txt"
+    not_tab.write_text("Just some lyrics or notes without tab lines.\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="No valid ASCII guitar tab"):
+        load_digital_score(not_tab)
