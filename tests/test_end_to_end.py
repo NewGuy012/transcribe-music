@@ -143,7 +143,7 @@ def test_cli_convert_inspect_and_cache_commands(tmp_path: Path) -> None:
     )
     assert nc_res.exit_code == 0, nc_res.output
     assert nocache_out.exists()
-    assert not (cache_dir / "catalog.duckdb").exists()
+    assert not (cache_dir / "catalog.sqlite").exists()
 
     conv_out = tmp_path / "cli_conv.musicxml"
     conv_res = runner.invoke(

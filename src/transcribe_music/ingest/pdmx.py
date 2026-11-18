@@ -1,15 +1,15 @@
-"""Optional local PDMX (Public Domain MusicXML, Zenodo 15571083) DuckDB catalog & archive extractor."""
+"""Optional local PDMX (Public Domain MusicXML, Zenodo 15571083) SQLite catalog & archive extractor."""
 
 from __future__ import annotations
 
+import csv
 import logging
 import shutil
+import sqlite3
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import duckdb
 
 from transcribe_music.ingest._io import (
     download_https_stream,
@@ -20,6 +20,7 @@ from transcribe_music.ingest._io import (
     save_catalog_dir,
 )
 from transcribe_music.models import Instrument
+from transcribe_music.storage import open_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -51,17 +52,17 @@ def _pdmx_archive_available(pdmx_dir: Path, kind: str) -> bool:
 
 
 def get_pdmx_status(cache_dir: Path = Path(".transcribe_cache")) -> PdmxStatus:
-    """Inspect local PDMX CSV, DuckDB index, and MXL/MIDI archive availability."""
+    """Inspect local PDMX CSV, SQLite index, and MXL/MIDI archive availability."""
     pdmx_dir = resolve_pdmx_dir(cache_dir)
     csv_path = pdmx_dir / "PDMX.csv"
-    db_path = pdmx_dir / "pdmx.duckdb"
+    db_path = pdmx_dir / "pdmx.sqlite"
     count = 0
     if db_path.exists():
         try:
-            with duckdb.connect(str(db_path), read_only=True) as con:
+            with open_sqlite(db_path, read_only=True) as con:
                 row = con.execute("SELECT COUNT(*) FROM pdmx_scores").fetchone()
                 count = int(row[0]) if row else 0
-        except duckdb.Error:
+        except sqlite3.Error:
             count = 0
     return PdmxStatus(
         pdmx_dir=pdmx_dir,
@@ -73,95 +74,138 @@ def get_pdmx_status(cache_dir: Path = Path(".transcribe_cache")) -> PdmxStatus:
     )
 
 
-def build_pdmx_duckdb(
+def _csv_str(row: dict[str, str | None], key: str) -> str | None:
+    raw = (row.get(key) or "").strip()
+    return None if not raw or raw == "NA" else raw
+
+
+def _csv_int(row: dict[str, str | None], key: str) -> int | None:
+    raw = _csv_str(row, key)
+    if raw is None:
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
+def _csv_float(row: dict[str, str | None], key: str) -> float | None:
+    raw = _csv_str(row, key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def build_pdmx_sqlite(
     csv_path: Path,
     db_path: Path,
     *,
     include_license_conflicts: bool = False,
 ) -> int:
-    """Ingest `PDMX.csv` into an indexed DuckDB database for fast offline search."""
+    """Ingest `PDMX.csv` into an indexed SQLite database for fast offline search."""
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"PDMX.csv not found at {csv_path}")
 
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_db = db_path.with_suffix(".duckdb.tmp")
+    tmp_db = db_path.with_suffix(".sqlite.tmp")
     tmp_db.unlink(missing_ok=True)
 
-    conflict_filter = (
-        ""
-        if include_license_conflicts
-        else 'AND TRY_CAST("subset:no_license_conflict" AS BOOLEAN) IS TRUE'
-    )
-
-    with duckdb.connect(str(tmp_db)) as con:
-        col_rows = con.execute(
-            """
-            DESCRIBE
-            SELECT * FROM read_csv(
-                ?,
-                header = TRUE,
-                nullstr = ['NA', ''],
-                ignore_errors = TRUE
+    count = 0
+    csv.field_size_limit(max(csv.field_size_limit(), 1024 * 1024))
+    try:
+        with open_sqlite(tmp_db) as con:
+            con.execute("PRAGMA journal_mode=OFF")
+            con.execute("PRAGMA synchronous=OFF")
+            con.execute(
+                """
+                CREATE TABLE pdmx_scores (
+                    mxl_rel TEXT,
+                    mid_rel TEXT,
+                    title TEXT NOT NULL,
+                    composer TEXT,
+                    genres TEXT,
+                    tracks TEXT,
+                    tags TEXT,
+                    n_tracks INTEGER,
+                    rating REAL,
+                    n_ratings INTEGER,
+                    is_best_unique INTEGER NOT NULL,
+                    search_text TEXT NOT NULL
+                )
+                """
             )
-            """,
-            [str(csv_path)],
-        ).fetchall()
-        available_cols = {str(r[0]) for r in col_rows}
-        tracks_expr = "NULLIF(TRIM(tracks), '')" if "tracks" in available_cols else "NULL::VARCHAR"
-        tags_expr = "NULLIF(TRIM(tags), '')" if "tags" in available_cols else "NULL::VARCHAR"
-        tracks_search = "COALESCE(tracks, '')" if "tracks" in available_cols else "''"
-        tags_search = "COALESCE(tags, '')" if "tags" in available_cols else "''"
+            insert_sql = """
+                INSERT INTO pdmx_scores (
+                    mxl_rel, mid_rel, title, composer, genres, tracks, tags,
+                    n_tracks, rating, n_ratings, is_best_unique, search_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            batch: list[tuple[Any, ...]] = []
+            with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    mxl_rel = _csv_str(row, "mxl")
+                    mid_rel = _csv_str(row, "mid")
+                    if mxl_rel is None and mid_rel is None:
+                        continue
+                    no_conflict = (_csv_str(row, "subset:no_license_conflict") or "").lower() in {
+                        "true",
+                        "1",
+                    }
+                    if not include_license_conflicts and not no_conflict:
+                        continue
 
-        con.execute(
-            f"""
-            CREATE TABLE pdmx_scores AS
-            SELECT
-                NULLIF(TRIM(mxl), '') AS mxl_rel,
-                NULLIF(TRIM(mid), '') AS mid_rel,
-                NULLIF(TRIM(pdf), '') AS pdf_rel,
-                COALESCE(NULLIF(TRIM(title), ''), NULLIF(TRIM(song_name), ''), 'Untitled') AS title,
-                NULLIF(TRIM(song_name), '') AS song_name,
-                COALESCE(NULLIF(TRIM(composer_name), ''), NULLIF(TRIM(artist_name), '')) AS composer,
-                NULLIF(TRIM(genres), '') AS genres,
-                {tracks_expr} AS tracks,
-                {tags_expr} AS tags,
-                TRY_CAST(n_tracks AS INTEGER) AS n_tracks,
-                TRY_CAST(complexity AS DOUBLE) AS complexity,
-                TRY_CAST(rating AS DOUBLE) AS rating,
-                TRY_CAST(n_ratings AS INTEGER) AS n_ratings,
-                COALESCE(TRY_CAST(is_best_unique_arrangement AS BOOLEAN), FALSE) AS is_best_unique,
-                COALESCE(TRY_CAST("subset:no_license_conflict" AS BOOLEAN), FALSE) AS no_license_conflict,
-                LOWER(
-                    STRIP_ACCENTS(
-                        CONCAT_WS(
-                            ' ',
-                            COALESCE(title, ''),
-                            COALESCE(song_name, ''),
-                            COALESCE(composer_name, ''),
-                            COALESCE(artist_name, ''),
-                            COALESCE(genres, ''),
-                            {tracks_search},
-                            {tags_search}
+                    title = _csv_str(row, "title") or _csv_str(row, "song_name") or "Untitled"
+                    composer = _csv_str(row, "composer_name") or _csv_str(row, "artist_name")
+                    genres = _csv_str(row, "genres")
+                    tracks = _csv_str(row, "tracks")
+                    tags = _csv_str(row, "tags")
+                    is_best = int(
+                        (_csv_str(row, "is_best_unique_arrangement") or "").lower() in {"true", "1"}
+                    )
+                    search_parts = [
+                        _csv_str(row, k)
+                        for k in (
+                            "title",
+                            "song_name",
+                            "composer_name",
+                            "artist_name",
+                            "genres",
+                            "tracks",
+                            "tags",
+                        )
+                    ]
+                    search_text = normalize_ascii(" ".join(p for p in search_parts if p))
+                    batch.append(
+                        (
+                            mxl_rel,
+                            mid_rel,
+                            title,
+                            composer,
+                            genres,
+                            tracks,
+                            tags,
+                            _csv_int(row, "n_tracks"),
+                            _csv_float(row, "rating"),
+                            _csv_int(row, "n_ratings"),
+                            is_best,
+                            search_text,
                         )
                     )
-                ) AS search_text
-            FROM read_csv(
-                ?,
-                header = TRUE,
-                nullstr = ['NA', ''],
-                ignore_errors = TRUE
-            )
-            WHERE (mxl IS NOT NULL OR mid IS NOT NULL)
-            {conflict_filter}
-            """,
-            [str(csv_path)],
-        )
-        row = con.execute("SELECT COUNT(*) FROM pdmx_scores").fetchone()
-        count = int(row[0]) if row else 0
-
-    tmp_db.replace(db_path)
+                    if len(batch) >= 5000:
+                        con.executemany(insert_sql, batch)
+                        count += len(batch)
+                        batch.clear()
+                if batch:
+                    con.executemany(insert_sql, batch)
+                    count += len(batch)
+        tmp_db.replace(db_path)
+    finally:
+        tmp_db.unlink(missing_ok=True)
     return count
 
 
@@ -181,7 +225,7 @@ def sync_pdmx(
     include_license_conflicts: bool = False,
     force: bool = False,
 ) -> PdmxStatus:
-    """Download/register PDMX metadata & optional score archives and build `pdmx.duckdb`."""
+    """Download/register PDMX metadata & optional score archives and build `pdmx.sqlite`."""
     target_dir = Path(pdmx_dir) if pdmx_dir is not None else (Path(cache_dir) / "pdmx")
     target_dir.mkdir(parents=True, exist_ok=True)
     if pdmx_dir is not None:
@@ -207,10 +251,9 @@ def sync_pdmx(
         if extract_archives and tar_path.exists():
             _extract_full_archive(tar_path, target_dir)
 
-    db_path = target_dir / "pdmx.duckdb"
-    build_pdmx_duckdb(
+    build_pdmx_sqlite(
         csv_path,
-        db_path,
+        target_dir / "pdmx.sqlite",
         include_license_conflicts=include_license_conflicts,
     )
     return get_pdmx_status(cache_dir)
@@ -224,9 +267,9 @@ def search_pdmx_catalog(
     instrument: Instrument | None = None,
     limit: int = 30,
 ) -> list[dict[str, Any]]:
-    """Query the local DuckDB PDMX catalog if synced; returns `[]` immediately otherwise."""
+    """Query the local SQLite PDMX catalog if synced; returns `[]` immediately otherwise."""
     pdmx_dir = resolve_pdmx_dir(cache_dir)
-    db_path = pdmx_dir / "pdmx.duckdb"
+    db_path = pdmx_dir / "pdmx.sqlite"
     if not db_path.exists():
         return []
 
@@ -242,21 +285,22 @@ def search_pdmx_catalog(
     mxl_ready = _pdmx_archive_available(pdmx_dir, "mxl")
     mid_ready = _pdmx_archive_available(pdmx_dir, "mid")
 
-    where_clauses = ["search_text LIKE '%' || ? || '%'"] * len(tokens)
+    where_clauses = ["INSTR(search_text, ?) > 0"] * len(tokens)
     inst_term = instrument.value if instrument is not None else None
     try:
-        with duckdb.connect(str(db_path), read_only=True) as con:
+        with open_sqlite(db_path, read_only=True) as con:
             cols = {str(r[1]) for r in con.execute("PRAGMA table_info('pdmx_scores')").fetchall()}
-            tracks_sel = "tracks" if "tracks" in cols else "NULL::VARCHAR AS tracks"
-            tags_sel = "tags" if "tags" in cols else "NULL::VARCHAR AS tags"
+            tracks_sel = "tracks" if "tracks" in cols else "NULL AS tracks"
+            tags_sel = "tags" if "tags" in cols else "NULL AS tags"
             inst_order = ""
             params: list[Any] = [*tokens]
             if inst_term is not None:
-                if "tracks" in cols or "tags" in cols:
-                    t_expr = "LOWER(COALESCE(tracks, '') || ' ' || COALESCE(tags, '') || ' ' || search_text)"
-                else:
-                    t_expr = "search_text"
-                inst_order = f"CASE WHEN {t_expr} LIKE '%' || ? || '%' THEN 1 ELSE 0 END DESC,"
+                t_expr = (
+                    "LOWER(COALESCE(tracks, '') || ' ' || COALESCE(tags, '') || ' ' || search_text)"
+                    if ("tracks" in cols or "tags" in cols)
+                    else "search_text"
+                )
+                inst_order = f"CASE WHEN INSTR({t_expr}, ?) > 0 THEN 1 ELSE 0 END DESC,"
                 params.append(inst_term)
             params.append(limit)
             sql = f"""
@@ -281,8 +325,8 @@ def search_pdmx_catalog(
                 LIMIT ?
             """
             rows = con.execute(sql, params).fetchall()
-    except duckdb.Error as exc:
-        logger.debug("PDMX DuckDB query failed: %s", exc)
+    except sqlite3.Error as exc:
+        logger.debug("PDMX SQLite query failed: %s", exc)
         return []
 
     inst_keywords = (

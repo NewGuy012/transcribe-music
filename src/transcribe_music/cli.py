@@ -33,7 +33,7 @@ app = typer.Typer(
     help="Convert digital symbolic scores (primary) or sheet music PDFs (fallback) into enriched MusicXML.",
     no_args_is_help=True,
 )
-cache_app = typer.Typer(help="Inspect or manage the DuckDB conversion cache.")
+cache_app = typer.Typer(help="Inspect or manage the SQLite conversion cache.")
 pdmx_app = typer.Typer(help="Manage the optional local PDMX (254k+ public domain MusicXML) catalog.")
 dadagp_app = typer.Typer(help="Manage the optional local DadaGP / Guitar Pro catalog.")
 app.add_typer(cache_app, name="cache")
@@ -72,7 +72,7 @@ GuitarStaffOpt = Annotated[
         help="Guitar MusicXML staff layout: notation (Treble 8vb), tab (6-line TAB), or both.",
     ),
 ]
-CacheOpt = Annotated[bool, typer.Option("--cache/--no-cache", help="Use DuckDB cache.")]
+CacheOpt = Annotated[bool, typer.Option("--cache/--no-cache", help="Use SQLite cache.")]
 CacheDirOpt = Annotated[Path, typer.Option("--cache-dir", help="Cache directory.")]
 OmrBackendOpt = Annotated[
     OmrBackend,
@@ -332,13 +332,13 @@ def cache_list(
     limit: Annotated[int, typer.Option("--limit", "-n", help="Max jobs to show.")] = 20,
     cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
-    """List cached MusicXML jobs stored in DuckDB."""
+    """List cached MusicXML jobs stored in SQLite."""
     store = CatalogStore(cache_dir)
     rows = store.list_recent_jobs(limit=limit)
     if not rows:
-        console.print("No cached jobs in DuckDB.")
+        console.print("No cached jobs in SQLite.")
         return
-    table = Table(title="DuckDB MusicXML Catalog")
+    table = Table(title="SQLite MusicXML Catalog")
     for col in (
         "job_hash",
         "source_type",
@@ -370,7 +370,7 @@ def cache_list(
 
 @cache_app.command("clear")
 def cache_clear(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
-    """Clear cached entries in DuckDB."""
+    """Clear cached entries in SQLite."""
     store = CatalogStore(cache_dir)
     removed = store.clear_cache()
     console.print(f"Cleared {removed} job records from {store.db_path}")
@@ -382,7 +382,7 @@ def _print_pdmx_status(status: PdmxStatus) -> None:
     table.add_column("Value")
     table.add_row("PDMX Directory", str(status.pdmx_dir))
     table.add_row("PDMX.csv Present", "Yes" if status.csv_exists else "No")
-    table.add_row("DuckDB Index", "Yes" if status.db_exists else "No")
+    table.add_row("SQLite Index", "Yes" if status.db_exists else "No")
     table.add_row("Indexed Scores", f"{status.score_count:,}")
     table.add_row("MXL Archive/Dir", "Available" if status.mxl_available else "Not synced (--with-mxl)")
     table.add_row("MID Archive/Dir", "Available" if status.mid_available else "Not synced (--with-mid)")
@@ -427,7 +427,7 @@ def pdmx_sync(
     ] = False,
     cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
-    """Sync PDMX metadata (Zenodo 15571083) into DuckDB and optionally fetch score archives."""
+    """Sync PDMX metadata (Zenodo 15571083) into SQLite and optionally fetch score archives."""
     status = sync_pdmx(
         cache_dir=cache_dir,
         pdmx_dir=pdmx_dir,
@@ -446,7 +446,7 @@ def _print_gp_status(status: GpCatalogStatus) -> None:
     table.add_column("Field", no_wrap=True)
     table.add_column("Value")
     table.add_row("Catalog Directory", str(status.gp_dir))
-    table.add_row("DuckDB Index", "Yes" if status.db_exists else "No")
+    table.add_row("SQLite Index", "Yes" if status.db_exists else "No")
     table.add_row("Indexed Scores", f"{status.score_count:,}")
     table.add_row("Files / Archives", "Available" if status.archive_available else "Empty")
     console.print(table)
@@ -478,7 +478,7 @@ def dadagp_sync(
     ] = False,
     cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
-    """Index local Guitar Pro / DadaGP files or download from Zenodo into DuckDB."""
+    """Index local Guitar Pro / DadaGP files or download from Zenodo into SQLite."""
     status = sync_gp_catalog(
         cache_dir=cache_dir,
         gp_dir=gp_dir,

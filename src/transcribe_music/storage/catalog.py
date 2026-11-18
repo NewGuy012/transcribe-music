@@ -1,15 +1,14 @@
-"""Embedded DuckDB catalog for content-addressed score job caching."""
+"""Embedded SQLite catalog for content-addressed score job caching."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import shutil
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
-import duckdb
 
 from transcribe_music.models import (
     Instrument,
@@ -17,24 +16,25 @@ from transcribe_music.models import (
     TranscriptionConfig,
     TranscriptionResult,
 )
+from transcribe_music.storage import open_sqlite
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS jobs (
-    job_hash VARCHAR PRIMARY KEY,
-    source_type VARCHAR NOT NULL,
-    source_ref VARCHAR NOT NULL,
-    instrument VARCHAR NOT NULL,
-    config_json VARCHAR NOT NULL,
-    musicxml_path VARCHAR NOT NULL,
+    job_hash TEXT PRIMARY KEY,
+    source_type TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    musicxml_path TEXT NOT NULL,
     measure_count INTEGER NOT NULL,
     note_count INTEGER NOT NULL,
     chord_count INTEGER NOT NULL,
     fingering_count INTEGER NOT NULL,
-    backend VARCHAR,
-    selected_part VARCHAR,
-    elapsed_sec DOUBLE NOT NULL,
-    warnings_json VARCHAR NOT NULL,
-    created_at TIMESTAMP NOT NULL
+    backend TEXT,
+    selected_part TEXT,
+    elapsed_sec REAL NOT NULL,
+    warnings_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -75,15 +75,12 @@ def compute_job_hash(
 
 
 class CatalogStore:
-    """Single-file DuckDB catalog for caching MusicXML enrichment jobs."""
+    """Single-file SQLite catalog for caching MusicXML enrichment jobs."""
 
     def __init__(self, cache_dir: Path = Path(".transcribe_cache")) -> None:
         self.cache_dir = Path(cache_dir)
         self.artifacts_dir = self.cache_dir / "artifacts"
-        self.db_path = self.cache_dir / "catalog.duckdb"
-
-    def _connect(self, *, read_only: bool = False) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self.db_path), read_only=read_only)
+        self.db_path = self.cache_dir / "catalog.sqlite"
 
     def artifact_dir(self, job_hash: str) -> Path:
         path = self.artifacts_dir / job_hash
@@ -94,7 +91,7 @@ class CatalogStore:
         if not self.db_path.exists():
             return None
         try:
-            with self._connect(read_only=True) as con:
+            with open_sqlite(self.db_path, read_only=True) as con:
                 row = con.execute(
                     """
                     SELECT job_hash, source_type, source_ref, instrument, musicxml_path,
@@ -105,14 +102,19 @@ class CatalogStore:
                     """,
                     [job_hash],
                 ).fetchone()
-        except duckdb.Error:
+        except sqlite3.Error:
             return None
 
         if row is None:
             return None
 
         musicxml_path = Path(row[4])
-        if not musicxml_path.exists():
+        artifacts_root = self.artifacts_dir.resolve()
+        try:
+            resolved_out = musicxml_path.resolve()
+        except OSError:
+            return None
+        if not resolved_out.is_relative_to(artifacts_root) or not resolved_out.is_file():
             return None
 
         return TranscriptionResult(
@@ -138,8 +140,8 @@ class CatalogStore:
         config: TranscriptionConfig,
     ) -> None:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        now = datetime.now(UTC).replace(tzinfo=None)
-        with self._connect() as con:
+        now = datetime.now(UTC).replace(tzinfo=None).isoformat(timespec="seconds")
+        with open_sqlite(self.db_path, wal=True) as con:
             con.execute(_SCHEMA_SQL)
             con.execute(
                 """
@@ -172,7 +174,7 @@ class CatalogStore:
         if not self.db_path.exists():
             return []
         try:
-            with self._connect(read_only=True) as con:
+            with open_sqlite(self.db_path, read_only=True) as con:
                 rows = con.execute(
                     """
                     SELECT job_hash, source_type, source_ref, instrument,
@@ -184,7 +186,7 @@ class CatalogStore:
                     """,
                     [limit],
                 ).fetchall()
-        except duckdb.Error:
+        except sqlite3.Error:
             return []
         cols = [
             "job_hash",
@@ -207,11 +209,11 @@ class CatalogStore:
         count = 0
         if self.db_path.exists():
             try:
-                with self._connect() as con:
+                with open_sqlite(self.db_path) as con:
                     count_row = con.execute("SELECT COUNT(*) FROM jobs").fetchone()
                     count = int(count_row[0]) if count_row else 0
                     con.execute("DELETE FROM jobs")
-            except duckdb.Error:
+            except sqlite3.Error:
                 pass
         if self.artifacts_dir.exists():
             shutil.rmtree(self.artifacts_dir, ignore_errors=True)

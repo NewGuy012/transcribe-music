@@ -1,4 +1,4 @@
-"""Optional local/Zenodo DadaGP & Guitar Pro DuckDB catalog and archive extractor."""
+"""Optional local/Zenodo DadaGP & Guitar Pro SQLite catalog and archive extractor."""
 
 from __future__ import annotations
 
@@ -6,14 +6,13 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import tarfile
 import urllib.error
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-import duckdb
 
 from transcribe_music.ingest._io import (
     download_https_stream,
@@ -26,6 +25,7 @@ from transcribe_music.ingest._io import (
     safe_resolve_member_path,
     save_catalog_dir,
 )
+from transcribe_music.storage import open_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +67,16 @@ def _has_gp_sources(gp_dir: Path) -> bool:
 
 
 def get_gp_catalog_status(cache_dir: Path = Path(".transcribe_cache")) -> GpCatalogStatus:
-    """Inspect local Guitar Pro / DadaGP DuckDB index and archive availability."""
+    """Inspect local Guitar Pro / DadaGP SQLite index and archive availability."""
     gp_dir = resolve_gp_catalog_dir(cache_dir)
-    db_path = gp_dir / "gp_catalog.duckdb"
+    db_path = gp_dir / "gp_catalog.sqlite"
     count = 0
     if db_path.exists():
         try:
-            with duckdb.connect(str(db_path), read_only=True) as con:
+            with open_sqlite(db_path, read_only=True) as con:
                 row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
                 count = int(row[0]) if row else 0
-        except duckdb.Error:
+        except sqlite3.Error:
             count = 0
     return GpCatalogStatus(
         gp_dir=gp_dir,
@@ -229,8 +229,8 @@ def _download_zenodo_record_archives(
         )
 
 
-def build_gp_catalog_duckdb(gp_dir: Path, db_path: Path) -> int:
-    """Scan `gp_dir` and build an indexed `gp_catalog.duckdb` database."""
+def build_gp_catalog_sqlite(gp_dir: Path, db_path: Path) -> int:
+    """Scan `gp_dir` and build an indexed `gp_catalog.sqlite` database."""
     gp_dir = Path(gp_dir)
     if not gp_dir.exists():
         raise FileNotFoundError(f"Guitar Pro catalog directory not found: {gp_dir}")
@@ -238,31 +238,35 @@ def build_gp_catalog_duckdb(gp_dir: Path, db_path: Path) -> int:
     entries = _collect_gp_entries(gp_dir)
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_db = db_path.with_suffix(".duckdb.tmp")
+    tmp_db = db_path.with_suffix(".sqlite.tmp")
     tmp_db.unlink(missing_ok=True)
 
-    with duckdb.connect(str(tmp_db)) as con:
-        con.execute(
-            """
-            CREATE TABLE gp_scores (
-                member_ref VARCHAR PRIMARY KEY,
-                format_ext VARCHAR NOT NULL,
-                artist VARCHAR,
-                genre VARCHAR,
-                title VARCHAR NOT NULL,
-                search_text VARCHAR NOT NULL
+    try:
+        with open_sqlite(tmp_db) as con:
+            con.execute("PRAGMA journal_mode=OFF")
+            con.execute("PRAGMA synchronous=OFF")
+            con.execute(
+                """
+                CREATE TABLE gp_scores (
+                    member_ref TEXT PRIMARY KEY,
+                    format_ext TEXT NOT NULL,
+                    artist TEXT,
+                    genre TEXT,
+                    title TEXT NOT NULL,
+                    search_text TEXT NOT NULL
+                )
+                """
             )
-            """
-        )
-        if entries:
-            con.executemany(
-                "INSERT INTO gp_scores (member_ref, format_ext, artist, genre, title, search_text) VALUES (?, ?, ?, ?, ?, ?)",
-                entries,
-            )
-        row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
-        count = int(row[0]) if row else 0
-
-    tmp_db.replace(db_path)
+            if entries:
+                con.executemany(
+                    "INSERT INTO gp_scores (member_ref, format_ext, artist, genre, title, search_text) VALUES (?, ?, ?, ?, ?, ?)",
+                    entries,
+                )
+            row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
+            count = int(row[0]) if row else 0
+        tmp_db.replace(db_path)
+    finally:
+        tmp_db.unlink(missing_ok=True)
     return count
 
 
@@ -274,7 +278,7 @@ def sync_gp_catalog(
     zenodo_token: str | None = None,
     force: bool = False,
 ) -> GpCatalogStatus:
-    """Index a local Guitar Pro / DadaGP folder/archive (or download a Zenodo record) into DuckDB."""
+    """Index a local Guitar Pro / DadaGP folder/archive (or download a Zenodo record) into SQLite."""
     target_dir = Path(gp_dir) if gp_dir is not None else (Path(cache_dir) / "dadagp")
     target_dir.mkdir(parents=True, exist_ok=True)
     if gp_dir is not None:
@@ -289,7 +293,7 @@ def sync_gp_catalog(
             force=force,
         )
 
-    build_gp_catalog_duckdb(target_dir, target_dir / "gp_catalog.duckdb")
+    build_gp_catalog_sqlite(target_dir, target_dir / "gp_catalog.sqlite")
     return get_gp_catalog_status(cache_dir)
 
 
@@ -300,9 +304,9 @@ def search_gp_catalog(
     allowed_exts: frozenset[str],
     limit: int = 30,
 ) -> list[dict[str, Any]]:
-    """Query the local DuckDB DadaGP / Guitar Pro catalog if synced; returns `[]` otherwise."""
+    """Query the local SQLite DadaGP / Guitar Pro catalog if synced; returns `[]` otherwise."""
     gp_dir = resolve_gp_catalog_dir(cache_dir)
-    db_path = gp_dir / "gp_catalog.duckdb"
+    db_path = gp_dir / "gp_catalog.sqlite"
     if not db_path.exists():
         return []
 
@@ -314,7 +318,7 @@ def search_gp_catalog(
     if not target_exts:
         return []
 
-    where_clauses = ["search_text LIKE '%' || ? || '%'"] * len(tokens)
+    where_clauses = ["INSTR(search_text, ?) > 0"] * len(tokens)
     ext_placeholders = ", ".join("?" for _ in target_exts)
     sql = f"""
         SELECT member_ref, format_ext, artist, genre, title
@@ -324,10 +328,10 @@ def search_gp_catalog(
         LIMIT ?
     """
     try:
-        with duckdb.connect(str(db_path), read_only=True) as con:
+        with open_sqlite(db_path, read_only=True) as con:
             rows = con.execute(sql, [*tokens, *target_exts, limit]).fetchall()
-    except duckdb.Error as exc:
-        logger.debug("GP DuckDB query failed: %s", exc)
+    except sqlite3.Error as exc:
+        logger.debug("GP SQLite query failed: %s", exc)
         return []
 
     records: list[dict[str, Any]] = []
@@ -335,7 +339,7 @@ def search_gp_catalog(
         note_bits = ["Guitar TAB"]
         if genre:
             note_bits.append(str(genre))
-        member_part = str(member_ref).rsplit("::", 1)[-1]
+        member_part = _decode_member_ref(str(member_ref))[-1]
         records.append(
             {
                 "title": str(title),

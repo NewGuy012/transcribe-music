@@ -55,6 +55,10 @@ def test_pdmx_duckdb_sync_search_extract_and_security(tmp_path: Path) -> None:
     )
     assert len(dvorak_hits) == 1
     assert dvorak_hits[0].composer == "Antonín Dvořák"
+    assert (
+        search_digital_scores("%", include_remote=False, include_local=False, cache_dir=cache_dir)
+        == []
+    )
     with pytest.raises(FileNotFoundError, match="pdmx sync --with-mxl"):
         download_score_result(dvorak_hits[0], download_dir=tmp_path / "dl")
 
