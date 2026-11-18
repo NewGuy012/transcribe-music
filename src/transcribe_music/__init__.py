@@ -6,6 +6,7 @@ from transcribe_music.ingest.digital import inspect_digital_score as inspect_sco
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
+    GuitarStaffMode,
     Instrument,
     OmrBackend,
     PartInfo,
@@ -23,6 +24,7 @@ except PackageNotFoundError:
     __version__ = "0.2.0"
 
 __all__ = [
+    "GuitarStaffMode",
     "Instrument",
     "OmrBackend",
     "PartInfo",

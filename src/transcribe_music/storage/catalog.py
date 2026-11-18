@@ -55,7 +55,7 @@ def compute_job_hash(
 ) -> str:
     """Compute a deterministic cache key for a score conversion/OMR job."""
     payload = {
-        "pipeline_version": "v2",
+        "pipeline_version": "v3",
         "source_type": source_type.value,
         "source_identity": source_identity,
         "instrument": config.instrument.value,
@@ -64,6 +64,8 @@ def compute_job_hash(
         "enrich_fingering": config.enrich_fingering,
         "preserve_existing_chords": config.preserve_existing_chords,
         "preserve_existing_fingering": config.preserve_existing_fingering,
+        "preserve_existing_tab": config.preserve_existing_tab if config.instrument == Instrument.GUITAR else None,
+        "guitar_staff": config.guitar_staff.value if config.instrument == Instrument.GUITAR else None,
         "quantize_divisors": list(config.quantize_divisors),
         "pdf_dpi": config.pdf_dpi if source_type == SourceType.PDF else None,
         "omr_backend": config.omr_backend.value if source_type == SourceType.PDF else None,

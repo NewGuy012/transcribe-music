@@ -34,6 +34,14 @@ class OmrBackend(str, Enum):
     HOMR = "homr"
 
 
+class GuitarStaffMode(str, Enum):
+    """Supported MusicXML staff layouts when exporting guitar scores."""
+
+    NOTATION = "notation"
+    TAB = "tab"
+    BOTH = "both"
+
+
 @dataclass(frozen=True)
 class InstrumentSpec:
     """Acoustic, notation, and biomechanical metadata for an instrument."""
@@ -105,6 +113,8 @@ class PartInfo(BaseModel):
     note_count: int = 0
     pitch_min: int | None = None
     pitch_max: int | None = None
+    tuning: str | None = None
+    capo: int | None = None
 
 
 class ScoreInspection(BaseModel):
@@ -126,6 +136,8 @@ class TranscriptionConfig(BaseModel):
     enrich_fingering: bool = True
     preserve_existing_chords: bool = False
     preserve_existing_fingering: bool = False
+    preserve_existing_tab: bool = True
+    guitar_staff: GuitarStaffMode = GuitarStaffMode.NOTATION
     quantize_divisors: tuple[int, ...] = (4, 3)
     cache_dir: Path = Path(".transcribe_cache")
     pdf_dpi: int = Field(default=300, ge=150, le=600)
@@ -165,4 +177,6 @@ class ScoreSearchResult(BaseModel):
     local_corpus_path: str | None = None
     pdmx_dir: str | None = None
     pdmx_member: str | None = None
+    gp_dir: str | None = None
+    gp_member: str | None = None
     score: float = 0.0

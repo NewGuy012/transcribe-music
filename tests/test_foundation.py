@@ -13,10 +13,17 @@ from conftest import write_pdf_file
 from transcribe_music.export.musicxml import _postprocess_and_validate_xml, export_musicxml
 from transcribe_music.ingest.pdf import render_pdf_pages
 from transcribe_music.models import (
+    GuitarStaffMode,
     Instrument,
     SourceType,
     TranscriptionConfig,
     TranscriptionResult,
+)
+from transcribe_music.score_utils import (
+    GuitarTrackMeta,
+    format_tuning_label,
+    get_guitar_track_meta,
+    set_guitar_track_meta,
 )
 from transcribe_music.storage.catalog import CatalogStore, compute_job_hash
 
@@ -182,3 +189,23 @@ def test_xml_validator_rejects_malformed_measures(
     )
     with pytest.raises(ValueError, match=error_match):
         _postprocess_and_validate_xml(xml_path)
+
+
+def test_guitar_track_meta_and_job_hash_isolation() -> None:
+    import copy
+
+    part = music21.stream.Part()
+    meta = GuitarTrackMeta(open_string_midi=(64, 59, 55, 50, 45, 38), capo_fret=2)
+    set_guitar_track_meta(part, meta)
+    copied = copy.deepcopy(part)
+    loaded_meta = get_guitar_track_meta(copied)
+    assert loaded_meta == meta
+    assert format_tuning_label(meta.open_string_midi) == "D2-A2-D3-G3-B3-E4"
+
+    cfg_not = TranscriptionConfig(instrument=Instrument.GUITAR)
+    cfg_tab = TranscriptionConfig(instrument=Instrument.GUITAR, guitar_staff=GuitarStaffMode.TAB)
+    cfg_recomp = TranscriptionConfig(instrument=Instrument.GUITAR, preserve_existing_tab=False)
+    h_not = compute_job_hash(SourceType.DIGITAL, "abc", cfg_not)
+    h_tab = compute_job_hash(SourceType.DIGITAL, "abc", cfg_tab)
+    h_recomp = compute_job_hash(SourceType.DIGITAL, "abc", cfg_recomp)
+    assert len({h_not, h_tab, h_recomp}) == 3

@@ -5,9 +5,46 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Iterator
+from dataclasses import dataclass
 from fractions import Fraction
 
 import music21
+
+
+@dataclass(frozen=True)
+class GuitarTrackMeta:
+    """Fretted-instrument tuning and capo metadata attached to a Part."""
+
+    open_string_midi: tuple[int, ...]  # Ordered string 1 (highest) -> string N (lowest)
+    capo_fret: int = 0
+
+
+def set_guitar_track_meta(part: music21.stream.Part, meta: GuitarTrackMeta) -> None:
+    """Persist tuning and capo metadata in a Part's editorial dictionary."""
+    part.editorial["guitar_meta"] = {
+        "open_string_midi": tuple(int(m) for m in meta.open_string_midi),
+        "capo_fret": max(0, int(meta.capo_fret)),
+    }
+
+
+def get_guitar_track_meta(part: music21.stream.Part) -> GuitarTrackMeta | None:
+    """Retrieve tuning and capo metadata from a Part's editorial dictionary if valid."""
+    raw = part.editorial.get("guitar_meta")
+    if not isinstance(raw, dict):
+        return None
+    strings = raw.get("open_string_midi")
+    if not isinstance(strings, (tuple, list)) or not strings:
+        return None
+    capo = int(raw.get("capo_fret", 0) or 0)
+    return GuitarTrackMeta(
+        open_string_midi=tuple(int(m) for m in strings),
+        capo_fret=max(0, capo),
+    )
+
+
+def format_tuning_label(open_string_midi: tuple[int, ...]) -> str:
+    """Format open string MIDI values (string 1..N) low-to-high, e.g. 'E2-A2-D3-G3-B3-E4'."""
+    return "-".join(music21.pitch.Pitch(midi=m).nameWithOctave for m in reversed(open_string_midi))
 
 
 def is_playable_chord(el: object) -> bool:
