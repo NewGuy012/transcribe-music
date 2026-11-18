@@ -10,6 +10,11 @@ from rich.console import Console
 from rich.table import Table
 
 from transcribe_music.ingest.digital import inspect_digital_score
+from transcribe_music.ingest.gp_catalog import (
+    GpCatalogStatus,
+    get_gp_catalog_status,
+    sync_gp_catalog,
+)
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
@@ -29,8 +34,10 @@ app = typer.Typer(
 )
 cache_app = typer.Typer(help="Inspect or manage the DuckDB conversion cache.")
 pdmx_app = typer.Typer(help="Manage the optional local PDMX (254k+ public domain MusicXML) catalog.")
+dadagp_app = typer.Typer(help="Manage the optional local DadaGP / Guitar Pro catalog.")
 app.add_typer(cache_app, name="cache")
 app.add_typer(pdmx_app, name="pdmx")
+app.add_typer(dadagp_app, name="dadagp")
 
 console = Console()
 
@@ -219,7 +226,7 @@ def search(
         typer.Option(
             "--instrument",
             "-i",
-            help="Optionally convert the downloaded score into enriched MusicXML immediately.",
+            help="Prioritize matching scores for this instrument and convert the download immediately.",
         ),
     ] = None,
     offline: Annotated[
@@ -228,13 +235,14 @@ def search(
     ] = False,
     cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
-    """Search symbolic score catalogs (preferring MusicXML) and download a pick."""
+    """Search symbolic score catalogs (preferring MusicXML or GP TAB) and download a pick."""
     parsed_formats = (
         [tok.strip() for tok in formats.split(",") if tok.strip()] if formats else None
     )
     results = search_digital_scores(
         query,
         limit=limit,
+        instrument=instrument,
         musicxml_only=musicxml_only,
         formats=parsed_formats,
         include_remote=not offline,
@@ -282,8 +290,13 @@ def search(
         res = convert_music(input_path=saved_path, instrument=instrument, config=cfg)
         _print_result(res)
     else:
+        suggested = (
+            "guitar"
+            if chosen.format_ext in {".gp", ".gpx", ".gp5", ".gp4", ".gp3", ".tab"}
+            else "piano"
+        )
         console.print(
-            f"Next: [bold]transcribe-music convert \"{saved_path}\" --instrument piano[/bold]"
+            f"Next: [bold]transcribe-music convert \"{saved_path}\" --instrument {suggested}[/bold]"
         )
 
 
@@ -399,3 +412,51 @@ def pdmx_sync(
         force=force,
     )
     _print_pdmx_status(status)
+
+
+def _print_gp_status(status: GpCatalogStatus) -> None:
+    table = Table(title="DadaGP / Guitar Pro Local Catalog")
+    table.add_column("Field", no_wrap=True)
+    table.add_column("Value")
+    table.add_row("Catalog Directory", str(status.gp_dir))
+    table.add_row("DuckDB Index", "Yes" if status.db_exists else "No")
+    table.add_row("Indexed Scores", f"{status.score_count:,}")
+    table.add_row("Files / Archives", "Available" if status.archive_available else "Empty")
+    console.print(table)
+
+
+@dadagp_app.command("status")
+def dadagp_status(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
+    """Inspect local DadaGP / Guitar Pro catalog status."""
+    _print_gp_status(get_gp_catalog_status(cache_dir))
+
+
+@dadagp_app.command("sync")
+def dadagp_sync(
+    gp_dir: Annotated[
+        Path | None,
+        typer.Option("--gp-dir", help="Local directory of .gp*/.tab files or .tar.gz/.zip archives."),
+    ] = None,
+    zenodo_record: Annotated[
+        str | None,
+        typer.Option("--zenodo-record", help="Optional Zenodo record ID to download archives from."),
+    ] = None,
+    zenodo_token: Annotated[
+        str | None,
+        typer.Option("--zenodo-token", help="Optional Zenodo API token (or set ZENODO_TOKEN)."),
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Re-download Zenodo archives even if cached locally."),
+    ] = False,
+    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
+) -> None:
+    """Index local Guitar Pro / DadaGP files or download from Zenodo into DuckDB."""
+    status = sync_gp_catalog(
+        cache_dir=cache_dir,
+        gp_dir=gp_dir,
+        zenodo_record=zenodo_record,
+        zenodo_token=zenodo_token,
+        force=force,
+    )
+    _print_gp_status(status)

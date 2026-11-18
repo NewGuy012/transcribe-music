@@ -3,6 +3,11 @@
 from importlib.metadata import PackageNotFoundError, version
 
 from transcribe_music.ingest.digital import inspect_digital_score as inspect_score
+from transcribe_music.ingest.gp_catalog import (
+    GpCatalogStatus,
+    get_gp_catalog_status,
+    sync_gp_catalog,
+)
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
@@ -24,6 +29,7 @@ except PackageNotFoundError:
     __version__ = "0.2.0"
 
 __all__ = [
+    "GpCatalogStatus",
     "GuitarStaffMode",
     "Instrument",
     "OmrBackend",
@@ -37,8 +43,10 @@ __all__ = [
     "__version__",
     "convert_music",
     "download_score_result",
+    "get_gp_catalog_status",
     "get_pdmx_status",
     "inspect_score",
     "search_digital_scores",
+    "sync_gp_catalog",
     "sync_pdmx",
 ]

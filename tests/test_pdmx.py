@@ -98,8 +98,33 @@ def test_pdmx_duckdb_sync_search_extract_and_security(tmp_path: Path) -> None:
     assert get_pdmx_status(cache_dir).score_count == 3
 
     for unsafe in ("../../etc/passwd", "/etc/passwd", "mxl/../../etc/passwd"):
-        with pytest.raises(ValueError, match="Unsafe PDMX member path"):
+        with pytest.raises(ValueError, match="Unsafe archive member path"):
             extract_pdmx_member(pdmx_dir, unsafe, tmp_path / "out.mxl")
 
     with pytest.raises(ValueError, match="not a regular file"):
         extract_pdmx_member(pdmx_dir, "mxl/evil_link.mxl", tmp_path / "out.mxl")
+
+
+def test_pdmx_tracks_column_and_instrument_search_boost(tmp_path: Path) -> None:
+    cache_dir = tmp_path / ".cache_gtr"
+    pdmx_dir = tmp_path / "pdmx_gtr"
+    pdmx_dir.mkdir(parents=True)
+    (pdmx_dir / "PDMX.csv").write_text(
+        'mxl,mid,pdf,title,song_name,composer_name,artist_name,genres,tracks,tags,n_tracks,complexity,rating,n_ratings,is_best_unique_arrangement,"subset:no_license_conflict"\n'
+        './mxl/g/gu/QmPiano.mxl,NA,NA,"Capricho","Capricho","Composer A",NA,classical,"Piano",piano,1,2.0,4.9,10,True,True\n'
+        './mxl/g/gu/QmGuitar.mxl,NA,NA,"Capricho","Capricho","Composer B",NA,classical,"Classical Guitar",guitar,1,2.0,3.5,2,False,True\n',
+        encoding="utf-8",
+    )
+    status = sync_pdmx(cache_dir=cache_dir, pdmx_dir=pdmx_dir, download_csv=False)
+    assert status.score_count == 2
+
+    hits = search_digital_scores(
+        "Capricho",
+        instrument=Instrument.GUITAR,
+        include_remote=False,
+        include_local=False,
+        cache_dir=cache_dir,
+    )
+    assert len(hits) == 2
+    assert hits[0].filename == "QmGuitar.mxl"
+    assert "Classical Guitar" in (hits[0].edition_note or "")

@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 import duckdb
 import requests
 
+from transcribe_music.models import Instrument
+
 logger = logging.getLogger(__name__)
 
 PDMX_ZENODO_RECORD_ID = "15571083"
@@ -23,7 +25,7 @@ PDMX_MXL_TAR_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/file
 PDMX_MID_TAR_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/files/mid.tar.gz/content"
 
 USER_AGENT = "transcribe-music/0.2 (+https://github.com/transcribe-music)"
-_MAX_MEMBER_BYTES = 50 * 1024 * 1024
+MAX_MEMBER_BYTES = 50 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,24 @@ def build_pdmx_duckdb(
     )
 
     with duckdb.connect(str(tmp_db)) as con:
+        col_rows = con.execute(
+            """
+            DESCRIBE
+            SELECT * FROM read_csv(
+                ?,
+                header = TRUE,
+                nullstr = ['NA', ''],
+                ignore_errors = TRUE
+            )
+            """,
+            [str(csv_path)],
+        ).fetchall()
+        available_cols = {str(r[0]) for r in col_rows}
+        tracks_expr = "NULLIF(TRIM(tracks), '')" if "tracks" in available_cols else "NULL::VARCHAR"
+        tags_expr = "NULLIF(TRIM(tags), '')" if "tags" in available_cols else "NULL::VARCHAR"
+        tracks_search = "COALESCE(tracks, '')" if "tracks" in available_cols else "''"
+        tags_search = "COALESCE(tags, '')" if "tags" in available_cols else "''"
+
         con.execute(
             f"""
             CREATE TABLE pdmx_scores AS
@@ -139,6 +159,8 @@ def build_pdmx_duckdb(
                 NULLIF(TRIM(song_name), '') AS song_name,
                 COALESCE(NULLIF(TRIM(composer_name), ''), NULLIF(TRIM(artist_name), '')) AS composer,
                 NULLIF(TRIM(genres), '') AS genres,
+                {tracks_expr} AS tracks,
+                {tags_expr} AS tags,
                 TRY_CAST(n_tracks AS INTEGER) AS n_tracks,
                 TRY_CAST(complexity AS DOUBLE) AS complexity,
                 TRY_CAST(rating AS DOUBLE) AS rating,
@@ -154,7 +176,8 @@ def build_pdmx_duckdb(
                             COALESCE(composer_name, ''),
                             COALESCE(artist_name, ''),
                             COALESCE(genres, ''),
-                            COALESCE(tags, '')
+                            {tracks_search},
+                            {tags_search}
                         )
                     )
                 ) AS search_text
@@ -176,13 +199,22 @@ def build_pdmx_duckdb(
     return count
 
 
-def _download_stream(url: str, dest: Path) -> Path:
+def download_https_stream(
+    url: str,
+    dest: Path,
+    *,
+    headers: dict[str, str] | None = None,
+) -> Path:
+    """Stream an HTTPS download atomically into `dest`, checking redirect schemes."""
     validate_https_url(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(f"{dest.suffix}.tmp")
+    req_headers = {"User-Agent": USER_AGENT}
+    if headers:
+        req_headers.update(headers)
     with requests.get(
         url,
-        headers={"User-Agent": USER_AGENT},
+        headers=req_headers,
         stream=True,
         timeout=60.0,
     ) as resp:
@@ -194,6 +226,45 @@ def _download_stream(url: str, dest: Path) -> Path:
                     fh.write(chunk)
     tmp.replace(dest)
     return dest
+
+
+def safe_resolve_member_path(base_dir: Path | str, member_rel: str) -> tuple[Path, str, Path]:
+    """Validate `member_rel` stays strictly inside `base_dir` and return (base, clean_rel, target)."""
+    base_resolved = Path(base_dir).resolve()
+    clean_rel = member_rel.removeprefix("./")
+    rel_parts = Path(clean_rel).parts
+    if not clean_rel or Path(clean_rel).is_absolute() or ".." in rel_parts:
+        raise ValueError(f"Unsafe archive member path outside catalog directory: {member_rel!r}")
+    target = (base_resolved / clean_rel).resolve()
+    if not target.is_relative_to(base_resolved) or target == base_resolved:
+        raise ValueError(f"Unsafe archive member path outside catalog directory: {member_rel!r}")
+    return base_resolved, clean_rel, target
+
+
+def read_bounded_tar_member(
+    tar_path: Path,
+    clean_rel: str,
+    *,
+    max_bytes: int = MAX_MEMBER_BYTES,
+) -> bytes:
+    """Safely extract a single regular file entry from a `.tar.gz` archive within size bounds."""
+    with tarfile.open(tar_path, "r:gz") as tf:
+        for candidate_name in (clean_rel, f"./{clean_rel}"):
+            try:
+                member = tf.getmember(candidate_name)
+            except KeyError:
+                continue
+            if not member.isfile():
+                raise ValueError(f"Archive entry '{clean_rel}' is not a regular file.")
+            if member.size > max_bytes:
+                raise ValueError(f"Archive entry '{clean_rel}' exceeds size limit.")
+            extracted = tf.extractfile(member)
+            if extracted is not None:
+                data = extracted.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise ValueError(f"Archive entry '{clean_rel}' exceeds size limit.")
+                return data
+    raise FileNotFoundError(f"Member '{clean_rel}' not found inside {tar_path}")
 
 
 def _extract_full_archive(archive_path: Path, dest_dir: Path) -> None:
@@ -220,7 +291,7 @@ def sync_pdmx(
 
     csv_path = target_dir / "PDMX.csv"
     if download_csv and (force or not csv_path.exists()):
-        _download_stream(PDMX_CSV_URL, csv_path)
+        download_https_stream(PDMX_CSV_URL, csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(
             f"PDMX.csv not found in {target_dir}. Run without --no-download or supply PDMX.csv."
@@ -234,7 +305,7 @@ def sync_pdmx(
             continue
         tar_path = target_dir / name
         if force or not tar_path.exists():
-            _download_stream(url, tar_path)
+            download_https_stream(url, tar_path)
         if extract_archives and tar_path.exists():
             _extract_full_archive(tar_path, target_dir)
 
@@ -252,6 +323,7 @@ def search_pdmx_catalog(
     *,
     cache_dir: Path = Path(".transcribe_cache"),
     allowed_exts: frozenset[str],
+    instrument: Instrument | None = None,
     limit: int = 30,
 ) -> list[dict[str, Any]]:
     """Query the local DuckDB PDMX catalog if synced; returns `[]` immediately otherwise."""
@@ -273,43 +345,71 @@ def search_pdmx_catalog(
     mid_ready = _pdmx_archive_available(pdmx_dir, "mid")
 
     where_clauses = ["search_text LIKE '%' || ? || '%'"] * len(tokens)
-    sql = f"""
-        SELECT
-            mxl_rel,
-            mid_rel,
-            title,
-            composer,
-            genres,
-            n_tracks,
-            rating,
-            is_best_unique
-        FROM pdmx_scores
-        WHERE {" AND ".join(where_clauses)}
-        ORDER BY
-            is_best_unique DESC,
-            rating DESC NULLS LAST,
-            n_ratings DESC NULLS LAST
-        LIMIT ?
-    """
+    inst_term = instrument.value if instrument is not None else None
     try:
         with duckdb.connect(str(db_path), read_only=True) as con:
-            rows = con.execute(sql, [*tokens, limit]).fetchall()
+            cols = {str(r[1]) for r in con.execute("PRAGMA table_info('pdmx_scores')").fetchall()}
+            tracks_sel = "tracks" if "tracks" in cols else "NULL::VARCHAR AS tracks"
+            tags_sel = "tags" if "tags" in cols else "NULL::VARCHAR AS tags"
+            inst_order = ""
+            params: list[Any] = [*tokens]
+            if inst_term is not None:
+                if "tracks" in cols or "tags" in cols:
+                    t_expr = "LOWER(COALESCE(tracks, '') || ' ' || COALESCE(tags, '') || ' ' || search_text)"
+                else:
+                    t_expr = "search_text"
+                inst_order = f"CASE WHEN {t_expr} LIKE '%' || ? || '%' THEN 1 ELSE 0 END DESC,"
+                params.append(inst_term)
+            params.append(limit)
+            sql = f"""
+                SELECT
+                    mxl_rel,
+                    mid_rel,
+                    title,
+                    composer,
+                    genres,
+                    n_tracks,
+                    rating,
+                    is_best_unique,
+                    {tracks_sel},
+                    {tags_sel}
+                FROM pdmx_scores
+                WHERE {" AND ".join(where_clauses)}
+                ORDER BY
+                    {inst_order}
+                    is_best_unique DESC,
+                    rating DESC NULLS LAST,
+                    n_ratings DESC NULLS LAST
+                LIMIT ?
+            """
+            rows = con.execute(sql, params).fetchall()
     except duckdb.Error as exc:
         logger.debug("PDMX DuckDB query failed: %s", exc)
         return []
 
+    inst_keywords = (
+        ("guitar", "gtr")
+        if instrument == Instrument.GUITAR
+        else ((instrument.value,) if instrument is not None else ())
+    )
+
     records: list[dict[str, Any]] = []
-    for mxl_rel, mid_rel, title, composer, genres, n_tracks, rating, is_best_unique in rows:
+    for mxl_rel, mid_rel, title, composer, genres, n_tracks, rating, is_best_unique, tracks, tags in rows:
         candidates: list[tuple[str, str | None, bool]] = []
         if want_mxl and mxl_rel:
             candidates.append((".mxl", str(mxl_rel), mxl_ready))
         if want_mid and mid_rel:
             candidates.append((".mid", str(mid_rel), mid_ready))
 
+        inst_meta_lower = f"{tracks or ''} {tags or ''}".lower()
+        has_inst_match = bool(inst_keywords and any(kw in inst_meta_lower for kw in inst_keywords))
+
         for ext, rel_path, archive_ready in candidates:
             if ext == ".mxl" and not mxl_ready and mid_ready and want_mid and mid_rel:
                 continue
             note_bits = []
+            if tracks:
+                note_bits.append(str(tracks))
             if genres:
                 note_bits.append(str(genres))
             if n_tracks:
@@ -323,6 +423,8 @@ def search_pdmx_catalog(
             bonus = 0.3 if is_best_unique else 0.0
             if rating is not None:
                 bonus += min(0.5, float(rating) / 10.0)
+            if has_inst_match:
+                bonus += 3.0
             if not archive_ready:
                 bonus -= 2.5
 
@@ -345,15 +447,7 @@ def search_pdmx_catalog(
 
 def extract_pdmx_member(pdmx_dir: Path | str, member_rel: str, dest: Path) -> Path:
     """Safely extract a single `.mxl` or `.mid` score from a PDMX dir or `.tar.gz` archive."""
-    base_resolved = Path(pdmx_dir).resolve()
-    clean_rel = member_rel.removeprefix("./")
-    rel_parts = Path(clean_rel).parts
-    if not clean_rel or Path(clean_rel).is_absolute() or ".." in rel_parts:
-        raise ValueError(f"Unsafe PDMX member path outside catalog directory: {member_rel!r}")
-
-    direct_file = (base_resolved / clean_rel).resolve()
-    if not direct_file.is_relative_to(base_resolved) or direct_file == base_resolved:
-        raise ValueError(f"Unsafe PDMX member path outside catalog directory: {member_rel!r}")
+    base_resolved, clean_rel, direct_file = safe_resolve_member_path(pdmx_dir, member_rel)
 
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -371,24 +465,8 @@ def extract_pdmx_member(pdmx_dir: Path | str, member_rel: str, dest: Path) -> Pa
             f"Run: transcribe-music pdmx sync {flag}"
         )
 
-    with tarfile.open(tar_path, "r:gz") as tf:
-        for candidate_name in (clean_rel, f"./{clean_rel}"):
-            try:
-                member = tf.getmember(candidate_name)
-            except KeyError:
-                continue
-            if not member.isfile():
-                raise ValueError(f"PDMX archive entry '{clean_rel}' is not a regular file.")
-            if member.size > _MAX_MEMBER_BYTES:
-                raise ValueError(f"PDMX archive entry '{clean_rel}' exceeds size limit.")
-            extracted = tf.extractfile(member)
-            if extracted is not None:
-                data = extracted.read(_MAX_MEMBER_BYTES + 1)
-                if len(data) > _MAX_MEMBER_BYTES:
-                    raise ValueError(f"PDMX archive entry '{clean_rel}' exceeds size limit.")
-                direct_file.parent.mkdir(parents=True, exist_ok=True)
-                direct_file.write_bytes(data)
-                dest.write_bytes(data)
-                return dest
-
-    raise FileNotFoundError(f"Member '{clean_rel}' not found inside {tar_path}")
+    data = read_bounded_tar_member(tar_path, clean_rel)
+    direct_file.parent.mkdir(parents=True, exist_ok=True)
+    direct_file.write_bytes(data)
+    dest.write_bytes(data)
+    return dest

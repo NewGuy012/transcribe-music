@@ -20,6 +20,7 @@ import music21
 import requests
 
 from transcribe_music.ingest.digital import DIGITAL_EXTENSIONS
+from transcribe_music.ingest.gp_catalog import extract_gp_catalog_member, search_gp_catalog
 from transcribe_music.ingest.pdmx import (
     USER_AGENT,
     extract_pdmx_member,
@@ -27,12 +28,13 @@ from transcribe_music.ingest.pdmx import (
     search_pdmx_catalog,
     validate_https_url,
 )
-from transcribe_music.models import ScoreSearchResult
+from transcribe_music.models import Instrument, ScoreSearchResult
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_SEARCH_EXTENSIONS: frozenset[str] = DIGITAL_EXTENSIONS
 MUSICXML_SEARCH_EXTENSIONS: frozenset[str] = frozenset({".musicxml", ".mxl", ".xml"})
+_GUITAR_TAB_EXTENSIONS: frozenset[str] = frozenset({".gp", ".gpx", ".gp5", ".gp4", ".gp3", ".tab"})
 
 _FORMAT_PRIORITY: dict[str, float] = {
     ".musicxml": 1.00,
@@ -51,14 +53,17 @@ _FORMAT_PRIORITY: dict[str, float] = {
     ".gp5": 0.60,
     ".gp4": 0.60,
     ".gp3": 0.60,
+    ".tab": 0.58,
     ".mid": 0.55,
     ".midi": 0.55,
 }
 
 _SOURCE_BIAS: dict[str, float] = {
     "OpenScore Orchestra": 1.1,
+    "GP Classical Guitar": 1.05,
     "OpenScore Lieder": 1.0,
     "OpenScore StringQuartets": 1.0,
+    "DadaGP": 1.0,
     "When-in-Rome": 0.95,
     "PDMX": 0.9,
     "music21 Corpus": 0.6,
@@ -87,6 +92,13 @@ _WHEN_IN_ROME_TREE_URL = (
     "https://api.github.com/repos/MarkGotham/When-in-Rome/git/trees/master?recursive=1"
 )
 _WHEN_IN_ROME_RAW_PREFIX = "https://raw.githubusercontent.com/MarkGotham/When-in-Rome/master/"
+
+_GP_CLASSICAL_GUITAR_TREE_URL = (
+    "https://api.github.com/repos/otnemrasordep/gp-classical-guitar/git/trees/main?recursive=1"
+)
+_GP_CLASSICAL_GUITAR_RAW_PREFIX = (
+    "https://raw.githubusercontent.com/otnemrasordep/gp-classical-guitar/main/"
+)
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -122,7 +134,7 @@ def _format_composer_name(raw: str) -> str:
 def _safe_filename(name: str, fallback_ext: str = ".musicxml") -> str:
     base = Path(name).name.strip() or f"score{fallback_ext}"
     cleaned = _SAFE_NAME_RE.sub("_", base).strip("._") or f"score{fallback_ext}"
-    if Path(cleaned).suffix.lower() not in SUPPORTED_SEARCH_EXTENSIONS:
+    if Path(cleaned).suffix.lower() not in (SUPPORTED_SEARCH_EXTENSIONS | _GUITAR_TAB_EXTENSIONS):
         cleaned = f"{cleaned}{fallback_ext}"
     return cleaned
 
@@ -306,6 +318,38 @@ def _fetch_openscore_sq_index() -> list[dict[str, Any]]:
     return records
 
 
+def _fetch_gp_classical_guitar_index() -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for node in _fetch_github_tree(_GP_CLASSICAL_GUITAR_TREE_URL):
+        rel_path = str(node.get("path", ""))
+        ext = Path(rel_path).suffix.lower()
+        if ext not in (SUPPORTED_SEARCH_EXTENSIONS | _GUITAR_TAB_EXTENSIONS):
+            continue
+        parts = Path(rel_path).parts
+        clean_dirs = [
+            p.replace("_", " ").strip()
+            for p in parts[:-1]
+            if p.lower() not in {"data", "scores", "midi", "mid", "gp", "gp5", "gpx", "files"}
+        ]
+        composer = _format_composer_name(clean_dirs[0]) if clean_dirs else None
+        stem_title = Path(rel_path).stem.replace("_", " ").strip()
+        work_group = " - ".join(clean_dirs[1:]) if len(clean_dirs) > 1 else ""
+        title = f"{stem_title} ({work_group})" if work_group else stem_title
+        note = "Classical Guitar MIDI" if ext in {".mid", ".midi"} else "Classical Guitar TAB"
+        records.append(
+            {
+                "title": title,
+                "composer": composer,
+                "format_ext": ext,
+                "source": "GP Classical Guitar",
+                "filename": _safe_filename(Path(rel_path).name, fallback_ext=ext),
+                "edition_note": note,
+                "download_url": f"{_GP_CLASSICAL_GUITAR_RAW_PREFIX}{_encode_url_path(rel_path)}",
+            }
+        )
+    return records
+
+
 def _search_music21_corpus(query: str) -> list[dict[str, Any]]:
     tokens = _normalize_text(query).split()
     if not tokens:
@@ -351,7 +395,12 @@ def _search_music21_corpus(query: str) -> list[dict[str, Any]]:
     return records
 
 
-def _score_candidate(record: dict[str, Any], query: str) -> float:
+def _score_candidate(
+    record: dict[str, Any],
+    query: str,
+    *,
+    instrument: Instrument | None = None,
+) -> float:
     q_norm = _normalize_text(query)
     q_tokens = q_norm.split()
     if not q_tokens:
@@ -360,10 +409,11 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
     title_norm = _normalize_text(str(record.get("title", "")))
     composer_norm = _normalize_text(str(record.get("composer") or ""))
     filename_norm = _normalize_text(str(record.get("filename", "")))
+    edition_norm = _normalize_text(str(record.get("edition_note") or ""))
     ext = str(record.get("format_ext", "")).lower()
     source = str(record.get("source", ""))
 
-    haystack = f"{title_norm} {composer_norm} {filename_norm}".strip()
+    haystack = f"{title_norm} {composer_norm} {filename_norm} {edition_norm}".strip()
     if not haystack:
         return 0.0
 
@@ -390,13 +440,23 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
     if matched < min_required:
         return 0.0
 
+    guitar_intent = (
+        instrument == Instrument.GUITAR or "guitar" in q_tokens or "tab" in q_tokens
+    )
+    is_preferred_fmt = ext in MUSICXML_SEARCH_EXTENSIONS or (
+        guitar_intent and ext in _GUITAR_TAB_EXTENSIONS
+    )
+    fmt_prio = _FORMAT_PRIORITY.get(ext, 0.2)
+    if guitar_intent and ext in _GUITAR_TAB_EXTENSIONS:
+        fmt_prio = max(fmt_prio, 0.96)
+
     coverage = matched / len(q_tokens)
     exact_ratio = exact_word_hits / len(q_tokens)
     score = 14.0 * coverage + 3.0 * exact_ratio + 4.0 * (composer_hits > 0)
 
     if matched == len(q_tokens):
         score += 8.0
-        if ext in MUSICXML_SEARCH_EXTENSIONS:
+        if is_preferred_fmt:
             score += 15.0
     if q_norm in title_norm:
         score += 6.0
@@ -404,9 +464,18 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
         score += 3.0
 
     score += 2.0 * (title_hits / max(1, len(title_words)))
-    score += 18.0 * _FORMAT_PRIORITY.get(ext, 0.2)
+    score += 18.0 * fmt_prio
     score += _SOURCE_BIAS.get(source, 0.0)
     score += float(record.get("source_bonus", 0.0) or 0.0)
+
+    if guitar_intent:
+        if source in {"GP Classical Guitar", "DadaGP"} or "guitar" in hay_words or "tab" in hay_words:
+            score += 4.0
+        if source == "OpenScore StringQuartets" and "quartet" not in q_tokens:
+            score -= 4.0
+    elif instrument is not None and instrument.value in hay_words:
+        score += 2.0
+
     return round(score, 4)
 
 
@@ -415,28 +484,33 @@ def _normalize_allowed_formats(
     *,
     musicxml_only: bool,
 ) -> frozenset[str]:
+    supported = SUPPORTED_SEARCH_EXTENSIONS | _GUITAR_TAB_EXTENSIONS
     if formats is not None:
         cleaned = {f".{f.strip().lstrip('.').lower()}" for f in formats if f.strip()}
-        valid = frozenset(cleaned & SUPPORTED_SEARCH_EXTENSIONS)
+        valid = frozenset(cleaned & supported)
         if not valid:
-            supported = ", ".join(sorted(SUPPORTED_SEARCH_EXTENSIONS))
-            raise ValueError(f"No supported score formats in {list(formats)!r}. Supported: {supported}")
+            supported_str = ", ".join(sorted(supported))
+            raise ValueError(
+                f"No supported score formats in {list(formats)!r}. Supported: {supported_str}"
+            )
         return frozenset(valid & MUSICXML_SEARCH_EXTENSIONS) if musicxml_only else valid
-    return MUSICXML_SEARCH_EXTENSIONS if musicxml_only else SUPPORTED_SEARCH_EXTENSIONS
+    return MUSICXML_SEARCH_EXTENSIONS if musicxml_only else supported
 
 
 def search_digital_scores(
     query: str,
     *,
     limit: int = 5,
+    instrument: Instrument | None = None,
     musicxml_only: bool = False,
     formats: Iterable[str] | None = None,
     include_pdmx: bool = True,
+    include_gp_catalog: bool = True,
     include_remote: bool = True,
     include_local: bool = True,
     cache_dir: Path = Path(".transcribe_cache"),
 ) -> list[ScoreSearchResult]:
-    """Search fast symbolic catalogs (local PDMX/music21 + cached OpenScore/When-in-Rome)."""
+    """Search fast symbolic catalogs (local PDMX/DadaGP/music21 + cached GitHub corpora)."""
     clean_query = query.strip()
     if not clean_query:
         raise ValueError("Search query cannot be empty.")
@@ -444,6 +518,8 @@ def search_digital_scores(
         raise ValueError("limit must be a positive integer.")
 
     allowed_exts = _normalize_allowed_formats(formats, musicxml_only=musicxml_only)
+    q_tokens = _normalize_text(clean_query).split()
+    guitar_intent = instrument == Instrument.GUITAR or "guitar" in q_tokens or "tab" in q_tokens
 
     def _safe_index(name: str, fetcher: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
         try:
@@ -457,12 +533,26 @@ def search_digital_scores(
         lambda: _safe_index("openscore_lieder", _fetch_openscore_lieder_index),
         lambda: _safe_index("openscore_stringquartets", _fetch_openscore_sq_index),
         lambda: _safe_index("when_in_rome", _fetch_when_in_rome_index),
+        lambda: _safe_index("gp_classical_guitar", _fetch_gp_classical_guitar_index),
     ]
     if include_local:
         tasks.append(lambda: _search_music21_corpus(clean_query))
     if include_pdmx:
         tasks.append(
-            lambda: search_pdmx_catalog(clean_query, cache_dir=cache_dir, allowed_exts=allowed_exts)
+            lambda: search_pdmx_catalog(
+                clean_query,
+                cache_dir=cache_dir,
+                allowed_exts=allowed_exts,
+                instrument=instrument,
+            )
+        )
+    if include_gp_catalog:
+        tasks.append(
+            lambda: search_gp_catalog(
+                clean_query,
+                cache_dir=cache_dir,
+                allowed_exts=allowed_exts,
+            )
         )
 
     raw_records: list[dict[str, Any]] = []
@@ -475,7 +565,7 @@ def search_digital_scores(
         ext = str(rec.get("format_ext", "")).lower()
         if ext not in allowed_exts:
             continue
-        score = _score_candidate(rec, clean_query)
+        score = _score_candidate(rec, clean_query, instrument=instrument)
         if score <= 0.0:
             continue
         scored_candidates.append(
@@ -491,12 +581,19 @@ def search_digital_scores(
                 local_corpus_path=rec.get("local_corpus_path"),
                 pdmx_dir=rec.get("pdmx_dir"),
                 pdmx_member=rec.get("pdmx_member"),
+                gp_dir=rec.get("gp_dir"),
+                gp_member=rec.get("gp_member"),
                 score=score,
             )
         )
 
+    def _effective_priority(ext: str) -> float:
+        if guitar_intent and ext in _GUITAR_TAB_EXTENSIONS:
+            return max(_FORMAT_PRIORITY.get(ext, 0.0), 0.96)
+        return _FORMAT_PRIORITY.get(ext, 0.0)
+
     scored_candidates.sort(
-        key=lambda r: (r.score, _FORMAT_PRIORITY.get(r.format_ext, 0.0)),
+        key=lambda r: (r.score, _effective_priority(r.format_ext)),
         reverse=True,
     )
 
@@ -566,6 +663,9 @@ def download_score_result(
 
     if result.pdmx_dir and result.pdmx_member:
         return extract_pdmx_member(result.pdmx_dir, result.pdmx_member, dest)
+
+    if result.gp_dir and result.gp_member:
+        return extract_gp_catalog_member(result.gp_dir, result.gp_member, dest)
 
     if not result.download_url:
         raise ValueError(f"Search result has no downloadable URL or local corpus path: {result.title}")

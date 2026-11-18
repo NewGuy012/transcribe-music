@@ -11,7 +11,13 @@ import pytest
 from conftest import make_simple_cello_score, write_mxl_bytes
 from typer.testing import CliRunner
 
-from transcribe_music import download_score_result, search_digital_scores
+from transcribe_music import (
+    Instrument,
+    download_score_result,
+    get_gp_catalog_status,
+    search_digital_scores,
+    sync_gp_catalog,
+)
 from transcribe_music.cli import app
 from transcribe_music.ingest import search as search_mod
 
@@ -23,11 +29,13 @@ def _stub_remote_sources(
     lieder: Callable[[], list[dict[str, Any]]] = list,
     quartets: Callable[[], list[dict[str, Any]]] = list,
     when_in_rome: Callable[[], list[dict[str, Any]]] = list,
+    gp_classical: Callable[[], list[dict[str, Any]]] = list,
 ) -> None:
     monkeypatch.setattr(search_mod, "_fetch_openscore_orchestra_index", orchestra)
     monkeypatch.setattr(search_mod, "_fetch_openscore_lieder_index", lieder)
     monkeypatch.setattr(search_mod, "_fetch_openscore_sq_index", quartets)
     monkeypatch.setattr(search_mod, "_fetch_when_in_rome_index", when_in_rome)
+    monkeypatch.setattr(search_mod, "_fetch_gp_classical_guitar_index", gp_classical)
 
 
 def test_search_ranking_diacritics_resilience_and_format_filters(
@@ -126,17 +134,26 @@ def test_offline_music21_corpus_and_github_tree_parsers(
                 {"path": "data/Haydn,_Franz/Symphony_No.104/01/Haydn_104_01_melody.mxl"},
             ]
             if "Hauptstimme" in url
-            else [
-                {"path": "Corpus/Piano_Sonatas/Mozart,_Wolfgang_Amadeus/K331/01/score.mxl"},
-                {"path": "Corpus/Textbooks/Reger,_Max/ex01/score.mxl"},
-                {"path": "Corpus/OpenScore-LiederCorpus/Schubert,_Franz/song/score.mxl"},
-            ]
+            else (
+                [{"path": "Brouwer/Estudios_Sencillos/Estudio_01.gp5"}]
+                if "gp-classical-guitar" in url
+                else [
+                    {"path": "Corpus/Piano_Sonatas/Mozart,_Wolfgang_Amadeus/K331/01/score.mxl"},
+                    {"path": "Corpus/Textbooks/Reger,_Max/ex01/score.mxl"},
+                    {"path": "Corpus/OpenScore-LiederCorpus/Schubert,_Franz/song/score.mxl"},
+                ]
+            )
         ),
     )
     orch = search_mod._fetch_openscore_orchestra_index()
     assert len(orch) == 1 and orch[0]["composer"] == "Franz Haydn"
     wir = search_mod._fetch_when_in_rome_index()
     assert len(wir) == 1 and wir[0]["composer"] == "Wolfgang Amadeus Mozart"
+    gp_cls = search_mod._fetch_gp_classical_guitar_index()
+    assert len(gp_cls) == 1
+    assert gp_cls[0]["composer"] == "Brouwer"
+    assert gp_cls[0]["format_ext"] == ".gp5"
+    assert gp_cls[0]["source"] == "GP Classical Guitar"
 
 
 def test_cli_search_and_download_security_guards(
@@ -231,3 +248,99 @@ def test_cli_search_and_download_security_guards(
     )
     with pytest.raises(ValueError, match="safety limit"):
         download_score_result(valid, download_dir=tmp_path)
+
+
+def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import io
+    import tarfile
+    import zipfile
+
+    from transcribe_music.ingest import gp_catalog as gp_mod
+
+    _stub_remote_sources(
+        monkeypatch,
+        quartets=lambda: [
+            {
+                "title": "Asturias Quartet Transcription",
+                "composer": "Isaac Albeniz",
+                "format_ext": ".mxl",
+                "source": "OpenScore StringQuartets",
+                "filename": "asturias_q.mxl",
+                "download_url": "https://example.com/asturias_q.mxl",
+            }
+        ],
+        gp_classical=lambda: [
+            {
+                "title": "Asturias (Leyenda)",
+                "composer": "Isaac Albeniz",
+                "format_ext": ".gp5",
+                "source": "GP Classical Guitar",
+                "filename": "asturias.gp5",
+                "edition_note": "Classical Guitar TAB",
+                "download_url": "https://example.com/asturias.gp5",
+            }
+        ],
+    )
+    gtr_hits = search_digital_scores(
+        "Asturias Albeniz",
+        instrument=Instrument.GUITAR,
+        include_local=False,
+        cache_dir=tmp_path / "search_cache",
+    )
+    assert gtr_hits[0].format_ext == ".gp5"
+    assert gtr_hits[0].source == "GP Classical Guitar"
+
+    # DadaGP / local GP catalog indexing across direct file, .tar.gz, and .zip
+    gp_dir = tmp_path / "gp_library"
+    (gp_dir / "Rock" / "Metallica").mkdir(parents=True)
+    (gp_dir / "Rock" / "Metallica" / "Nothing_Else_Matters.gp5").write_bytes(b"GP5RAW")
+
+    tar_buf = io.BytesIO()
+    with tarfile.open(fileobj=tar_buf, mode="w:gz") as tf:
+        payload = b"TAR_GP4_BYTES"
+        ti = tarfile.TarInfo("DadaGP-v1.1/A/Albeniz/Capricho_Arabe.gp4")
+        ti.size = len(payload)
+        tf.addfile(ti, io.BytesIO(payload))
+    (gp_dir / "bundle.tar.gz").write_bytes(tar_buf.getvalue())
+
+    with zipfile.ZipFile(gp_dir / "pack.zip", "w") as zf:
+        zf.writestr("Bach/Bourree_in_E_minor.tab", "e|---0---|\n")
+
+    cache_dir = tmp_path / "gp_cache"
+    status = sync_gp_catalog(cache_dir=cache_dir, gp_dir=gp_dir)
+    assert status.db_exists is True
+    assert status.score_count == 3
+    assert get_gp_catalog_status(cache_dir).score_count == 3
+
+    for q, expected_ext, expected_bytes in (
+        ("Metallica Nothing Else", ".gp5", b"GP5RAW"),
+        ("Capricho Arabe", ".gp4", b"TAR_GP4_BYTES"),
+        ("Bourree", ".tab", b"e|---0---|\n"),
+    ):
+        hits = search_digital_scores(
+            q,
+            instrument=Instrument.GUITAR,
+            include_remote=False,
+            include_local=False,
+            cache_dir=cache_dir,
+        )
+        assert hits and hits[0].source == "DadaGP" and hits[0].format_ext == expected_ext
+        out = download_score_result(hits[0], download_dir=tmp_path / "dl_gp")
+        assert out.read_bytes() == expected_bytes
+
+    with pytest.raises(ValueError, match="Unsafe archive member"):
+        gp_mod.extract_gp_catalog_member(gp_dir, "file::../../etc/passwd", tmp_path / "x.gp5")
+
+    monkeypatch.setattr(
+        gp_mod.requests,
+        "get",
+        lambda *_a, **_kw: SimpleNamespace(status_code=403),
+    )
+    with pytest.raises(RuntimeError, match="approved researcher access"):
+        sync_gp_catalog(cache_dir=cache_dir, zenodo_record="4789123")
+
+    runner = CliRunner()
+    cli_st = runner.invoke(app, ["dadagp", "status", "--cache-dir", str(cache_dir)])
+    assert cli_st.exit_code == 0 and "3" in cli_st.stdout

@@ -1,0 +1,405 @@
+"""Optional local/Zenodo DadaGP & Guitar Pro DuckDB catalog and archive extractor."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import tarfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import duckdb
+import requests
+
+from transcribe_music.ingest.pdmx import (
+    MAX_MEMBER_BYTES,
+    USER_AGENT,
+    download_https_stream,
+    normalize_ascii,
+    read_bounded_tar_member,
+    safe_resolve_member_path,
+    validate_https_url,
+)
+
+logger = logging.getLogger(__name__)
+
+GP_CATALOG_EXTENSIONS: frozenset[str] = frozenset(
+    {".gp3", ".gp4", ".gp5", ".gp", ".gpx", ".tab", ".mxl", ".musicxml"}
+)
+_IGNORED_DIR_NAMES: frozenset[str] = frozenset(
+    {"songs", "tabs", "scores", "guitarpro", "gp", "data", "files"}
+)
+
+
+@dataclass(frozen=True)
+class GpCatalogStatus:
+    """Status summary of the local Guitar Pro / DadaGP catalog."""
+
+    gp_dir: Path
+    db_exists: bool
+    score_count: int
+    archive_available: bool
+
+
+def _config_file(cache_dir: Path) -> Path:
+    return Path(cache_dir) / "dadagp" / "config.json"
+
+
+def resolve_gp_catalog_dir(cache_dir: Path = Path(".transcribe_cache")) -> Path:
+    """Resolve active Guitar Pro catalog dir (custom configured dir or `<cache_dir>/dadagp`)."""
+    default_dir = Path(cache_dir) / "dadagp"
+    cfg_path = _config_file(cache_dir)
+    if cfg_path.exists():
+        try:
+            data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            custom = data.get("gp_dir")
+            if isinstance(custom, str) and custom.strip():
+                return Path(custom)
+        except (OSError, ValueError):
+            pass
+    return default_dir
+
+
+def _save_gp_dir_config(cache_dir: Path, gp_dir: Path) -> None:
+    cfg_path = _config_file(cache_dir)
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(json.dumps({"gp_dir": str(gp_dir.resolve())}), encoding="utf-8")
+
+
+def _has_gp_sources(gp_dir: Path) -> bool:
+    if not gp_dir.exists():
+        return False
+    for p in gp_dir.iterdir():
+        name_l = p.name.lower()
+        if p.is_file() and (
+            name_l.endswith((".tar.gz", ".tgz", ".zip")) or p.suffix.lower() in GP_CATALOG_EXTENSIONS
+        ):
+            return True
+        if p.is_dir():
+            return True
+    return False
+
+
+def get_gp_catalog_status(cache_dir: Path = Path(".transcribe_cache")) -> GpCatalogStatus:
+    """Inspect local Guitar Pro / DadaGP DuckDB index and archive availability."""
+    gp_dir = resolve_gp_catalog_dir(cache_dir)
+    db_path = gp_dir / "gp_catalog.duckdb"
+    count = 0
+    if db_path.exists():
+        try:
+            with duckdb.connect(str(db_path), read_only=True) as con:
+                row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
+                count = int(row[0]) if row else 0
+        except duckdb.Error:
+            count = 0
+    return GpCatalogStatus(
+        gp_dir=gp_dir,
+        db_exists=db_path.exists(),
+        score_count=count,
+        archive_available=_has_gp_sources(gp_dir),
+    )
+
+
+def _infer_entry_metadata(rel_path: str) -> tuple[str, str | None, str | None]:
+    """Derive (title, artist, genre_or_group) from a relative Guitar Pro path."""
+    p = Path(rel_path)
+    stem = p.stem.replace("_", " ").strip()
+    meaningful_dirs = [
+        part.replace("_", " ").strip()
+        for part in p.parts[:-1]
+        if part
+        and part != "."
+        and len(part) > 1
+        and part.lower() not in _IGNORED_DIR_NAMES
+        and not part.lower().startswith("dadagp")
+    ]
+
+    artist: str | None = None
+    genre: str | None = None
+    title = stem
+
+    if " - " in stem:
+        left, right = (seg.strip() for seg in stem.split(" - ", 1))
+        if left and right:
+            artist = left
+            title = right
+
+    if artist is None and meaningful_dirs:
+        artist = meaningful_dirs[-1]
+        if len(meaningful_dirs) >= 2:
+            genre = meaningful_dirs[0]
+    elif len(meaningful_dirs) >= 1 and meaningful_dirs[-1].lower() != (artist or "").lower():
+        genre = meaningful_dirs[-1]
+
+    return title or p.stem, artist, genre
+
+
+def _collect_gp_entries(target_dir: Path) -> list[tuple[str, str, str | None, str | None, str, str]]:
+    """Scan local files, `.tar.gz`, and `.zip` archives inside `target_dir` for GP scores."""
+    rows: list[tuple[str, str, str | None, str | None, str, str]] = []
+
+    for path in sorted(target_dir.rglob("*")):
+        if not path.is_file() or path.name.startswith("."):
+            continue
+        rel = path.relative_to(target_dir).as_posix()
+        ext = path.suffix.lower()
+        name_l = path.name.lower()
+
+        if ext in GP_CATALOG_EXTENSIONS:
+            title, artist, genre = _infer_entry_metadata(rel)
+            search_text = normalize_ascii(f"{title} {artist or ''} {genre or ''} {Path(rel).stem}")
+            rows.append((f"file::{rel}", ext, artist, genre, title, search_text))
+        elif name_l.endswith((".tar.gz", ".tgz")):
+            with tarfile.open(path, "r:gz") as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    clean_m = member.name.lstrip("./")
+                    m_ext = Path(clean_m).suffix.lower()
+                    if m_ext not in GP_CATALOG_EXTENSIONS:
+                        continue
+                    title, artist, genre = _infer_entry_metadata(clean_m)
+                    search_text = normalize_ascii(
+                        f"{title} {artist or ''} {genre or ''} {Path(clean_m).stem}"
+                    )
+                    rows.append((f"tar::{rel}::{clean_m}", m_ext, artist, genre, title, search_text))
+        elif ext == ".zip":
+            with zipfile.ZipFile(path, "r") as zf:
+                for info in zf.infolist():
+                    if info.is_dir():
+                        continue
+                    clean_m = info.filename.lstrip("./")
+                    m_ext = Path(clean_m).suffix.lower()
+                    if m_ext not in GP_CATALOG_EXTENSIONS:
+                        continue
+                    title, artist, genre = _infer_entry_metadata(clean_m)
+                    search_text = normalize_ascii(
+                        f"{title} {artist or ''} {genre or ''} {Path(clean_m).stem}"
+                    )
+                    rows.append((f"zip::{rel}::{clean_m}", m_ext, artist, genre, title, search_text))
+
+    return rows
+
+
+def _download_zenodo_record_archives(
+    record_id: str,
+    target_dir: Path,
+    *,
+    token: str | None,
+    force: bool,
+) -> None:
+    clean_id = record_id.strip()
+    if not clean_id.isdigit():
+        raise ValueError(f"Zenodo record ID must be numeric, got: {record_id!r}")
+
+    api_url = validate_https_url(f"https://zenodo.org/api/records/{clean_id}")
+    headers: dict[str, str] = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    resp = requests.get(api_url, headers=headers, timeout=20.0)
+    if resp.status_code in (401, 403):
+        raise RuntimeError(
+            f"Zenodo record {clean_id} requires approved researcher access (HTTP {resp.status_code}). "
+            "Set ZENODO_TOKEN / --zenodo-token after access approval, or index local tabs with --gp-dir."
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    files = data.get("files", []) if isinstance(data, dict) else []
+
+    auth_headers = {"Authorization": f"Bearer {token}"} if token else None
+    downloaded = 0
+    for entry in files:
+        key = str(entry.get("key") or entry.get("filename") or "").strip()
+        if not key or not key.lower().endswith((".tar.gz", ".tgz", ".zip")):
+            continue
+        links = entry.get("links") or {}
+        dl_url = str(links.get("self") or links.get("download") or "").strip()
+        if not dl_url:
+            continue
+        _, clean_key, dest = safe_resolve_member_path(target_dir, key)
+        if force or not dest.exists():
+            download_https_stream(dl_url, dest, headers=auth_headers)
+        downloaded += 1
+        logger.debug("Synced Zenodo GP archive: %s", clean_key)
+
+    if downloaded == 0:
+        raise RuntimeError(
+            f"No .tar.gz or .zip archives found in Zenodo record {clean_id}. "
+            "Supply local Guitar Pro files or archives via --gp-dir."
+        )
+
+
+def build_gp_catalog_duckdb(gp_dir: Path, db_path: Path) -> int:
+    """Scan `gp_dir` and build an indexed `gp_catalog.duckdb` database."""
+    gp_dir = Path(gp_dir)
+    if not gp_dir.exists():
+        raise FileNotFoundError(f"Guitar Pro catalog directory not found: {gp_dir}")
+
+    entries = _collect_gp_entries(gp_dir)
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_db = db_path.with_suffix(".duckdb.tmp")
+    tmp_db.unlink(missing_ok=True)
+
+    with duckdb.connect(str(tmp_db)) as con:
+        con.execute(
+            """
+            CREATE TABLE gp_scores (
+                member_ref VARCHAR PRIMARY KEY,
+                format_ext VARCHAR NOT NULL,
+                artist VARCHAR,
+                genre VARCHAR,
+                title VARCHAR NOT NULL,
+                search_text VARCHAR NOT NULL
+            )
+            """
+        )
+        if entries:
+            con.executemany(
+                "INSERT INTO gp_scores (member_ref, format_ext, artist, genre, title, search_text) VALUES (?, ?, ?, ?, ?, ?)",
+                entries,
+            )
+        row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
+        count = int(row[0]) if row else 0
+
+    tmp_db.replace(db_path)
+    return count
+
+
+def sync_gp_catalog(
+    cache_dir: Path = Path(".transcribe_cache"),
+    *,
+    gp_dir: Path | None = None,
+    zenodo_record: str | None = None,
+    zenodo_token: str | None = None,
+    force: bool = False,
+) -> GpCatalogStatus:
+    """Index a local Guitar Pro / DadaGP folder/archive (or download a Zenodo record) into DuckDB."""
+    target_dir = Path(gp_dir) if gp_dir is not None else (Path(cache_dir) / "dadagp")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if gp_dir is not None:
+        _save_gp_dir_config(cache_dir, target_dir)
+
+    if zenodo_record:
+        resolved_token = (zenodo_token or os.environ.get("ZENODO_TOKEN") or "").strip() or None
+        _download_zenodo_record_archives(
+            zenodo_record,
+            target_dir,
+            token=resolved_token,
+            force=force,
+        )
+
+    build_gp_catalog_duckdb(target_dir, target_dir / "gp_catalog.duckdb")
+    return get_gp_catalog_status(cache_dir)
+
+
+def search_gp_catalog(
+    query: str,
+    *,
+    cache_dir: Path = Path(".transcribe_cache"),
+    allowed_exts: frozenset[str],
+    limit: int = 30,
+) -> list[dict[str, Any]]:
+    """Query the local DuckDB DadaGP / Guitar Pro catalog if synced; returns `[]` otherwise."""
+    gp_dir = resolve_gp_catalog_dir(cache_dir)
+    db_path = gp_dir / "gp_catalog.duckdb"
+    if not db_path.exists():
+        return []
+
+    tokens = [tok for tok in normalize_ascii(query).split() if tok]
+    if not tokens:
+        return []
+
+    target_exts = sorted(allowed_exts & GP_CATALOG_EXTENSIONS)
+    if not target_exts:
+        return []
+
+    where_clauses = ["search_text LIKE '%' || ? || '%'"] * len(tokens)
+    ext_placeholders = ", ".join("?" for _ in target_exts)
+    sql = f"""
+        SELECT member_ref, format_ext, artist, genre, title
+        FROM gp_scores
+        WHERE {" AND ".join(where_clauses)}
+          AND format_ext IN ({ext_placeholders})
+        LIMIT ?
+    """
+    try:
+        with duckdb.connect(str(db_path), read_only=True) as con:
+            rows = con.execute(sql, [*tokens, *target_exts, limit]).fetchall()
+    except duckdb.Error as exc:
+        logger.debug("GP DuckDB query failed: %s", exc)
+        return []
+
+    records: list[dict[str, Any]] = []
+    for member_ref, fmt_ext, artist, genre, title in rows:
+        note_bits = ["Guitar TAB"]
+        if genre:
+            note_bits.append(str(genre))
+        member_part = str(member_ref).rsplit("::", 1)[-1]
+        records.append(
+            {
+                "title": str(title),
+                "composer": str(artist) if artist else None,
+                "format_ext": str(fmt_ext),
+                "source": "DadaGP",
+                "filename": f"{Path(member_part).stem}{fmt_ext}",
+                "edition_note": " · ".join(note_bits),
+                "gp_dir": str(gp_dir),
+                "gp_member": str(member_ref),
+            }
+        )
+    return records
+
+
+def extract_gp_catalog_member(gp_dir: Path | str, member_ref: str, dest: Path) -> Path:
+    """Safely extract a Guitar Pro / tab file from a catalog dir, `.tar.gz`, or `.zip`."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    parts = member_ref.split("::")
+    kind = parts[0]
+    if kind == "file" and len(parts) == 2:
+        _, _, src = safe_resolve_member_path(gp_dir, parts[1])
+        if not src.exists():
+            raise FileNotFoundError(f"Guitar Pro file not found in catalog: {src}")
+        shutil.copy2(src, dest)
+        return dest
+
+    if kind in {"tar", "zip"} and len(parts) == 3:
+        _, clean_archive, archive_path = safe_resolve_member_path(gp_dir, parts[1])
+        _, clean_member, _ = safe_resolve_member_path(gp_dir, parts[2])
+        if not archive_path.exists():
+            raise FileNotFoundError(f"Guitar Pro archive '{clean_archive}' not found in {gp_dir}")
+
+        if kind == "tar":
+            data = read_bounded_tar_member(archive_path, clean_member)
+        else:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                info = None
+                for cand in (clean_member, f"./{clean_member}"):
+                    try:
+                        info = zf.getinfo(cand)
+                        break
+                    except KeyError:
+                        continue
+                if info is None:
+                    raise FileNotFoundError(
+                        f"Member '{clean_member}' not found inside {archive_path}"
+                    )
+                if info.is_dir():
+                    raise ValueError(f"Archive entry '{clean_member}' is not a regular file.")
+                if info.file_size > MAX_MEMBER_BYTES:
+                    raise ValueError(f"Archive entry '{clean_member}' exceeds size limit.")
+                with zf.open(info, "r") as fh:
+                    data = fh.read(MAX_MEMBER_BYTES + 1)
+                if len(data) > MAX_MEMBER_BYTES:
+                    raise ValueError(f"Archive entry '{clean_member}' exceeds size limit.")
+        dest.write_bytes(data)
+        return dest
+
+    raise ValueError(f"Invalid Guitar Pro catalog member reference: {member_ref!r}")
