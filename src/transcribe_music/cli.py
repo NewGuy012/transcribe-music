@@ -83,21 +83,27 @@ def _print_result(res: TranscriptionResult) -> None:
 
 
 def _print_search_results(query: str, results: list[ScoreSearchResult]) -> None:
-    table = Table(title=f"Top {len(results)} Digital Scores for {query!r}")
+    show_details = any(item.edition_note for item in results)
+    table = Table(title=f"Top {len(results)} Scores for {query!r}")
     table.add_column("#", no_wrap=True)
     table.add_column("Format", no_wrap=True)
     table.add_column("Title")
     table.add_column("Composer")
     table.add_column("Source", no_wrap=True)
+    if show_details:
+        table.add_column("Details")
     for idx, item in enumerate(results, start=1):
         fmt_label = item.format_ext.lstrip(".").upper()
-        table.add_row(
+        row = [
             str(idx),
             fmt_label,
             item.title,
             item.composer or "-",
             item.source,
-        )
+        ]
+        if show_details:
+            row.append(item.edition_note or "-")
+        table.add_row(*row)
     console.print(table)
 
 

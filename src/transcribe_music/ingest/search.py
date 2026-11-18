@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import csv
 import html
+import io
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import time
 import unicodedata
+import zipfile
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import music21
 import requests
@@ -50,16 +54,19 @@ _FORMAT_PRIORITY: dict[str, float] = {
 }
 
 _SOURCE_BIAS: dict[str, float] = {
-    "MuseTrainer": 1.1,
+    "OpenScore Orchestra": 1.1,
     "OpenScore Lieder": 1.0,
     "OpenScore StringQuartets": 1.0,
+    "When-in-Rome": 0.95,
+    "Mutopia Project": 0.75,
     "music21 Corpus": 0.6,
-    "Humdrum GitHub": 0.5,
+    "Humdrum GitHub": 0.55,
     "Archive.org": 0.4,
 }
 
 _USER_AGENT = "transcribe-music/0.2 (+https://github.com/transcribe-music)"
 _DEFAULT_INDEX_TTL_SEC = 86_400
+_HUMDRUM_INDEX_TTL_SEC = 7 * 86_400
 _REQUEST_TIMEOUT_SEC = 7.0
 
 _OPENSCORE_LIEDER_INDEX_URL = (
@@ -72,44 +79,52 @@ _OPENSCORE_SQ_TSV_URL = (
 )
 _OPENSCORE_SQ_RAW_PREFIX = "https://raw.githubusercontent.com/OpenScore/StringQuartets/main/scores/"
 
-_MUSETRAINER_TREE_URL = (
-    "https://api.github.com/repos/musetrainer/library/git/trees/master?recursive=1"
+_OPENSCORE_ORCH_TREE_URL = (
+    "https://api.github.com/repos/MarkGotham/Hauptstimme/git/trees/main?recursive=1"
 )
-_MUSETRAINER_RAW_PREFIX = "https://raw.githubusercontent.com/musetrainer/library/master/"
+_OPENSCORE_ORCH_RAW_PREFIX = "https://raw.githubusercontent.com/MarkGotham/Hauptstimme/main/"
 
-_HUMDRUM_GITHUB_REPOS: tuple[tuple[str, str, str], ...] = (
-    ("craigsapp/beethoven-piano-sonatas", "master", "Ludwig van Beethoven"),
-    ("craigsapp/mozart-piano-sonatas", "master", "Wolfgang Amadeus Mozart"),
-    ("craigsapp/bach-370-chorales", "master", "Johann Sebastian Bach"),
-    ("craigsapp/joplin", "master", "Scott Joplin"),
+_WHEN_IN_ROME_TREE_URL = (
+    "https://api.github.com/repos/MarkGotham/When-in-Rome/git/trees/master?recursive=1"
 )
+_WHEN_IN_ROME_RAW_PREFIX = "https://raw.githubusercontent.com/MarkGotham/When-in-Rome/master/"
+
+_HUMDRUM_LIST_URL = (
+    "https://raw.githubusercontent.com/humdrum-tools/humdrum-data/master/.lists/LIST.txt"
+)
+# Curated classical Humdrum repositories with composer metadata and fallback branch/group labels.
+_HUMDRUM_CLASSICAL_META: dict[str, tuple[str | None, str]] = {
+    "musedata/vivaldi": ("Antonio Vivaldi", "Concertos"),
+    "musedata/humdrum-bach-brandenburg": ("Johann Sebastian Bach", "Brandenburg Concertos"),
+    "musedata/humdrum-corelli": ("Arcangelo Corelli", "Corelli"),
+    "musedata/humdrum-haydn-symphonies": ("Joseph Haydn", "Symphonies"),
+    "musedata/humdrum-haydn-quartets": ("Joseph Haydn", "String Quartets"),
+    "musedata/humdrum-mozart-quartets": ("Wolfgang Amadeus Mozart", "String Quartets"),
+    "craigsapp/beethoven-piano-sonatas": ("Ludwig van Beethoven", "Piano Sonatas"),
+    "craigsapp/beethoven-string-quartets": ("Ludwig van Beethoven", "String Quartets"),
+    "craigsapp/mozart-piano-sonatas": ("Wolfgang Amadeus Mozart", "Piano Sonatas"),
+    "craigsapp/haydn-piano-sonatas": ("Joseph Haydn", "Piano Sonatas"),
+    "craigsapp/bach-370-chorales": ("Johann Sebastian Bach", "370 Chorales"),
+    "craigsapp/art-of-the-fugue": ("Johann Sebastian Bach", "Art of the Fugue"),
+    "craigsapp/bach-musical-offering": ("Johann Sebastian Bach", "Musical Offering"),
+    "craigsapp/chopin-mazurkas": ("Frederic Chopin", "Mazurkas"),
+    "craigsapp/chopin-preludes": ("Frederic Chopin", "Preludes"),
+    "craigsapp/scarlatti-keyboard-sonatas": ("Domenico Scarlatti", "Keyboard Sonatas"),
+    "craigsapp/hummel-preludes": ("Johann Nepomuk Hummel", "Preludes"),
+    "craigsapp/joplin": ("Scott Joplin", "Ragtime"),
+    "humdrum-tools/bach-wtc": ("Johann Sebastian Bach", "Well-Tempered Clavier"),
+    "humdrum-tools/inventions": ("Johann Sebastian Bach", "Inventions"),
+    "humdrum-tools/schubert-songs": ("Franz Schubert", "Songs"),
+    "pl-wnifc/humdrum-chopin-first-editions": ("Frederic Chopin", "First Editions"),
+    "pl-wnifc/humdrum-polish-scores": (None, "Polish Heritage Scores"),
+}
+
+_MUTOPIA_SEARCH_URL = "https://www.mutopiaproject.org/cgibin/make-table.cgi"
+_MUTOPIA_BASE_URL = "https://www.mutopiaproject.org/cgibin/"
 
 _ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php"
 _ARCHIVE_METADATA_URL = "https://archive.org/metadata/{identifier}"
 _ARCHIVE_DOWNLOAD_URL = "https://archive.org/download/{identifier}/{filename}"
-
-_KNOWN_COMPOSERS: tuple[str, ...] = (
-    "Bach",
-    "Beethoven",
-    "Brahms",
-    "Chopin",
-    "Debussy",
-    "Dvorak",
-    "Handel",
-    "Haydn",
-    "Joplin",
-    "Liszt",
-    "Mendelssohn",
-    "Mozart",
-    "Pachelbel",
-    "Rachmaninoff",
-    "Ravel",
-    "Satie",
-    "Schubert",
-    "Schumann",
-    "Tchaikovsky",
-    "Vivaldi",
-)
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -168,11 +183,27 @@ def _encode_url_path(path: str) -> str:
     return quote(path.lstrip("/"), safe="/")
 
 
-def _http_get_json(url: str, params: dict[str, Any] | None = None, timeout: float = _REQUEST_TIMEOUT_SEC) -> Any:
+def _github_headers() -> dict[str, str]:
+    headers = {"User-Agent": _USER_AGENT, "Accept": "application/vnd.github+json"}
+    token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _http_get_json(
+    url: str,
+    params: dict[str, Any] | None = None,
+    timeout: float = _REQUEST_TIMEOUT_SEC,
+    headers: dict[str, str] | None = None,
+) -> Any:
+    req_headers = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
     resp = requests.get(
         url,
         params=params,
-        headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        headers=req_headers,
         timeout=timeout,
     )
     resp.raise_for_status()
@@ -186,7 +217,13 @@ def _http_get_text(url: str, timeout: float = _REQUEST_TIMEOUT_SEC) -> str:
         timeout=timeout,
     )
     resp.raise_for_status()
-    return resp.text
+    return resp.content.decode("utf-8", errors="replace")
+
+
+def _fetch_github_tree(tree_url: str) -> list[dict[str, Any]]:
+    data = _http_get_json(tree_url, headers=_github_headers(), timeout=12.0)
+    tree = data.get("tree", []) if isinstance(data, dict) else []
+    return [node for node in tree if isinstance(node, dict) and node.get("type") == "blob"]
 
 
 def _load_or_fetch_index(
@@ -224,34 +261,64 @@ def _load_or_fetch_index(
     return records
 
 
-def _fetch_musetrainer_index() -> list[dict[str, Any]]:
-    data = _http_get_json(_MUSETRAINER_TREE_URL)
-    tree = data.get("tree", []) if isinstance(data, dict) else []
+def _fetch_openscore_orchestra_index() -> list[dict[str, Any]]:
+    tree = _fetch_github_tree(_OPENSCORE_ORCH_TREE_URL)
     records: list[dict[str, Any]] = []
     for node in tree:
         rel_path = str(node.get("path", ""))
-        if not rel_path.startswith("scores/"):
+        if not rel_path.startswith("data/") or not rel_path.lower().endswith(".mxl"):
             continue
-        ext = Path(rel_path).suffix.lower()
-        if ext not in SUPPORTED_SEARCH_EXTENSIONS:
+        if rel_path.lower().endswith("_melody.mxl"):
             continue
+        parts = Path(rel_path).parts
+        # Expected: data/<Composer>/<Work>/<Movement>/<file>.mxl
+        composer = _format_composer_name(parts[1]) if len(parts) >= 3 else None
+        work = parts[2].replace("_", " ").strip() if len(parts) >= 3 else Path(rel_path).stem
+        movement = parts[3].replace("_", " ").strip() if len(parts) >= 5 else ""
+        title = f"{work} ({movement})" if movement else work
         filename = Path(rel_path).name
-        stem = Path(rel_path).stem
-        title = " ".join(stem.replace("_", " ").split())
-        composer: str | None = None
-        norm_title = _normalize_text(title)
-        for cand in _KNOWN_COMPOSERS:
-            if cand.lower() in norm_title.split():
-                composer = cand
-                break
         records.append(
             {
                 "title": title,
                 "composer": composer,
-                "format_ext": ext,
-                "source": "MuseTrainer",
-                "filename": filename,
-                "download_url": f"{_MUSETRAINER_RAW_PREFIX}{_encode_url_path(rel_path)}",
+                "format_ext": ".mxl",
+                "source": "OpenScore Orchestra",
+                "filename": _safe_filename(filename, fallback_ext=".mxl"),
+                "download_url": f"{_OPENSCORE_ORCH_RAW_PREFIX}{_encode_url_path(rel_path)}",
+            }
+        )
+    return records
+
+
+def _fetch_when_in_rome_index() -> list[dict[str, Any]]:
+    tree = _fetch_github_tree(_WHEN_IN_ROME_TREE_URL)
+    records: list[dict[str, Any]] = []
+    for node in tree:
+        rel_path = str(node.get("path", ""))
+        if not rel_path.startswith("Corpus/") or not rel_path.lower().endswith(".mxl"):
+            continue
+        parts = Path(rel_path).parts
+        # Expected: Corpus/<Category>/<Composer>/<Work>/<Movement>/score.mxl
+        if len(parts) < 5:
+            continue
+        category = parts[1]
+        if category in {"Textbooks", "OpenScore-LiederCorpus"}:
+            continue
+        composer = _format_composer_name(parts[2])
+        work = parts[3].replace("_", " ").strip()
+        movement = parts[4].replace("_", " ").strip() if len(parts) >= 6 else ""
+        title = f"{work} ({movement})" if movement else work
+        cat_label = category.replace("_", " ").strip()
+        filename = f"{work}_{movement or 'score'}.mxl"
+        records.append(
+            {
+                "title": title,
+                "composer": composer,
+                "format_ext": ".mxl",
+                "source": "When-in-Rome",
+                "filename": _safe_filename(filename, fallback_ext=".mxl"),
+                "edition_note": cat_label,
+                "download_url": f"{_WHEN_IN_ROME_RAW_PREFIX}{_encode_url_path(rel_path)}",
             }
         )
     return records
@@ -316,46 +383,295 @@ def _fetch_openscore_sq_index() -> list[dict[str, Any]]:
     return records
 
 
-def _fetch_humdrum_github_index() -> list[dict[str, Any]]:
+def _parse_humdrum_list_repos(text: str) -> list[str]:
+    repos: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        if not line or line.startswith(("!", "*")):
+            continue
+        cols = line.split("\t")
+        if len(cols) < 2:
+            continue
+        owner = cols[0].strip()
+        repo = cols[1].strip()
+        if not owner or not repo:
+            continue
+        slug = f"{owner}/{repo}"
+        if slug not in seen:
+            seen.add(slug)
+            repos.append(slug)
+    return repos
+
+
+def _parse_hmd_index_records(text: str, repo: str, composer: str | None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for repo, branch, composer in _HUMDRUM_GITHUB_REPOS:
-        url = f"https://raw.githubusercontent.com/{repo}/{branch}/index.hmd"
-        try:
-            text = _http_get_text(url)
-        except Exception as exc:  # noqa: BLE001 — skip unreachable Humdrum sub-repo
-            logger.debug("Skipping Humdrum index %s: %s", repo, exc)
+    group_titles: dict[str, str] = {}
+    repo_stem = Path(repo).name
+    for line in text.splitlines():
+        if not line or line.startswith(("!", "*")):
+            continue
+        cols = line.split("\t")
+        if len(cols) < 5:
+            continue
+        file_col, sort_col, available_col, _pdf_col, desc_col = cols[:5]
+        desc = _strip_html(desc_col)
+        if file_col.startswith("@"):
+            prefix = sort_col.split("-", 1)[0]
+            if prefix and desc:
+                group_titles[prefix] = desc
+            continue
+        if available_col.strip().upper() == "N":
+            continue
+        ext = Path(file_col).suffix.lower()
+        if ext not in SUPPORTED_SEARCH_EXTENSIONS:
+            continue
+        prefix = sort_col.split("-", 1)[0]
+        parent_title = group_titles.get(prefix, "")
+        title = (
+            f"{parent_title} - {desc}"
+            if parent_title and desc
+            else (desc or parent_title or Path(file_col).stem)
+        )
+        records.append(
+            {
+                "title": title,
+                "composer": composer,
+                "format_ext": ext,
+                "source": "Humdrum GitHub",
+                "filename": _safe_filename(f"{repo_stem}_{Path(file_col).name}", fallback_ext=ext),
+                "download_url": f"https://raw.githubusercontent.com/{repo}/HEAD/{_encode_url_path(file_col)}",
+            }
+        )
+    return records
+
+
+def _fetch_single_humdrum_repo(repo: str) -> list[dict[str, Any]]:
+    composer, group_label = _HUMDRUM_CLASSICAL_META.get(repo, (None, Path(repo).name))
+    hmd_url = f"https://raw.githubusercontent.com/{repo}/HEAD/index.hmd"
+    try:
+        text = _http_get_text(hmd_url)
+        return _parse_hmd_index_records(text, repo, composer)
+    except (requests.RequestException, ValueError, OSError, RuntimeError) as exc:
+        logger.debug("No index.hmd for %s: %s", repo, exc)
+
+    if repo not in _HUMDRUM_CLASSICAL_META:
+        return []
+
+    tree_url = f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1"
+    try:
+        tree = _fetch_github_tree(tree_url)
+    except (requests.RequestException, ValueError, OSError, RuntimeError) as exc:
+        logger.debug("Skipping Humdrum repo %s: %s", repo, exc)
+        return []
+
+    records: list[dict[str, Any]] = []
+    repo_stem = Path(repo).name
+    for node in tree:
+        rel_path = str(node.get("path", ""))
+        ext = Path(rel_path).suffix.lower()
+        if ext not in SUPPORTED_SEARCH_EXTENSIONS:
+            continue
+        parts = Path(rel_path).parts
+        sub_label = ""
+        for part in parts[:-1]:
+            if part.lower() not in {"kern", "krn", "data", "scores"}:
+                sub_label = part.replace("_", " ").replace("-", " ").strip()
+                break
+        stem_label = " ".join(Path(rel_path).stem.replace("_", " ").replace("-", " ").split())
+        title = f"{group_label} - {sub_label} ({stem_label})" if sub_label else f"{group_label} - {stem_label}"
+        records.append(
+            {
+                "title": title,
+                "composer": composer,
+                "format_ext": ext,
+                "source": "Humdrum GitHub",
+                "filename": _safe_filename(f"{repo_stem}_{Path(rel_path).name}", fallback_ext=ext),
+                "download_url": f"https://raw.githubusercontent.com/{repo}/HEAD/{_encode_url_path(rel_path)}",
+            }
+        )
+    return records
+
+
+def _fetch_humdrum_github_index() -> list[dict[str, Any]]:
+    candidate_repos = list(_HUMDRUM_CLASSICAL_META.keys())
+    try:
+        list_text = _http_get_text(_HUMDRUM_LIST_URL)
+        discovered = _parse_humdrum_list_repos(list_text)
+        seen = set(candidate_repos)
+        for slug in discovered:
+            if slug in seen:
+                continue
+            owner = slug.split("/", 1)[0]
+            if owner in {"craigsapp", "musedata", "humdrum-tools", "pl-wnifc", "polyrhythm-project", "TassoInMusicProject"}:
+                seen.add(slug)
+                candidate_repos.append(slug)
+    except (requests.RequestException, ValueError, OSError) as exc:
+        logger.debug("Using fallback classical Humdrum list: %s", exc)
+
+    records: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(_fetch_single_humdrum_repo, repo) for repo in candidate_repos]
+        for fut in as_completed(futures):
+            records.extend(fut.result())
+    return records
+
+
+class _MutopiaTableParser(HTMLParser):
+    """Parse Mutopia Project make-table.cgi result tables into structured entries."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entries: list[dict[str, Any]] = []
+        self._in_result_table = False
+        self._table_depth = 0
+        self._in_row = False
+        self._in_cell = False
+        self._current_rows: list[list[str]] = []
+        self._current_row: list[str] = []
+        self._current_cell_parts: list[str] = []
+        self._current_links: list[tuple[str, str]] = []
+        self._current_href: str | None = None
+        self._current_link_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = dict(attrs)
+        if tag == "table":
+            cls = attr_map.get("class") or ""
+            if "result-table" in cls and not self._in_result_table:
+                self._in_result_table = True
+                self._table_depth = 1
+                self._current_rows = []
+                self._current_links = []
+                return
+            if self._in_result_table:
+                self._table_depth += 1
+        if not self._in_result_table:
+            return
+        if tag == "tr":
+            self._in_row = True
+            self._current_row = []
+        elif tag in {"td", "th"} and self._in_row:
+            self._in_cell = True
+            self._current_cell_parts = []
+        elif tag == "a" and self._in_cell:
+            self._current_href = attr_map.get("href")
+            self._current_link_text = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._in_result_table:
+            return
+        if tag == "a" and self._current_href is not None:
+            link_label = " ".join("".join(self._current_link_text).split())
+            self._current_links.append((self._current_href, link_label))
+            self._current_href = None
+            self._current_link_text = []
+        elif tag in {"td", "th"} and self._in_cell:
+            cell_txt = " ".join("".join(self._current_cell_parts).replace("\xa0", " ").split())
+            self._current_row.append(cell_txt)
+            self._in_cell = False
+        elif tag == "tr" and self._in_row:
+            if self._current_row:
+                self._current_rows.append(self._current_row)
+            self._in_row = False
+        elif tag == "table":
+            self._table_depth -= 1
+            if self._table_depth <= 0:
+                self._in_result_table = False
+                self.entries.append(
+                    {"rows": self._current_rows, "links": self._current_links}
+                )
+
+    def handle_data(self, data: str) -> None:
+        if self._in_cell:
+            self._current_cell_parts.append(data)
+            if self._current_href is not None:
+                self._current_link_text.append(data)
+
+
+def _clean_mutopia_composer(raw: str) -> str | None:
+    text = raw.strip()
+    if text.lower().startswith("by "):
+        text = text[3:].strip()
+    text = re.sub(r"\s*\([^)]*\d{3,4}[^)]*\)\s*$", "", text).strip()
+    return text or None
+
+
+def _search_mutopia(query: str, allowed_exts: frozenset[str]) -> list[dict[str, Any]]:
+    try:
+        resp = requests.get(
+            _MUTOPIA_SEARCH_URL,
+            params={"searchingfor": query},
+            headers={"User-Agent": _USER_AGENT},
+            timeout=_REQUEST_TIMEOUT_SEC,
+        )
+        resp.raise_for_status()
+        html_text = resp.content.decode("utf-8", errors="replace")
+    except (requests.RequestException, ValueError, OSError):
+        return []
+
+    parser = _MutopiaTableParser()
+    parser.feed(html_text)
+
+    records: list[dict[str, Any]] = []
+    for entry in parser.entries[:12]:
+        rows: list[list[str]] = entry["rows"]
+        links: list[tuple[str, str]] = entry["links"]
+        if not rows or not rows[0]:
             continue
 
-        group_titles: dict[str, str] = {}
-        for line in text.splitlines():
-            if not line or line.startswith(("!", "*")):
+        title = rows[0][0].strip()
+        composer = _clean_mutopia_composer(rows[0][1]) if len(rows[0]) > 1 else None
+        opus = rows[0][2].strip() if len(rows[0]) > 2 and rows[0][2].strip() else ""
+        if opus and opus.lower() not in title.lower():
+            title = f"{title} ({opus})"
+
+        instrumentation = rows[1][0].strip() if len(rows) > 1 and rows[1] else ""
+        style = rows[1][2].strip() if len(rows) > 1 and len(rows[1]) > 2 else ""
+        note_parts = [p for p in (instrumentation, style) if p]
+        base_note = " · ".join(note_parts) if note_parts else None
+
+        page_url: str | None = None
+        mid_url: str | None = None
+        mid_is_zip = False
+        ly_url: str | None = None
+        pdf_url: str | None = None
+
+        for href, _label in links:
+            abs_href = urljoin(_MUTOPIA_BASE_URL, href)
+            lower = abs_href.lower()
+            if "piece-info.cgi" in lower:
+                page_url = abs_href
+            elif lower.endswith(".mid") and mid_url is None:
+                mid_url = abs_href
+                mid_is_zip = False
+            elif lower.endswith("-mids.zip") and mid_url is None:
+                mid_url = abs_href
+                mid_is_zip = True
+            elif lower.endswith(".ly") and ly_url is None:
+                ly_url = abs_href
+            elif lower.endswith(("-a4.pdf", "-let.pdf")) and pdf_url is None:
+                pdf_url = abs_href
+
+        candidates = [
+            (".mid", mid_url, f"{base_note} (MIDI archive)" if base_note and mid_is_zip else base_note),
+            (".ly", ly_url, base_note),
+            (".pdf", pdf_url, base_note),
+        ]
+        for ext, url, note in candidates:
+            if not url or ext not in allowed_exts:
                 continue
-            cols = line.split("\t")
-            if len(cols) < 5:
-                continue
-            file_col, sort_col, available_col, _pdf_col, desc_col = cols[:5]
-            desc = _strip_html(desc_col)
-            if file_col.startswith("@"):
-                prefix = sort_col.split("-", 1)[0]
-                if prefix and desc:
-                    group_titles[prefix] = desc
-                continue
-            if available_col.strip().upper() == "N":
-                continue
-            ext = Path(file_col).suffix.lower()
-            if ext not in SUPPORTED_SEARCH_EXTENSIONS:
-                continue
-            prefix = sort_col.split("-", 1)[0]
-            parent_title = group_titles.get(prefix, "")
-            title = f"{parent_title} - {desc}" if parent_title and desc else (desc or parent_title or Path(file_col).stem)
+            url_name = Path(url.split("?", 1)[0]).name
+            fname_base = url_name.removesuffix("-mids.zip") if mid_is_zip and ext == ".mid" else url_name
             records.append(
                 {
                     "title": title,
                     "composer": composer,
                     "format_ext": ext,
-                    "source": "Humdrum GitHub",
-                    "filename": _safe_filename(f"{Path(repo).name}_{Path(file_col).name}", fallback_ext=ext),
-                    "download_url": f"https://raw.githubusercontent.com/{repo}/{branch}/{_encode_url_path(file_col)}",
+                    "source": "Mutopia Project",
+                    "filename": _safe_filename(fname_base, fallback_ext=ext),
+                    "download_url": url,
+                    "page_url": page_url,
+                    "edition_note": note,
                 }
             )
     return records
@@ -624,21 +940,35 @@ def search_digital_scores(
     allowed_exts = _normalize_allowed_formats(formats, musicxml_only=musicxml_only)
     raw_records: list[dict[str, Any]] = []
 
-    def _safe_index(name: str, fetcher: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    def _safe_index(
+        name: str,
+        fetcher: Callable[[], list[dict[str, Any]]],
+        *,
+        ttl_sec: int = _DEFAULT_INDEX_TTL_SEC,
+    ) -> list[dict[str, Any]]:
         try:
-            return _load_or_fetch_index(cache_dir, name, fetcher, allow_network=include_remote)
-        except Exception:  # noqa: BLE001 — resilient multi-source aggregation
+            return _load_or_fetch_index(
+                cache_dir,
+                name,
+                fetcher,
+                allow_network=include_remote,
+                ttl_sec=ttl_sec,
+            )
+        except (requests.RequestException, ValueError, OSError, RuntimeError) as exc:
+            logger.debug("Skipping search index %s: %s", name, exc)
             return []
 
     tasks: list[Callable[[], list[dict[str, Any]]]] = [
-        lambda: _safe_index("musetrainer_library", _fetch_musetrainer_index),
+        lambda: _safe_index("openscore_orchestra", _fetch_openscore_orchestra_index),
         lambda: _safe_index("openscore_lieder", _fetch_openscore_lieder_index),
         lambda: _safe_index("openscore_stringquartets", _fetch_openscore_sq_index),
-        lambda: _safe_index("humdrum_github", _fetch_humdrum_github_index),
+        lambda: _safe_index("when_in_rome", _fetch_when_in_rome_index),
+        lambda: _safe_index("humdrum_github", _fetch_humdrum_github_index, ttl_sec=_HUMDRUM_INDEX_TTL_SEC),
     ]
     if include_local:
         tasks.append(lambda: _search_music21_corpus(clean_query))
     if include_remote:
+        tasks.append(lambda: _search_mutopia(clean_query, allowed_exts))
         tasks.append(
             lambda: _search_archive_org(clean_query, allowed_exts, musicxml_only=musicxml_only)
         )
@@ -675,6 +1005,8 @@ def search_digital_scores(
                 source=str(rec["source"]),
                 filename=str(rec["filename"]),
                 download_url=rec.get("download_url"),
+                page_url=rec.get("page_url"),
+                edition_note=rec.get("edition_note"),
                 local_corpus_path=rec.get("local_corpus_path"),
                 archive_identifier=rec.get("archive_identifier"),
                 score=score,
@@ -733,7 +1065,22 @@ def download_score_result(
     if not resp.content:
         raise RuntimeError(f"Downloaded file was empty: {download_url}")
 
+    payload = resp.content
+    if result.format_ext in {".mid", ".midi"} and payload[:4] == b"PK\x03\x04":
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            midi_members = sorted(
+                name
+                for name in zf.namelist()
+                if Path(name).suffix.lower() in {".mid", ".midi"} and not name.endswith("/")
+            )
+            if not midi_members:
+                raise RuntimeError(f"MIDI archive contained no .mid files: {download_url}")
+            for extra in midi_members[1:]:
+                extra_dest = dest.parent / _safe_filename(Path(extra).name, fallback_ext=".mid")
+                extra_dest.write_bytes(zf.read(extra))
+            payload = zf.read(midi_members[0])
+
     tmp_dest = dest.with_suffix(f"{dest.suffix}.tmp")
-    tmp_dest.write_bytes(resp.content)
+    tmp_dest.write_bytes(payload)
     tmp_dest.replace(dest)
     return dest

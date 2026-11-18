@@ -34,16 +34,24 @@ def _make_sample_mxl_bytes(tmp_path: Path, title: str = "Moonlight Study") -> by
 def _stub_remote_sources(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    musetrainer: Callable[[], list[dict[str, Any]]] = list,
+    orchestra: Callable[[], list[dict[str, Any]]] = list,
     lieder: Callable[[], list[dict[str, Any]]] = list,
     quartets: Callable[[], list[dict[str, Any]]] = list,
+    when_in_rome: Callable[[], list[dict[str, Any]]] = list,
     humdrum: Callable[[], list[dict[str, Any]]] = list,
+    mutopia: Callable[..., list[dict[str, Any]]] | None = None,
     archive: Callable[..., list[dict[str, Any]]] | None = None,
 ) -> None:
-    monkeypatch.setattr(search_mod, "_fetch_musetrainer_index", musetrainer)
+    monkeypatch.setattr(search_mod, "_fetch_openscore_orchestra_index", orchestra)
     monkeypatch.setattr(search_mod, "_fetch_openscore_lieder_index", lieder)
     monkeypatch.setattr(search_mod, "_fetch_openscore_sq_index", quartets)
+    monkeypatch.setattr(search_mod, "_fetch_when_in_rome_index", when_in_rome)
     monkeypatch.setattr(search_mod, "_fetch_humdrum_github_index", humdrum)
+    monkeypatch.setattr(
+        search_mod,
+        "_search_mutopia",
+        mutopia if mutopia is not None else (lambda *_a, **_kw: []),
+    )
     monkeypatch.setattr(
         search_mod,
         "_search_archive_org",
@@ -56,12 +64,12 @@ def test_search_prefers_musicxml_over_other_formats_and_caps_top_5(
 ) -> None:
     _stub_remote_sources(
         monkeypatch,
-        musetrainer=lambda: [
+        when_in_rome=lambda: [
             {
                 "title": "Sonate No 14 Moonlight 1st Movement",
                 "composer": "Beethoven",
                 "format_ext": ".mxl",
-                "source": "MuseTrainer",
+                "source": "When-in-Rome",
                 "filename": "Sonate_No._14_Moonlight_1st_Movement.mxl",
                 "download_url": "https://example.com/moonlight_1.mxl",
             },
@@ -69,7 +77,7 @@ def test_search_prefers_musicxml_over_other_formats_and_caps_top_5(
                 "title": "Moonlight Sonata 3rd Movement",
                 "composer": "Beethoven",
                 "format_ext": ".mxl",
-                "source": "MuseTrainer",
+                "source": "When-in-Rome",
                 "filename": "moonlight_sonata_3rd_movement.mxl",
                 "download_url": "https://example.com/moonlight_3.mxl",
             },
@@ -149,7 +157,7 @@ def test_search_diacritics_and_remote_resilience(
 
     _stub_remote_sources(
         monkeypatch,
-        musetrainer=_boom,
+        orchestra=_boom,
         lieder=lambda: [
             {
                 "title": "Der Erlkönig",
@@ -204,7 +212,7 @@ def test_search_supports_all_digital_format_filters(
         }
         for ext in (".gp5", ".mscz", ".mei", ".abc", ".krn", ".mid", ".mxl")
     ]
-    _stub_remote_sources(monkeypatch, musetrainer=lambda: sample_records)
+    _stub_remote_sources(monkeypatch, orchestra=lambda: sample_records)
 
     gp_only = search_digital_scores(
         "Study Piece",
@@ -230,12 +238,12 @@ def test_cli_search_interactive_select_cancel_and_convert(
 
     _stub_remote_sources(
         monkeypatch,
-        musetrainer=lambda: [
+        when_in_rome=lambda: [
             {
                 "title": "Moonlight Sonata 1st Movement",
                 "composer": "Ludwig van Beethoven",
                 "format_ext": ".mxl",
-                "source": "MuseTrainer",
+                "source": "When-in-Rome",
                 "filename": "../../evil_path/moonlight.mxl",
                 "download_url": "https://example.com/moonlight.mxl",
             },
@@ -303,3 +311,94 @@ def test_cli_search_interactive_select_cancel_and_convert(
     assert conv_res.exit_code == 0, conv_res.stdout
     assert "MusicXML Ready" in conv_res.stdout
     assert (conv_dir / "moonlight.mxl").exists()
+
+
+def test_new_catalog_parsers_orchestra_when_in_rome_humdrum_and_mutopia(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import io
+    import zipfile
+
+    # 1. OpenScore Orchestra (Hauptstimme) skips _melody.mxl and parses full scores
+    monkeypatch.setattr(
+        search_mod,
+        "_fetch_github_tree",
+        lambda url: (
+            [
+                {"path": "data/Haydn,_Franz/Symphony_No.104/01/Haydn_104_01.mxl"},
+                {"path": "data/Haydn,_Franz/Symphony_No.104/01/Haydn_104_01_melody.mxl"},
+            ]
+            if "Hauptstimme" in url
+            else [
+                {"path": "Corpus/Piano_Sonatas/Mozart,_Wolfgang_Amadeus/K331/01/score.mxl"},
+                {"path": "Corpus/Textbooks/Reger,_Max/ex01/score.mxl"},
+                {"path": "Corpus/OpenScore-LiederCorpus/Schubert,_Franz/song/score.mxl"},
+            ]
+        ),
+    )
+    orch = search_mod._fetch_openscore_orchestra_index()
+    assert len(orch) == 1
+    assert orch[0]["composer"] == "Franz Haydn"
+    assert orch[0]["title"] == "Symphony No.104 (01)"
+
+    wir = search_mod._fetch_when_in_rome_index()
+    assert len(wir) == 1
+    assert wir[0]["composer"] == "Wolfgang Amadeus Mozart"
+    assert wir[0]["title"] == "K331 (01)"
+
+    # 2. Humdrum manifest parser & tree-based classical .krn fallback
+    repos = search_mod._parse_humdrum_list_repos(
+        "!! comment\n**ghname\t**ghrepo\nmusedata\tvivaldi\tfoo\tbar\nmusedata\tvivaldi\tbaz\tqux\n"
+    )
+    assert repos == ["musedata/vivaldi"]
+
+    monkeypatch.setattr(
+        search_mod,
+        "_http_get_text",
+        lambda url: (_ for _ in ()).throw(RuntimeError("404")) if "index.hmd" in url else "",
+    )
+    monkeypatch.setattr(
+        search_mod,
+        "_fetch_github_tree",
+        lambda _url: [{"path": "op01/kern/vivaldi-op01n01m01.krn"}],
+    )
+    vivaldi_recs = search_mod._fetch_single_humdrum_repo("musedata/vivaldi")
+    assert len(vivaldi_recs) == 1
+    assert vivaldi_recs[0]["composer"] == "Antonio Vivaldi"
+    assert vivaldi_recs[0]["format_ext"] == ".krn"
+
+    # 3. Mutopia HTML table parser (with UTF-8 bytes) & MIDI zip unpacking
+    mutopia_html = """
+    <table class="table-bordered result-table">
+      <tr><td>Cello Concerto Cadenza</td><td>by C. Brey (1954–)</td><td>Hob. VIIb:2</td><td></td></tr>
+      <tr><td>for Cello</td><td>2001</td><td>Classical</td><td></td></tr>
+      <tr><td>Ed.</td><td>Public Domain</td><td><a href="piece-info.cgi?id=10">More Information</a></td><td></td></tr>
+      <tr>
+        <td class="zipped"><a href="https://www.mutopiaproject.org/ftp/BreyC/cadenza/cadenza-mids.zip">.mid files (zipped)</a></td>
+        <td><a href="https://www.mutopiaproject.org/ftp/BreyC/cadenza/cadenza.ly">.ly file</a></td>
+      </tr>
+    </table>
+    """.encode()
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        zf.writestr("01_allegro.mid", b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60")
+        zf.writestr("02_adagio.mid", b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60")
+
+    def _fake_mutopia_get(url: str, **_kwargs: object) -> SimpleNamespace:
+        if "make-table.cgi" in url:
+            return SimpleNamespace(content=mutopia_html, raise_for_status=lambda: None)
+        return SimpleNamespace(content=zip_buf.getvalue(), headers={}, url=url, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(search_mod.requests, "get", _fake_mutopia_get)
+    mut_recs = search_mod._search_mutopia("haydn cello", frozenset({".mid", ".ly"}))
+    assert len(mut_recs) == 2
+    mid_rec = next(r for r in mut_recs if r["format_ext"] == ".mid")
+    assert mid_rec["composer"] == "C. Brey"
+    assert "Hob. VIIb:2" in mid_rec["title"]
+
+    hit = search_mod.ScoreSearchResult(**mid_rec, score=20.0)
+    saved_mid = download_score_result(hit, download_dir=tmp_path / "mutopia_dl")
+    assert saved_mid.exists()
+    assert saved_mid.read_bytes().startswith(b"MThd")
+    assert (tmp_path / "mutopia_dl" / "02_adagio.mid").exists()

@@ -165,6 +165,8 @@ class ScoreSearchResult(BaseModel):
     source: str
     filename: str
     download_url: str | None = None
+    page_url: str | None = None
+    edition_note: str | None = None
     local_corpus_path: str | None = None
     archive_identifier: str | None = None
     score: float = 0.0
