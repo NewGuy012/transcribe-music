@@ -1,5 +1,7 @@
 """transcribe-music public Python SDK."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import (
     ManualDownloadRequiredError,
@@ -23,7 +25,10 @@ from transcribe_music.pipeline import (
     transcribe_score,
 )
 
-__version__ = "0.2.0"
+try:
+    __version__ = version("transcribe-music")
+except PackageNotFoundError:
+    __version__ = "0.2.0"
 
 __all__ = [
     "Instrument",

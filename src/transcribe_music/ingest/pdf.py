@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pymupdf
-
 
 def render_pdf_pages(
     pdf_path: Path,
@@ -18,6 +16,14 @@ def render_pdf_pages(
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
     if pdf_path.suffix.lower() != ".pdf":
         raise ValueError(f"Sheet music input must be a .pdf file, got: {pdf_path.suffix}")
+
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF OMR fallback requires the optional 'pdf' extra (`pymupdf`). "
+            "Install with: uv sync --extra pdf"
+        ) from exc
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

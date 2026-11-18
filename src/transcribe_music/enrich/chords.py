@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import music21
-import numpy as np
 
 from transcribe_music.export.musicxml import is_playable_chord
 
@@ -25,40 +25,44 @@ _QUALITIES: list[tuple[str, tuple[int, ...], float]] = [
 class _ChordTemplate:
     symbol: str
     root_pc: int
-    vector: np.ndarray
+    vector: tuple[float, ...]
 
 
 def _build_templates() -> list[_ChordTemplate]:
     templates: list[_ChordTemplate] = []
     for root_pc, root_name in enumerate(_ROOT_NAMES):
         for suffix, intervals, prior_weight in _QUALITIES:
-            vec = np.zeros(12, dtype=np.float64)
+            vec = [0.0] * 12
             for idx, interval in enumerate(intervals):
                 pc = (root_pc + interval) % 12
-                # Root and 3rd carry highest harmonic weight
                 vec[pc] = 1.0 if idx == 0 else (0.85 if idx == 1 else 0.7)
-            vec = vec / (np.linalg.norm(vec) + 1e-8) * prior_weight
-            templates.append(_ChordTemplate(symbol=f"{root_name}{suffix}", root_pc=root_pc, vector=vec))
+            scale = prior_weight / (math.hypot(*vec) + 1e-8)
+            templates.append(
+                _ChordTemplate(
+                    symbol=f"{root_name}{suffix}",
+                    root_pc=root_pc,
+                    vector=tuple(v * scale for v in vec),
+                )
+            )
     return templates
 
 
 _TEMPLATES = _build_templates()
-_TEMPLATE_MATRIX = np.stack([t.vector for t in _TEMPLATES], axis=0)  # (72, 12)
 
 
 def _compute_symbolic_chroma_by_window(
     score: music21.stream.Score,
     total_beats: float,
     window_beats: float,
-) -> tuple[np.ndarray, list[int | None]]:
+) -> tuple[list[list[float]], list[int | None]]:
     """Accumulate pitch-class weights and lowest bass pitch class per beat window."""
-    n_windows = max(1, int(np.ceil(total_beats / window_beats)))
-    out = np.zeros((n_windows, 12), dtype=np.float64)
+    n_windows = max(1, math.ceil(total_beats / window_beats))
+    out = [[0.0] * 12 for _ in range(n_windows)]
     lowest_midi: list[int | None] = [None] * n_windows
 
     try:
         sounding_score = score.toSoundingPitch()
-    except Exception:  # noqa: BLE001 — fallback to raw score if transposition metadata is incomplete
+    except Exception:  # noqa: BLE001 — fallback when transposition metadata is incomplete
         sounding_score = score
 
     flat = sounding_score.flatten()
@@ -76,65 +80,75 @@ def _compute_symbolic_chroma_by_window(
             overlap = min(end, (w + 1) * window_beats) - max(onset, w * window_beats)
             if overlap <= 0:
                 continue
-            # Sublinear duration weighting so sustained bass pedals don't erase 3rds/5ths
-            weight = float(np.sqrt(overlap))
+            # Sublinear weighting prevents sustained bass notes from drowning 3rds/5ths
+            weight = math.sqrt(overlap)
+            row = out[w]
             for p in pitches:
                 midi_val = int(p.midi)
-                pc = midi_val % 12
-                out[w, pc] += weight
+                row[midi_val % 12] += weight
                 cur_low = lowest_midi[w]
                 if cur_low is None or midi_val < cur_low:
                     lowest_midi[w] = midi_val
 
-    for w in range(n_windows):
-        norm = float(np.linalg.norm(out[w]))
+    for row in out:
+        norm = math.hypot(*row)
         if norm > 1e-8:
-            out[w] /= norm
+            inv = 1.0 / norm
+            for i in range(12):
+                row[i] *= inv
     bass_pcs = [m % 12 if m is not None else None for m in lowest_midi]
     return out, bass_pcs
 
 
 def _viterbi_chords(
-    chroma_windows: np.ndarray,
+    chroma_windows: list[list[float]],
     bass_pcs: list[int | None] | None = None,
     switch_penalty: float = 0.14,
 ) -> list[str | None]:
     """Decode smoothest chord sequence via Viterbi over cosine similarity + bass/root priors."""
-    n_win = chroma_windows.shape[0]
+    n_win = len(chroma_windows)
     n_states = len(_TEMPLATES)
-    sims = chroma_windows @ _TEMPLATE_MATRIX.T  # (W, S)
 
-    if bass_pcs is not None:
-        root_pcs = np.array([t.root_pc for t in _TEMPLATES], dtype=np.intp)
-        bass_arr = np.array([-1 if b is None else b for b in bass_pcs], dtype=np.intp)
-        sims += (bass_arr[:, None] == root_pcs[None, :]) * 0.12
-        sims -= (chroma_windows[:, root_pcs] < 1e-3) * 0.20
+    sims: list[list[float]] = []
+    energies: list[float] = []
+    for t, chroma in enumerate(chroma_windows):
+        energies.append(math.hypot(*chroma))
+        bass = bass_pcs[t] if bass_pcs is not None else None
+        row: list[float] = []
+        for tmpl in _TEMPLATES:
+            sim = sum(c * tv for c, tv in zip(chroma, tmpl.vector, strict=True))
+            if bass_pcs is not None:
+                if bass == tmpl.root_pc:
+                    sim += 0.12
+                if chroma[tmpl.root_pc] < 1e-3:
+                    sim -= 0.20
+            row.append(sim)
+        sims.append(row)
 
-    energies = np.linalg.norm(chroma_windows, axis=1)
-    dp = np.zeros((n_win, n_states), dtype=np.float64)
-    back = np.zeros((n_win, n_states), dtype=np.int32)
-    dp[0] = sims[0]
-    state_ids = np.arange(n_states, dtype=np.int32)
-
+    dp = list(sims[0])
+    back: list[list[int]] = []
     for t in range(1, n_win):
-        prev_best_idx = int(np.argmax(dp[t - 1]))
-        switch_val = dp[t - 1, prev_best_idx] - switch_penalty
-        stay_mask = dp[t - 1] >= switch_val
-        dp[t] = np.where(stay_mask, dp[t - 1], switch_val) + sims[t]
-        back[t] = np.where(stay_mask, state_ids, prev_best_idx)
+        prev_best_idx = max(range(n_states), key=dp.__getitem__)
+        switch_val = dp[prev_best_idx] - switch_penalty
+        cur_sims = sims[t]
+        cur_dp: list[float] = []
+        cur_back: list[int] = []
+        for s in range(n_states):
+            stay = dp[s] >= switch_val
+            cur_dp.append((dp[s] if stay else switch_val) + cur_sims[s])
+            cur_back.append(s if stay else prev_best_idx)
+        dp = cur_dp
+        back.append(cur_back)
 
-    best_states = np.zeros(n_win, dtype=np.int32)
-    best_states[-1] = int(np.argmax(dp[-1]))
+    best_states = [0] * n_win
+    best_states[-1] = max(range(n_states), key=dp.__getitem__)
     for t in range(n_win - 1, 0, -1):
-        best_states[t - 1] = back[t, best_states[t]]
+        best_states[t - 1] = back[t - 1][best_states[t]]
 
-    result: list[str | None] = []
-    for t in range(n_win):
-        if energies[t] < 1e-6:
-            result.append(None)
-        else:
-            result.append(_TEMPLATES[int(best_states[t])].symbol)
-    return result
+    return [
+        None if energies[t] < 1e-6 else _TEMPLATES[best_states[t]].symbol
+        for t in range(n_win)
+    ]
 
 
 def annotate_chords(

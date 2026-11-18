@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -102,13 +101,6 @@ def test_end_to_end_mxl_concerto_verovio_and_duckdb_cache(tmp_path: Path) -> Non
     assert clefs == ["F", "C"]  # Bass clef in m.1, authored Tenor clef preserved in m.2!
     harmonies = [h.findtext("root/root-step") for h in root.findall(".//harmony")]
     assert harmonies == ["D", "A"]
-
-    if importlib.util.find_spec("verovio") is not None:
-        import verovio
-
-        tk = verovio.toolkit()
-        assert tk.loadData(out_xml.read_text(encoding="utf-8"))
-        assert "<svg" in tk.renderToSVG(1)
 
     out_xml_2 = tmp_path / "haydn_cello_cached.musicxml"
     res2 = transcribe_score(mxl_path, Instrument.CELLO, output_path=out_xml_2, config=cfg)

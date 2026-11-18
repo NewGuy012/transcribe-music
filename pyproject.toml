@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "transcribe-music"
-version = "0.1.0"
-description = "Fast local Python CLI, SDK, and Marimo workbench to convert digital scores and fallback PDF sheet music into validated MusicXML with chords and instrument fingerings."
+version = "0.2.0"
+description = "Fast local Python CLI and SDK to convert digital scores and fallback PDF sheet music into validated MusicXML with chords and instrument fingerings."
 readme = "README.md"
 license = "BSD-3-Clause"
 requires-python = ">=3.14,<3.15"
@@ -15,9 +15,6 @@ dependencies = [
     "duckdb",
     "music21",
     "converter21",
-    "pyguitarpro",
-    "numpy",
-    "pymupdf",
     "requests",
 ]
 
@@ -25,10 +22,8 @@ dependencies = [
 environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 
 [project.optional-dependencies]
-ui = [
-    "marimo",
-    "verovio",
-]
+pdf = ["pymupdf"]
+gp = ["pyguitarpro"]
 dev = [
     "pytest",
     "ruff",
@@ -49,6 +44,3 @@ line-length = 100
 
 [tool.ruff.lint]
 ignore = ["B008"]
-
-[tool.ruff.lint.per-file-ignores]
-"notebooks/*.py" = ["B018"]

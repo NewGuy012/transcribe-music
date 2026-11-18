@@ -277,8 +277,14 @@ def _mark_gp_tie(
 
 def _load_guitarpro_score(path: Path) -> LoadedDigitalScore:
     """Convert a Guitar Pro (.gp3/.gp4/.gp5) song into a measured music21 Score."""
-    import guitarpro
-    import guitarpro.models as gm
+    try:
+        import guitarpro
+        import guitarpro.models as gm
+    except ImportError as exc:
+        raise RuntimeError(
+            f"Loading {path.name} requires the optional 'gp' extra (`pyguitarpro`). "
+            "Install with: uv sync --extra gp"
+        ) from exc
 
     song = guitarpro.parse(str(path))
     non_percussion = [
