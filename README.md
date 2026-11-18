@@ -3,7 +3,7 @@
 A fast, lean, local-first Python CLI and SDK that converts **digital symbolic music scores** (primary source of truth) — or **sheet music PDFs** as an OMR fallback — into validated **MusicXML** enriched with **chord symbols (`<harmony>`), guitar TAB (`<string>`, `<fret>`), and ergonomic fingerings (`<fingering>`)** for:
 
 - **Piano** (Grand Staff RH/LH splitting or native 2-staff preservation + O(N) Viterbi fingering solver)
-- **Guitar** (Treble `8vb` written-pitch normalization + 6-string Viterbi TAB & chord-grip solver)
+- **Guitar** (Treble `8vb` written-pitch normalization, custom tunings/capos, locked-TAB or 24-fret Viterbi solver, power/sus chords, and `notation|tab|both` MusicXML export)
 - **Violin** (4-string Viterbi position solver)
 - **Cello** (Preserves Bass/Tenor/Treble clefs + 4-string closed/extended/thumb `T` solver)
 
@@ -17,12 +17,13 @@ Powered by **`uv`**, **`music21`**, **`converter21`**, **`duckdb`**, **`typer`**
 - **MusicXML**: `.musicxml`, `.xml`, `.mxl`
 - **Humdrum / MEI / ABC** (via `converter21`): `.krn`, `.mei`, `.abc`
 - **MIDI**: `.mid`, `.midi` (quantized cleanly + auto-split Piano Grand Staff)
-- **Guitar Pro**: `.gp3`, `.gp4`, `.gp5` (via optional `gp` extra: `pyguitarpro`); `.gp`, `.gpx` (via MuseScore Studio CLI)
+- **Guitar Pro**: `.gp3`, `.gp4`, `.gp5` (via optional `gp` extra: `pyguitarpro`); `.gp` GP7/8 (native stdlib GPIF XML parser with MuseScore fallback); `.gpx` (via MuseScore Studio CLI)
+- **ASCII Guitar Tabs**: `.tab` (and `.txt` local conversion)
 - **MuseScore & Capella**: `.mscz`, `.mscx`, `.cap` (via MuseScore Studio CLI); `.capx` (native `music21` XML parser with MuseScore fallback)
 - **LilyPond**: `.ly` (via `python-ly` or `lilypond` CLI when installed)
 
 **Built-in Fast Score Catalogs (`transcribe-music search`):**
-- **MusicXML Corpora**: **OpenScore Orchestra** (`MarkGotham/Hauptstimme`), **OpenScore Lieder**, **OpenScore StringQuartets**, **When-in-Rome** (`.mxl`), and optional local **PDMX** (254k+ public-domain MusicXML/MIDI scores via DuckDB).
+- **MusicXML & Guitar Corpora**: **OpenScore Orchestra** (`MarkGotham/Hauptstimme`), **OpenScore Lieder**, **OpenScore StringQuartets**, **When-in-Rome** (`.mxl`), **GP Classical Guitar** (`.gp5`/`.gpx`/`.mid`), optional local **PDMX** (254k+ public-domain MusicXML/MIDI scores via DuckDB), and optional local/Zenodo **DadaGP** Guitar Pro DuckDB catalog.
 - **Local Symbolic Corpus**: **`music21` Corpus** (`.mxl`, `.xml`, `.krn`).
 
 ### 2. Sheet Music PDFs (Fallback OMR)
@@ -47,8 +48,9 @@ uv sync --all-extras
 ### CLI Usage
 
 ```bash
-# 1. Search fast symbolic catalogs (MusicXML preferred), show top 5, and download your pick
+# 1. Search fast symbolic catalogs (MusicXML or GP TAB with --instrument guitar), show top 5, and download
 uv run transcribe-music search "Moonlight Sonata"
+uv run transcribe-music search "Asturias" --instrument guitar
 # Or download selection #1 and enrich immediately for piano:
 uv run transcribe-music search "Moonlight Sonata" --select 1 --instrument piano
 
@@ -56,7 +58,11 @@ uv run transcribe-music search "Moonlight Sonata" --select 1 --instrument piano
 uv run transcribe-music pdmx sync --with-mid   # or --with-mxl for full .mxl archive
 uv run transcribe-music pdmx status
 
-# 2. Inspect parts/tracks inside a multi-part digital score
+# Optional: index a local DadaGP / Guitar Pro folder or Zenodo record into DuckDB
+uv run transcribe-music dadagp sync --gp-dir /path/to/guitar_tabs
+uv run transcribe-music dadagp status
+
+# 2. Inspect parts/tracks inside a multi-part digital score (including guitar tuning/capo)
 uv run transcribe-music inspect haydn_cello_concerto.mxl
 
 # 3. Convert any digital score (or fallback PDF) with automatic part selection
@@ -67,9 +73,9 @@ uv run transcribe-music convert haydn_cello_concerto.mxl \
 uv run transcribe-music convert suite_or_sonata.mid \
   --instrument cello --part "Solo Cello" -o solo_cello.musicxml
 
-# 5. Guitar Pro tab -> MusicXML with chords & ergonomic 6-string TAB/fingerings (requires --extra gp)
+# 5. Guitar Pro (.gp/.gp5) or ASCII (.tab) -> linked Notation + 6-line TAB MusicXML
 uv run transcribe-music convert song.gp5 \
-  --instrument guitar -o song_guitar.musicxml
+  --instrument guitar --guitar-staff both -o song_guitar.musicxml
 
 # 6. Sheet music PDF fallback (Audiveris CLI when installed, else batched homr OMR via --extra pdf)
 uv run transcribe-music convert solo_cello_part.pdf \

@@ -10,10 +10,12 @@ from pathlib import Path
 
 import music21
 
-from transcribe_music.models import INSTRUMENT_SPECS, Instrument
+from transcribe_music.models import INSTRUMENT_SPECS, GuitarStaffMode, Instrument
 from transcribe_music.score_utils import (
+    GuitarTrackMeta,
     coerce_to_score,
     fill_stream_rest_gaps,
+    get_guitar_track_meta,
     is_playable_chord,
     make_clef,
     replace_or_insert_initial_clef,
@@ -302,8 +304,233 @@ def _redistribute_chord_technical_tags(root: ET.Element) -> bool:
     return changed
 
 
+_ATTR_TAG_ORDER: dict[str, int] = {
+    "divisions": 0,
+    "key": 1,
+    "time": 2,
+    "staves": 3,
+    "part-symbol": 4,
+    "instruments": 5,
+    "clef": 6,
+    "staff-details": 7,
+    "transpose": 8,
+    "directive": 9,
+    "measure-style": 10,
+}
+
+_NOTE_TAG_ORDER: dict[str, int] = {
+    "grace": 0,
+    "chord": 1,
+    "pitch": 2,
+    "unpitched": 2,
+    "rest": 2,
+    "duration": 3,
+    "tie": 4,
+    "instrument": 5,
+    "voice": 6,
+    "type": 7,
+    "dot": 8,
+    "accidental": 9,
+    "time-modification": 10,
+    "stem": 11,
+    "notehead": 12,
+    "notehead-text": 13,
+    "staff": 14,
+    "beam": 15,
+    "notations": 16,
+    "lyric": 17,
+}
+
+
+def _sort_children_by_order(parent: ET.Element, order_map: dict[str, int]) -> None:
+    children = list(parent)
+    children.sort(key=lambda el: order_map.get(el.tag, 99))
+    parent[:] = children
+
+
+def _build_staff_details_element(
+    meta: GuitarTrackMeta,
+    *,
+    staff_number: int | None = None,
+) -> ET.Element:
+    attrib = {"number": str(staff_number)} if staff_number is not None else {}
+    details = ET.Element("staff-details", attrib)
+    ET.SubElement(details, "staff-lines").text = str(len(meta.open_string_midi))
+    for line_idx, midi_val in enumerate(reversed(meta.open_string_midi), start=1):
+        pitch = music21.pitch.Pitch(midi=midi_val)
+        tuning_el = ET.SubElement(details, "staff-tuning", {"line": str(line_idx)})
+        ET.SubElement(tuning_el, "tuning-step").text = pitch.step
+        alter_int = round(pitch.alter) if pitch.alter else 0
+        if alter_int != 0:
+            ET.SubElement(tuning_el, "tuning-alter").text = str(alter_int)
+        ET.SubElement(tuning_el, "tuning-octave").text = str(int(pitch.octave or 0))
+    if meta.capo_fret > 0:
+        ET.SubElement(details, "capo").text = str(meta.capo_fret)
+    return details
+
+
+def _shift_note_octave(note_el: ET.Element, delta: int) -> None:
+    oct_el = note_el.find("./pitch/octave")
+    if oct_el is not None and oct_el.text and oct_el.text.lstrip("-").isdigit():
+        oct_el.text = str(int(oct_el.text) + delta)
+
+
+def _set_or_replace_staff(note_el: ET.Element, staff_num: int) -> None:
+    staff_el = note_el.find("staff")
+    if staff_el is None:
+        staff_el = ET.Element("staff")
+        note_el.append(staff_el)
+    staff_el.text = str(staff_num)
+    _sort_children_by_order(note_el, _NOTE_TAG_ORDER)
+
+
+def _apply_guitar_staff_layout(
+    root: ET.Element,
+    guitar_staff: GuitarStaffMode,
+    guitar_meta: GuitarTrackMeta,
+) -> bool:
+    parts = root.findall("part")
+    if not parts:
+        return False
+    part = parts[0]
+    measures = part.findall("measure")
+    if not measures:
+        return False
+
+    is_nonstandard = (
+        guitar_meta.open_string_midi != INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi
+        or guitar_meta.capo_fret > 0
+    )
+    if guitar_staff == GuitarStaffMode.NOTATION and not is_nonstandard:
+        return False
+
+    first_attrs = measures[0].find("attributes")
+    if first_attrs is None:
+        first_attrs = ET.Element("attributes")
+        measures[0].insert(0, first_attrs)
+
+    if guitar_staff == GuitarStaffMode.NOTATION:
+        if not first_attrs.findall("staff-details"):
+            first_attrs.append(_build_staff_details_element(guitar_meta))
+            _sort_children_by_order(first_attrs, _ATTR_TAG_ORDER)
+        return True
+
+    if guitar_staff == GuitarStaffMode.TAB:
+        for clef_el in list(first_attrs.findall("clef")):
+            first_attrs.remove(clef_el)
+        tab_clef = ET.SubElement(first_attrs, "clef")
+        ET.SubElement(tab_clef, "sign").text = "TAB"
+        ET.SubElement(tab_clef, "line").text = "5"
+        for tr_el in list(first_attrs.findall("transpose")):
+            first_attrs.remove(tr_el)
+        for sd_el in list(first_attrs.findall("staff-details")):
+            first_attrs.remove(sd_el)
+        first_attrs.append(_build_staff_details_element(guitar_meta))
+        _sort_children_by_order(first_attrs, _ATTR_TAG_ORDER)
+        for note_el in part.findall(".//note"):
+            _shift_note_octave(note_el, -1)
+        return True
+
+    # GuitarStaffMode.BOTH: 2-staff Standard Notation (Staff 1) + TAB (Staff 2)
+    staves_el = first_attrs.find("staves")
+    if staves_el is None:
+        staves_el = ET.SubElement(first_attrs, "staves")
+    staves_el.text = "2"
+
+    clefs = first_attrs.findall("clef")
+    if clefs:
+        clefs[0].set("number", "1")
+    else:
+        c1 = ET.SubElement(first_attrs, "clef", {"number": "1"})
+        ET.SubElement(c1, "sign").text = "G"
+        ET.SubElement(c1, "line").text = "2"
+        ET.SubElement(c1, "clef-octave-change").text = "-1"
+    c2 = ET.SubElement(first_attrs, "clef", {"number": "2"})
+    ET.SubElement(c2, "sign").text = "TAB"
+    ET.SubElement(c2, "line").text = "5"
+
+    for tr_el in first_attrs.findall("transpose"):
+        tr_el.set("number", "1")
+    for sd_el in list(first_attrs.findall("staff-details")):
+        first_attrs.remove(sd_el)
+    first_attrs.append(_build_staff_details_element(guitar_meta, staff_number=2))
+    _sort_children_by_order(first_attrs, _ATTR_TAG_ORDER)
+
+    for measure in measures:
+        orig_children = list(measure)
+        timeline_elems: list[ET.Element] = []
+        staff1_cursor = 0
+        for child in orig_children:
+            if child.tag in {"note", "forward", "backup"}:
+                timeline_elems.append(child)
+                if child.tag == "note":
+                    if child.find("grace") is None and child.find("chord") is None:
+                        dur_txt = child.findtext("duration")
+                        if dur_txt and dur_txt.isdigit():
+                            staff1_cursor += int(dur_txt)
+                elif child.tag == "forward":
+                    dur_txt = child.findtext("duration")
+                    if dur_txt and dur_txt.isdigit():
+                        staff1_cursor += int(dur_txt)
+                elif child.tag == "backup":
+                    dur_txt = child.findtext("duration")
+                    if dur_txt and dur_txt.isdigit():
+                        staff1_cursor -= int(dur_txt)
+
+        if not timeline_elems:
+            continue
+
+        cloned_staff2: list[ET.Element] = []
+        for elem in timeline_elems:
+            clone = copy.deepcopy(elem)
+            if elem.tag == "note":
+                # Staff 1 retains notation + <fingering>, moves <string>/<fret> strictly to Staff 2 TAB
+                tech1 = elem.find("notations/technical")
+                if tech1 is not None:
+                    for tab_tag in (*tech1.findall("string"), *tech1.findall("fret")):
+                        tech1.remove(tab_tag)
+                    if not list(tech1):
+                        notations1 = elem.find("notations")
+                        if notations1 is not None:
+                            notations1.remove(tech1)
+                            if not list(notations1):
+                                elem.remove(notations1)
+                _set_or_replace_staff(elem, 1)
+
+                # Staff 2 TAB clone: sounding octave, shifted voice, strip notation-only tags & <fingering>
+                _shift_note_octave(clone, -1)
+                voice_el = clone.find("voice")
+                if voice_el is not None and voice_el.text and voice_el.text.isdigit():
+                    voice_el.text = str(int(voice_el.text) + 4)
+                for drop_tag in ("stem", "beam", "accidental", "notehead", "lyric"):
+                    for d_el in list(clone.findall(drop_tag)):
+                        clone.remove(d_el)
+                tech2 = clone.find("notations/technical")
+                if tech2 is not None:
+                    for f_el in list(tech2.findall("fingering")):
+                        tech2.remove(f_el)
+                _set_or_replace_staff(clone, 2)
+            cloned_staff2.append(clone)
+
+        insert_pos = len(orig_children)
+        right_bar = measure.find("barline[@location='right']")
+        if right_bar is not None:
+            insert_pos = list(measure).index(right_bar)
+
+        extras: list[ET.Element] = []
+        if staff1_cursor > 0:
+            backup_el = ET.Element("backup")
+            ET.SubElement(backup_el, "duration").text = str(staff1_cursor)
+            extras.append(backup_el)
+        extras.extend(cloned_staff2)
+        for offset_i, new_el in enumerate(extras):
+            measure.insert(insert_pos + offset_i, new_el)
+
+    return True
+
+
 def _validate_part_measures(parts: list[ET.Element]) -> None:
-    """Ensure no measure contains duplicate whole-bar rests or overflows its time signature."""
+    """Ensure no measure contains duplicate whole-bar rests per staff or overflows its time signature."""
     for part in parts:
         divisions: int | None = None
         beats: int | None = None
@@ -312,8 +539,13 @@ def _validate_part_measures(parts: list[ET.Element]) -> None:
 
         for measure in part.findall("measure"):
             m_num = measure.attrib.get("number", "?")
-            whole_rests = measure.findall("./note/rest[@measure='yes']")
-            if len(whole_rests) > 1:
+            rests_by_staff: dict[str, int] = {}
+            for note_el in measure.findall("./note"):
+                rest_el = note_el.find("rest")
+                if rest_el is not None and rest_el.attrib.get("measure") == "yes":
+                    staff_id = note_el.findtext("staff") or "1"
+                    rests_by_staff[staff_id] = rests_by_staff.get(staff_id, 0) + 1
+            if any(cnt > 1 for cnt in rests_by_staff.values()):
                 raise ValueError(f"Measure {m_num} contains duplicate whole-measure rests")
 
             for attrs in measure.findall("attributes"):
@@ -365,14 +597,22 @@ def _validate_part_measures(parts: list[ET.Element]) -> None:
                 )
 
 
-def _postprocess_and_validate_xml(xml_path: Path) -> ExportMetrics:
-    """Redistribute chord technical tags, validate MusicXML structure, and extract counts."""
+def _postprocess_and_validate_xml(
+    xml_path: Path,
+    *,
+    guitar_staff: GuitarStaffMode = GuitarStaffMode.NOTATION,
+    guitar_meta: GuitarTrackMeta | None = None,
+) -> ExportMetrics:
+    """Redistribute chord technical tags, apply guitar staff layout, validate, and count."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     if root.tag not in ("score-partwise", "score-timewise"):
         raise ValueError(f"Invalid MusicXML root element: {root.tag}")
 
-    if _redistribute_chord_technical_tags(root):
+    changed = _redistribute_chord_technical_tags(root)
+    if guitar_meta is not None:
+        changed = _apply_guitar_staff_layout(root, guitar_staff, guitar_meta) or changed
+    if changed:
         ET.indent(tree, space="  ")
         tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 
@@ -389,8 +629,17 @@ def _postprocess_and_validate_xml(xml_path: Path) -> ExportMetrics:
     if parts:
         _validate_part_measures(parts)
 
+    has_linked_tab_staff = (
+        len(parts) == 1
+        and any(c.findtext("sign") == "TAB" for c in parts[0].findall("./measure[1]/attributes/clef[@number='2']"))
+    )
     measure_count = len(parts[0].findall("measure")) if parts else len(xml_measures)
-    note_count = sum(1 for n in xml_notes if n.find("rest") is None)
+    note_count = sum(
+        1
+        for n in xml_notes
+        if n.find("rest") is None
+        and not (has_linked_tab_staff and n.findtext("staff") == "2")
+    )
     return ExportMetrics(
         measure_count=measure_count,
         note_count=note_count,
@@ -404,11 +653,21 @@ def export_musicxml(
     output_path: Path,
     instrument: Instrument,
     title: str | None = None,
+    *,
+    guitar_staff: GuitarStaffMode = GuitarStaffMode.NOTATION,
 ) -> tuple[ExportMetrics, list[str]]:
     """Normalize, serialize, and validate a MusicXML score with graceful fallback."""
     warnings: list[str] = []
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    guitar_meta: GuitarTrackMeta | None = None
+    if instrument == Instrument.GUITAR:
+        part0 = score.parts[0] if list(score.parts) else None
+        guitar_meta = (
+            (get_guitar_track_meta(part0) if part0 is not None else None)
+            or GuitarTrackMeta(open_string_midi=INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi)
+        )
 
     normalized = normalize_score_structure(score, instrument=instrument, title=title)
 
@@ -419,4 +678,11 @@ def export_musicxml(
         _strip_non_note_articulations(normalized)
         normalized.write("musicxml", fp=str(output_path))
 
-    return _postprocess_and_validate_xml(output_path), warnings
+    return (
+        _postprocess_and_validate_xml(
+            output_path,
+            guitar_staff=guitar_staff,
+            guitar_meta=guitar_meta,
+        ),
+        warnings,
+    )

@@ -7,10 +7,22 @@ from pathlib import Path
 
 import music21
 import pytest
-from conftest import make_concerto_score, write_gp5_file, write_pdf_file
+from conftest import (
+    make_concerto_score,
+    write_ascii_tab_file,
+    write_gp5_file,
+    write_gpif_file,
+    write_pdf_file,
+)
 from typer.testing import CliRunner
 
-from transcribe_music import Instrument, TranscriptionConfig, convert_music, inspect_score
+from transcribe_music import (
+    GuitarStaffMode,
+    Instrument,
+    TranscriptionConfig,
+    convert_music,
+    inspect_score,
+)
 from transcribe_music.cli import app
 from transcribe_music.storage.catalog import CatalogStore
 
@@ -159,3 +171,106 @@ def test_cli_convert_inspect_and_cache_commands(tmp_path: Path) -> None:
     clear_res = runner.invoke(app, ["cache", "clear", "--cache-dir", str(cache_dir)])
     assert clear_res.exit_code == 0, clear_res.output
     assert "Cleared 1 job records" in clear_res.output
+
+
+def test_end_to_end_guitar_staff_modes_gpif_ascii_tab_and_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 1. GP5 with Drop-D tuning and Capo 2 exported in notation, tab, and both modes
+    gp5_path = write_gp5_file(
+        tmp_path / "dropd.gp5",
+        notes=((6, 0), (6, 3), (6, 5), (6, 7)),
+        tuning=(64, 59, 55, 50, 45, 38),
+        capo=2,
+    )
+    cache_dir = tmp_path / ".gtr_cache"
+
+    res_not = convert_music(
+        gp5_path,
+        Instrument.GUITAR,
+        output_path=tmp_path / "dropd_not.musicxml",
+        config=TranscriptionConfig(
+            instrument=Instrument.GUITAR,
+            guitar_staff=GuitarStaffMode.NOTATION,
+            cache_dir=cache_dir,
+        ),
+    )
+    res_tab = convert_music(
+        gp5_path,
+        Instrument.GUITAR,
+        output_path=tmp_path / "dropd_tab.musicxml",
+        config=TranscriptionConfig(
+            instrument=Instrument.GUITAR,
+            guitar_staff=GuitarStaffMode.TAB,
+            cache_dir=cache_dir,
+        ),
+    )
+    res_both = convert_music(
+        gp5_path,
+        Instrument.GUITAR,
+        output_path=tmp_path / "dropd_both.musicxml",
+        config=TranscriptionConfig(
+            instrument=Instrument.GUITAR,
+            guitar_staff=GuitarStaffMode.BOTH,
+            cache_dir=cache_dir,
+        ),
+    )
+
+    assert len({res_not.job_hash, res_tab.job_hash, res_both.job_hash}) == 3
+    assert res_not.note_count == res_tab.note_count == res_both.note_count == 4
+    assert res_not.fingering_count == res_both.fingering_count == 4
+
+    # Preserved authored TAB keeps all 4 notes on string 6 (frets 0, 3, 5, 7)
+    root_not = ET.parse(res_not.musicxml_path).getroot()
+    assert [s.text for s in root_not.findall(".//technical/string")] == ["6", "6", "6", "6"]
+    assert [f.text for f in root_not.findall(".//technical/fret")] == ["0", "3", "5", "7"]
+    assert root_not.findtext(".//staff-details/capo") == "2"
+    assert root_not.findtext(".//staff-details/staff-tuning[@line='1']/tuning-step") == "D"
+
+    root_tab = ET.parse(res_tab.musicxml_path).getroot()
+    assert root_tab.findtext(".//attributes/clef/sign") == "TAB"
+    assert root_tab.find(".//attributes/transpose") is None
+    # Note 1 is D2+capo2 = E2 sounding (octave 2 in TAB vs octave 3 in written notation)
+    assert root_tab.findtext(".//measure[@number='1']/note[1]/pitch/octave") == "2"
+
+    root_both = ET.parse(res_both.musicxml_path).getroot()
+    assert root_both.findtext(".//attributes/staves") == "2"
+    assert root_both.findtext(".//attributes/clef[@number='1']/sign") == "G"
+    assert root_both.findtext(".//attributes/clef[@number='2']/sign") == "TAB"
+    assert root_both.findtext(".//staff-details[@number='2']/capo") == "2"
+    staff1_notes = [n for n in root_both.findall(".//note") if n.findtext("staff") == "1"]
+    staff2_notes = [n for n in root_both.findall(".//note") if n.findtext("staff") == "2"]
+    assert len(staff1_notes) == len(staff2_notes) == 4
+    assert all(n.find("notations/technical/fingering") is not None for n in staff1_notes)
+    assert all(n.find("notations/technical/string") is None for n in staff1_notes)
+    assert all(n.find("notations/technical/string") is not None for n in staff2_notes)
+    assert all(n.find("notations/technical/fingering") is None for n in staff2_notes)
+
+    # 2. CLI inspect shows Tuning/Capo, and convert supports --guitar-staff both & --recompute-tab
+    monkeypatch.setattr("transcribe_music.ingest.digital._find_musescore_executable", lambda: None)
+    gp_path = write_gpif_file(tmp_path / "lead.gp")
+    tab_path = write_ascii_tab_file(tmp_path / "riff.tab")
+
+    runner = CliRunner()
+    insp_res = runner.invoke(app, ["inspect", str(gp_path)])
+    assert insp_res.exit_code == 0, insp_res.output
+    assert "D2-A2-D3-G3-B3-E4" in insp_res.output
+
+    cli_both = tmp_path / "cli_both.musicxml"
+    conv_res = runner.invoke(
+        app,
+        [
+            "convert",
+            str(tab_path),
+            "-i",
+            "guitar",
+            "--guitar-staff",
+            "both",
+            "--recompute-tab",
+            "--no-cache",
+            "-o",
+            str(cli_both),
+        ],
+    )
+    assert conv_res.exit_code == 0, conv_res.output
+    assert ET.parse(cli_both).findtext(".//attributes/staves") == "2"

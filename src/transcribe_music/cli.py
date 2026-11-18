@@ -18,6 +18,7 @@ from transcribe_music.ingest.gp_catalog import (
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
+    GuitarStaffMode,
     Instrument,
     OmrBackend,
     ScoreSearchResult,
@@ -55,7 +56,21 @@ PreserveChordsOpt = Annotated[
 ]
 PreserveFingeringOpt = Annotated[
     bool,
-    typer.Option("--preserve-fingering", help="Keep authored fingerings/TAB when present."),
+    typer.Option("--preserve-fingering", help="Keep authored fingerings when present."),
+]
+PreserveTabOpt = Annotated[
+    bool,
+    typer.Option(
+        "--preserve-tab/--recompute-tab",
+        help="Keep authored guitar TAB string/fret placements when present (default: preserve).",
+    ),
+]
+GuitarStaffOpt = Annotated[
+    GuitarStaffMode,
+    typer.Option(
+        "--guitar-staff",
+        help="Guitar MusicXML staff layout: notation (Treble 8vb), tab (6-line TAB), or both.",
+    ),
 ]
 CacheOpt = Annotated[bool, typer.Option("--cache/--no-cache", help="Use DuckDB cache.")]
 CacheDirOpt = Annotated[Path, typer.Option("--cache-dir", help="Cache directory.")]
@@ -129,6 +144,8 @@ def convert(
     fingering: FingeringOpt = True,
     preserve_chords: PreserveChordsOpt = False,
     preserve_fingering: PreserveFingeringOpt = False,
+    preserve_tab: PreserveTabOpt = True,
+    guitar_staff: GuitarStaffOpt = GuitarStaffMode.NOTATION,
     cache: CacheOpt = True,
     cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
@@ -140,6 +157,8 @@ def convert(
         enrich_fingering=fingering,
         preserve_existing_chords=preserve_chords,
         preserve_existing_fingering=preserve_fingering,
+        preserve_existing_tab=preserve_tab,
+        guitar_staff=guitar_staff,
         use_cache=cache,
         cache_dir=cache_dir,
         pdf_dpi=dpi,

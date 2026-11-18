@@ -97,6 +97,7 @@ def _produce_enrich_and_export(
         output_path=export_path,
         instrument=cfg.instrument,
         title=existing_title or input_path.stem,
+        guitar_staff=cfg.guitar_staff,
     )
     warnings.extend(export_warnings)
 
