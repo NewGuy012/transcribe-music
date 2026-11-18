@@ -23,7 +23,7 @@ from transcribe_music.models import (
     TranscriptionResult,
 )
 from transcribe_music.storage.catalog import CatalogStore, compute_job_hash, hash_file
-from transcribe_music.transcribe.omr_pdf import transcribe_pdf_omr
+from transcribe_music.transcribe.omr_pdf import run_pdf_omr
 from transcribe_music.transcribe.part_selector import select_and_adapt_parts
 
 
@@ -264,8 +264,12 @@ def transcribe_pdf(
     _require_existing_file(path, expected_suffix=".pdf")
 
     def _produce(artifact_dir: Path, cfg: TranscriptionConfig) -> _ProducedScore:
-        raw_score = transcribe_pdf_omr(
-            path, artifact_dir, instrument=cfg.instrument, dpi=cfg.pdf_dpi
+        raw_score, active_backend, omr_warnings = run_pdf_omr(
+            path,
+            artifact_dir,
+            instrument=cfg.instrument,
+            dpi=cfg.pdf_dpi,
+            omr_backend=cfg.omr_backend,
         )
         selected = select_and_adapt_parts(
             raw_score,
@@ -276,9 +280,9 @@ def transcribe_pdf(
         return _ProducedScore(
             score=selected.score,
             harmonic_reference_score=raw_score,
-            backend="homr",
+            backend=active_backend,
             selected_part=selected.selected_part,
-            warnings=selected.warnings,
+            warnings=[*omr_warnings, *selected.warnings],
         )
 
     return _run_cached_job(

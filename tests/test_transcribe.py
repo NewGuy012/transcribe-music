@@ -14,8 +14,12 @@ import pytest
 
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.ingest.digital import inspect_digital_score, load_digital_score
-from transcribe_music.models import Instrument
-from transcribe_music.transcribe.omr_pdf import stitch_musicxml_pages, transcribe_pdf_omr
+from transcribe_music.models import Instrument, OmrBackend
+from transcribe_music.transcribe.omr_pdf import (
+    run_pdf_omr,
+    stitch_musicxml_pages,
+    transcribe_pdf_omr,
+)
 from transcribe_music.transcribe.part_selector import select_and_adapt_parts
 
 
@@ -351,6 +355,7 @@ def test_batched_pdf_omr_invokes_homr_once_and_stitches_pages(
 
         return SimpleNamespace(returncode=0, stderr="", stdout="")
 
+    monkeypatch.setattr("transcribe_music.transcribe.omr_pdf._find_audiveris_executable", lambda: None)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/homr" if name == "homr" else None)
     monkeypatch.setattr("subprocess.run", _fake_subprocess_run)
 
@@ -380,3 +385,57 @@ def test_batched_pdf_omr_invokes_homr_once_and_stitches_pages(
     assert m_metrics.note_count == 8
     root = ET.parse(merged_xml).getroot()
     assert [m.get("number") for m in root.findall(".//measure")] == ["1", "2"]
+
+
+def test_audiveris_omr_preferred_over_homr_and_explicit_backend_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf_path = tmp_path / "cello_solo.pdf"
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), "Cello Solo")
+    doc.save(str(pdf_path))
+    doc.close()
+
+    # Explicit audiveris without binary errors cleanly
+    monkeypatch.setattr("transcribe_music.transcribe.omr_pdf._find_audiveris_executable", lambda: None)
+    with pytest.raises(RuntimeError, match="Audiveris"):
+        run_pdf_omr(pdf_path, tmp_path / "w_err", Instrument.CELLO, omr_backend=OmrBackend.AUDIVERIS)
+
+    # When Audiveris CLI is available, AUTO prefers Audiveris and passes PDF directly
+    aud_calls: list[list[str]] = []
+
+    def _fake_audiveris_run(cmd, **_kwargs):
+        aud_calls.append(list(cmd))
+        out_dir = Path(cmd[cmd.index("-output") + 1])
+        sub_dir = out_dir / pdf_path.stem
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        s = music21.stream.Score()
+        p = music21.stream.Part()
+        m1 = music21.stream.Measure(number=1)
+        m1.insert(0, music21.clef.BassClef())
+        for pch in ("D3", "F#3", "A3", "D4"):
+            m1.append(music21.note.Note(pch, quarterLength=1.0))
+        m2 = music21.stream.Measure(number=2)
+        m2.insert(0, music21.clef.TenorClef())
+        for pch in ("F#4", "G4", "A4", "D4"):
+            m2.append(music21.note.Note(pch, quarterLength=1.0))
+        p.append(m1)
+        p.append(m2)
+        s.insert(0, p)
+        s.write("mxl", fp=str(sub_dir / f"{pdf_path.stem}.mxl"))
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(
+        "transcribe_music.transcribe.omr_pdf._find_audiveris_executable",
+        lambda: "/usr/local/bin/audiveris",
+    )
+    monkeypatch.setattr("subprocess.run", _fake_audiveris_run)
+
+    score, backend, warnings = run_pdf_omr(pdf_path, tmp_path / "w_aud", Instrument.CELLO)
+    assert backend == "audiveris"
+    assert not warnings
+    assert len(aud_calls) == 1
+    assert "-batch" in aud_calls[0]
+    assert str(pdf_path.resolve()) in aud_calls[0]
+    clefs = list(score.parts[0].recurse().getElementsByClass(music21.clef.Clef))
+    assert any(isinstance(c, music21.clef.TenorClef) for c in clefs)

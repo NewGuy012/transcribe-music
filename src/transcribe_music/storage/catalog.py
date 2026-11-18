@@ -65,6 +65,7 @@ def compute_job_hash(
         "preserve_existing_fingering": config.preserve_existing_fingering,
         "quantize_divisors": list(config.quantize_divisors),
         "pdf_dpi": config.pdf_dpi if source_type == SourceType.PDF else None,
+        "omr_backend": config.omr_backend.value if source_type == SourceType.PDF else None,
     }
     encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:24]

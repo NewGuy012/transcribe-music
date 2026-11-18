@@ -26,6 +26,14 @@ class SourceType(str, Enum):
     PDF = "pdf"
 
 
+class OmrBackend(str, Enum):
+    """Supported Optical Music Recognition backends for PDF fallback."""
+
+    AUTO = "auto"
+    AUDIVERIS = "audiveris"
+    HOMR = "homr"
+
+
 @dataclass(frozen=True)
 class InstrumentSpec:
     """Acoustic, notation, and biomechanical metadata for an instrument."""
@@ -126,6 +134,7 @@ class TranscriptionConfig(BaseModel):
     quantize_divisors: tuple[int, ...] = (4, 3)
     cache_dir: Path = Path(".transcribe_cache")
     pdf_dpi: int = Field(default=300, ge=150, le=600)
+    omr_backend: OmrBackend = OmrBackend.AUTO
 
 
 class TranscriptionResult(BaseModel):

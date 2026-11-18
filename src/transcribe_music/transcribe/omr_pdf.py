@@ -1,4 +1,4 @@
-"""Optical Music Recognition (OMR) fallback for multi-page sheet music PDFs via batched homr."""
+"""Optical Music Recognition (OMR) fallback for PDFs via Audiveris CLI or batched homr."""
 
 from __future__ import annotations
 
@@ -6,11 +6,96 @@ import copy
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Literal
 
 import music21
 
 from transcribe_music.ingest.pdf import render_pdf_pages
-from transcribe_music.models import Instrument
+from transcribe_music.models import Instrument, OmrBackend
+
+
+def _find_audiveris_executable() -> str | None:
+    """Locate an installed Audiveris CLI binary if available on the host."""
+    for name in ("audiveris", "Audiveris"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    candidates = (
+        Path("/Applications/Audiveris.app/Contents/MacOS/Audiveris"),
+        Path.home() / "Applications" / "Audiveris.app" / "Contents" / "MacOS" / "Audiveris",
+        Path("/opt/homebrew/bin/audiveris"),
+        Path("/usr/local/bin/audiveris"),
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def resolve_omr_backend(preferred: OmrBackend | str = OmrBackend.AUTO) -> Literal["audiveris", "homr"]:
+    """Resolve the active PDF OMR backend from user preference and local tooling."""
+    backend = OmrBackend(preferred)
+    if backend == OmrBackend.AUDIVERIS:
+        if _find_audiveris_executable() is None:
+            raise RuntimeError(
+                "Audiveris OMR was requested, but 'audiveris' CLI was not found. "
+                "Install Audiveris or run with --omr-backend homr."
+            )
+        return "audiveris"
+    if backend == OmrBackend.HOMR:
+        return "homr"
+    return "audiveris" if _find_audiveris_executable() is not None else "homr"
+
+
+def _run_audiveris_batch(pdf_path: Path, work_dir: Path) -> list[Path]:
+    """Run Audiveris headless batch OMR directly on a PDF and return exported MusicXML files."""
+    audiveris_bin = _find_audiveris_executable()
+    if audiveris_bin is None:
+        raise RuntimeError(
+            "Audiveris CLI executable not found. Install Audiveris or use --omr-backend homr."
+        )
+
+    out_dir = Path(work_dir).resolve() / "audiveris_out"
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        audiveris_bin,
+        "-batch",
+        "-transcribe",
+        "-export",
+        "-output",
+        str(out_dir),
+        "--",
+        str(Path(pdf_path).resolve()),
+    ]
+    proc = subprocess.run(
+        cmd,
+        check=False,
+        cwd=str(out_dir),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+
+    mxl_files = sorted(out_dir.rglob("*.mxl"))
+    if mxl_files:
+        return mxl_files
+    musicxml_files = sorted(out_dir.rglob("*.musicxml"))
+    if musicxml_files:
+        return musicxml_files
+    xml_files = sorted(
+        p
+        for p in out_dir.rglob("*.xml")
+        if p.name.lower() not in {"book.xml"} and not p.name.lower().startswith("sheet")
+    )
+    if xml_files:
+        return xml_files
+
+    detail = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+    raise RuntimeError(f"Audiveris OMR produced no MusicXML output in {out_dir}: {detail}")
 
 
 def _build_homr_command(image_paths: list[Path]) -> list[str]:
@@ -134,14 +219,48 @@ def stitch_musicxml_pages(
     return merged_score
 
 
+def run_pdf_omr(
+    pdf_path: Path,
+    work_dir: Path,
+    instrument: Instrument,
+    dpi: int = 300,
+    omr_backend: OmrBackend | str = OmrBackend.AUTO,
+) -> tuple[music21.stream.Score, str, list[str]]:
+    """Run PDF OMR (Audiveris CLI preferred when available, else batched homr) into a music21 Score."""
+    pref = OmrBackend(omr_backend)
+    selected = resolve_omr_backend(pref)
+    warnings: list[str] = []
+
+    if selected == "audiveris":
+        try:
+            xml_paths = _run_audiveris_batch(pdf_path, work_dir)
+            score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
+            return score, "audiveris", warnings
+        except Exception as exc:
+            if pref == OmrBackend.AUDIVERIS:
+                raise
+            warnings.append(f"Audiveris OMR failed ({exc}); fell back to homr.")
+
+    pages_dir = Path(work_dir) / "pdf_pages"
+    image_paths = render_pdf_pages(pdf_path, pages_dir, dpi=dpi)
+    xml_paths = _run_homr_batch(image_paths, pages_dir)
+    score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
+    return score, "homr", warnings
+
+
 def transcribe_pdf_omr(
     pdf_path: Path,
     work_dir: Path,
     instrument: Instrument,
     dpi: int = 300,
+    omr_backend: OmrBackend | str = OmrBackend.AUTO,
 ) -> music21.stream.Score:
-    """Rasterize PDF pages and run a single batched homr OMR pass into a music21 Score."""
-    pages_dir = Path(work_dir) / "pdf_pages"
-    image_paths = render_pdf_pages(pdf_path, pages_dir, dpi=dpi)
-    xml_paths = _run_homr_batch(image_paths, pages_dir)
-    return stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
+    """Rasterize/recognize a sheet music PDF into a music21 Score."""
+    score, _backend, _warnings = run_pdf_omr(
+        pdf_path,
+        work_dir,
+        instrument=instrument,
+        dpi=dpi,
+        omr_backend=omr_backend,
+    )
+    return score

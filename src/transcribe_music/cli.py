@@ -15,6 +15,7 @@ from rich.table import Table
 from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
     Instrument,
+    OmrBackend,
     ScoreSearchResult,
     TranscriptionConfig,
     TranscriptionResult,
@@ -55,6 +56,10 @@ PreserveFingeringOpt = Annotated[
 ]
 CacheOpt = Annotated[bool, typer.Option("--cache/--no-cache", help="Use DuckDB cache.")]
 CacheDirOpt = Annotated[Path, typer.Option("--cache-dir", help="Cache directory.")]
+OmrBackendOpt = Annotated[
+    OmrBackend,
+    typer.Option("--omr-backend", help="PDF OMR backend (auto prefers Audiveris if installed, else homr)."),
+]
 
 
 def _print_result(res: TranscriptionResult) -> None:
@@ -107,6 +112,7 @@ def _build_config(
     cache: bool,
     cache_dir: Path,
     dpi: int = 300,
+    omr_backend: OmrBackend = OmrBackend.AUTO,
 ) -> TranscriptionConfig:
     return TranscriptionConfig(
         instrument=instrument,
@@ -118,6 +124,7 @@ def _build_config(
         use_cache=cache,
         cache_dir=cache_dir,
         pdf_dpi=dpi,
+        omr_backend=omr_backend,
     )
 
 
@@ -135,6 +142,7 @@ def convert(
     output: OutputOpt = None,
     part: PartOpt = None,
     dpi: Annotated[int, typer.Option("--dpi", help="PDF rasterization DPI (for .pdf fallback only).")] = 300,
+    omr_backend: OmrBackendOpt = OmrBackend.AUTO,
     chords: ChordsOpt = True,
     fingering: FingeringOpt = True,
     preserve_chords: PreserveChordsOpt = False,
@@ -153,6 +161,7 @@ def convert(
         cache=cache,
         cache_dir=cache_dir,
         dpi=dpi,
+        omr_backend=omr_backend,
     )
     res = convert_music(input_path=input_file, instrument=instrument, output_path=output, config=cfg)
     _print_result(res)
@@ -202,6 +211,7 @@ def pdf(
     output: OutputOpt = None,
     part: PartOpt = None,
     dpi: Annotated[int, typer.Option("--dpi", help="PDF rasterization DPI for OMR.")] = 300,
+    omr_backend: OmrBackendOpt = OmrBackend.AUTO,
     chords: ChordsOpt = True,
     fingering: FingeringOpt = True,
     preserve_chords: PreserveChordsOpt = False,
@@ -220,6 +230,7 @@ def pdf(
         cache=cache,
         cache_dir=cache_dir,
         dpi=dpi,
+        omr_backend=omr_backend,
     )
     res = transcribe_pdf(pdf_path=pdf_file, instrument=instrument, output_path=output, config=cfg)
     _print_result(res)

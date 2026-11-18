@@ -166,6 +166,7 @@ def test_end_to_end_pdf_fallback_omr_mocked(
             xml_outs.append(xml_out)
         return xml_outs
 
+    monkeypatch.setattr("transcribe_music.transcribe.omr_pdf._find_audiveris_executable", lambda: None)
     monkeypatch.setattr("transcribe_music.transcribe.omr_pdf._run_homr_batch", _fake_homr_batch)
 
     out_xml = tmp_path / "guitar_pdf.musicxml"

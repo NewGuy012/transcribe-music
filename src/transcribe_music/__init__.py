@@ -3,6 +3,7 @@
 from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
     Instrument,
+    OmrBackend,
     PartInfo,
     ScoreInspection,
     ScoreSearchResult,
@@ -21,6 +22,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "Instrument",
+    "OmrBackend",
     "PartInfo",
     "ScoreInspection",
     "ScoreSearchResult",
