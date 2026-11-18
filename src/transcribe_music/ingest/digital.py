@@ -13,6 +13,7 @@ from pathlib import Path
 import music21
 
 from transcribe_music.models import PartInfo, ScoreInspection
+from transcribe_music.score_utils import coerce_to_score, element_midis, iter_playable_notes
 
 logger = logging.getLogger(__name__)
 
@@ -65,44 +66,22 @@ def ensure_converter21_registered() -> None:
     _CONVERTER21_REGISTERED = True
 
 
-def _coerce_to_score(
+def _to_loaded_score(
     parsed: music21.stream.Stream,
-    default_title: str,
-) -> tuple[music21.stream.Score, list[str]]:
-    """Normalize a music21 parse result (Score, Part, or Opus) into a Score."""
-    warnings: list[str] = []
-    if isinstance(parsed, music21.stream.Opus):
-        scores = list(parsed.scores)
-        if not scores:
-            raise ValueError("Opus file contains zero scores.")
-        if len(scores) > 1:
-            warnings.append(
-                f"Input Opus contains {len(scores)} movements/tunes; loaded the first score only."
-            )
-        score = scores[0]
-    elif isinstance(parsed, music21.stream.Score):
-        score = parsed
-    elif isinstance(parsed, music21.stream.Part):
-        score = music21.stream.Score()
-        score.insert(0, parsed)
-    else:
-        score = music21.stream.Score()
-        part = music21.stream.Part()
-        for el in list(parsed):
-            if isinstance(el, music21.metadata.Metadata):
-                score.metadata = el
-            elif not isinstance(el, music21.layout.LayoutBase):
-                part.append(el)
-        score.insert(0, part)
-
-    if score.metadata is None:
-        score.metadata = music21.metadata.Metadata()
-    resolved_title = (score.metadata.title or score.metadata.movementName or "").strip()
-    if resolved_title and resolved_title != "Music21 Fragment":
-        score.metadata.title = resolved_title
-    else:
-        score.metadata.title = default_title
-    return score, warnings
+    path: Path,
+    backend: str,
+    *,
+    format_name: str | None = None,
+    is_sounding: bool = False,
+) -> LoadedDigitalScore:
+    score, warnings = coerce_to_score(parsed, path.stem)
+    return LoadedDigitalScore(
+        score=score,
+        backend=backend,
+        format_name=format_name or path.suffix.lstrip(".").lower(),
+        is_sounding_pitch_source=is_sounding,
+        warnings=warnings,
+    )
 
 
 def _find_musescore_executable() -> str | None:
@@ -151,32 +130,17 @@ def _load_musescore_file(path: Path) -> LoadedDigitalScore:
             detail = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
             raise RuntimeError(f"MuseScore failed converting {path.name} to MusicXML: {detail}")
         parsed = music21.converter.parse(str(tmp_xml), format="musicxml")
-        score, warnings = _coerce_to_score(parsed, path.stem)
-        return LoadedDigitalScore(
-            score=score,
-            backend="musescore",
-            format_name=path.suffix.lstrip(".").lower(),
-            is_sounding_pitch_source=False,
-            warnings=warnings,
-        )
+        return _to_loaded_score(parsed, path, "musescore")
 
 
 def _load_capella_file(path: Path) -> LoadedDigitalScore:
     """Load Capella .capx via music21 native parser (falling back to MuseScore) or .cap via MuseScore."""
-    suffix = path.suffix.lower()
-    if suffix == ".capx":
+    if path.suffix.lower() == ".capx":
         try:
             from music21.capella.fromCapellaXML import CapellaImporter
 
             parsed = CapellaImporter().scoreFromFile(str(path))
-            score, warnings = _coerce_to_score(parsed, path.stem)
-            return LoadedDigitalScore(
-                score=score,
-                backend="capella_xml",
-                format_name="capx",
-                is_sounding_pitch_source=False,
-                warnings=warnings,
-            )
+            return _to_loaded_score(parsed, path, "capella_xml", format_name="capx")
         except Exception as exc:
             if _find_musescore_executable() is not None:
                 loaded = _load_musescore_file(path)
@@ -209,14 +173,7 @@ def _load_lilypond_file(
                 tmp_xml = Path(tmp_dir) / f"{path.stem}.musicxml"
                 tmp_xml.write_text(xml_text, encoding="utf-8")
                 parsed = music21.converter.parse(str(tmp_xml), format="musicxml")
-                score, warnings = _coerce_to_score(parsed, path.stem)
-                return LoadedDigitalScore(
-                    score=score,
-                    backend="python_ly",
-                    format_name="ly",
-                    is_sounding_pitch_source=False,
-                    warnings=warnings,
-                )
+                return _to_loaded_score(parsed, path, "python_ly", format_name="ly")
 
     lilypond_bin = shutil.which("lilypond")
     if lilypond_bin is not None:
@@ -237,13 +194,8 @@ def _load_lilypond_file(
                     quantizePost=True,
                     quarterLengthDivisors=quantize_divisors or (4, 3),
                 )
-                score, warnings = _coerce_to_score(parsed, path.stem)
-                return LoadedDigitalScore(
-                    score=score,
-                    backend="lilypond_midi",
-                    format_name="ly",
-                    is_sounding_pitch_source=True,
-                    warnings=warnings,
+                return _to_loaded_score(
+                    parsed, path, "lilypond_midi", format_name="ly", is_sounding=True
                 )
             detail = proc.stderr.strip() or proc.stdout.strip() or "no MIDI output produced (missing \\midi block?)"
             raise RuntimeError(f"LilyPond failed converting {path.name}: {detail}")
@@ -486,38 +438,15 @@ def load_digital_score(
             quantizePost=True,
             quarterLengthDivisors=quantize_divisors or (4, 3),
         )
-        score, warnings = _coerce_to_score(parsed, src.stem)
-        return LoadedDigitalScore(
-            score=score,
-            backend="midi",
-            format_name="midi",
-            is_sounding_pitch_source=True,
-            warnings=warnings,
-        )
+        return _to_loaded_score(parsed, src, "midi", format_name="midi", is_sounding=True)
 
     if suffix in CONVERTER21_EXTENSIONS:
         ensure_converter21_registered()
-        backend = CONVERTER21_EXTENSIONS[suffix]
         parsed = music21.converter.parse(str(src))
-        score, warnings = _coerce_to_score(parsed, src.stem)
-        return LoadedDigitalScore(
-            score=score,
-            backend=backend,
-            format_name=suffix.lstrip("."),
-            is_sounding_pitch_source=False,
-            warnings=warnings,
-        )
+        return _to_loaded_score(parsed, src, CONVERTER21_EXTENSIONS[suffix])
 
-    # MusicXML (.musicxml, .xml, .mxl)
     parsed = music21.converter.parse(str(src))
-    score, warnings = _coerce_to_score(parsed, src.stem)
-    return LoadedDigitalScore(
-        score=score,
-        backend="musicxml",
-        format_name=suffix.lstrip("."),
-        is_sounding_pitch_source=False,
-        warnings=warnings,
-    )
+    return _to_loaded_score(parsed, src, "musicxml")
 
 
 def summarize_score_parts(score: music21.stream.Score) -> list[PartInfo]:
@@ -527,18 +456,7 @@ def summarize_score_parts(score: music21.stream.Score) -> list[PartInfo]:
         inst = part.recurse().getElementsByClass(music21.instrument.Instrument).first()
         clef = part.recurse().getElementsByClass(music21.clef.Clef).first()
         measures = list(part.getElementsByClass(music21.stream.Measure))
-
-        pitches: list[int] = []
-        note_count = 0
-        for el in part.recurse().notes:
-            if isinstance(el, music21.harmony.ChordSymbol):
-                continue
-            if isinstance(el, music21.note.Note):
-                note_count += 1
-                pitches.append(int(el.pitch.midi))
-            elif isinstance(el, music21.chord.Chord):
-                note_count += len(el.pitches)
-                pitches.extend(int(p.midi) for p in el.pitches)
+        pitches = [m for el in iter_playable_notes(part) for m in element_midis(el)]
 
         inst_name = getattr(inst, "instrumentName", None) if inst is not None else None
         midi_prog = getattr(inst, "midiProgram", None) if inst is not None else None
@@ -559,7 +477,7 @@ def summarize_score_parts(score: music21.stream.Score) -> list[PartInfo]:
                 midi_program=int(midi_prog) if midi_prog is not None else None,
                 clef=clef_name,
                 measure_count=len(measures),
-                note_count=note_count,
+                note_count=len(pitches),
                 pitch_min=min(pitches) if pitches else None,
                 pitch_max=max(pitches) if pitches else None,
             )

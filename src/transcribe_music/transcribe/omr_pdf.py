@@ -12,6 +12,7 @@ import music21
 
 from transcribe_music.ingest.pdf import render_pdf_pages
 from transcribe_music.models import Instrument, OmrBackend
+from transcribe_music.score_utils import coerce_to_score
 
 
 def _find_audiveris_executable() -> str | None:
@@ -110,7 +111,7 @@ def _build_homr_command(image_paths: list[Path]) -> list[str]:
         raise RuntimeError(
             "PDF OMR fallback requires 'homr' or 'uvx' to run homr[cpu] in an isolated environment."
         )
-    return [uvx_bin, "--python", "3.14", "--from", "homr[cpu]", "homr", *resolved]
+    return [uvx_bin, "--python", "3.14", "--from", "homr[cpu]==0.7.1", "homr", *resolved]
 
 
 def _run_homr_batch(image_paths: list[Path], work_dir: Path) -> list[Path]:
@@ -172,15 +173,8 @@ def stitch_musicxml_pages(
 
     if len(page_xml_paths) == 1:
         parsed = music21.converter.parse(str(page_xml_paths[0]))
-        if isinstance(parsed, music21.stream.Part):
-            wrapper = music21.stream.Score()
-            wrapper.insert(0, parsed)
-            parsed = wrapper
-        if parsed.metadata is None:
-            parsed.metadata = music21.metadata.Metadata()
-        if title and not parsed.metadata.title:
-            parsed.metadata.title = title
-        return parsed
+        score, _ = coerce_to_score(parsed, title)
+        return score
 
     merged_score = music21.stream.Score()
     merged_score.metadata = music21.metadata.Metadata(title=title or f"{instrument.value.title()} Score")
@@ -246,21 +240,3 @@ def run_pdf_omr(
     xml_paths = _run_homr_batch(image_paths, pages_dir)
     score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
     return score, "homr", warnings
-
-
-def transcribe_pdf_omr(
-    pdf_path: Path,
-    work_dir: Path,
-    instrument: Instrument,
-    dpi: int = 300,
-    omr_backend: OmrBackend | str = OmrBackend.AUTO,
-) -> music21.stream.Score:
-    """Rasterize/recognize a sheet music PDF into a music21 Score."""
-    score, _backend, _warnings = run_pdf_omr(
-        pdf_path,
-        work_dir,
-        instrument=instrument,
-        dpi=dpi,
-        omr_backend=omr_backend,
-    )
-    return score

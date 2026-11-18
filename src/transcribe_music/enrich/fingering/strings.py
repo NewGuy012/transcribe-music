@@ -7,9 +7,13 @@ from itertools import product
 
 import music21
 
+from transcribe_music.enrich.fingering._shared import (
+    apply_string_articulations,
+    pick_unique_string_candidates,
+)
 from transcribe_music.enrich.fingering.viterbi import solve_viterbi
-from transcribe_music.export.musicxml import clear_technical_articulations, sorted_playable_notes
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
+from transcribe_music.score_utils import element_midis, prepare_playable_notes
 
 
 @dataclass(frozen=True)
@@ -100,14 +104,9 @@ def _chord_poses(
     if valid:
         return valid
 
-    used: set[int] = set()
-    fb: list[tuple[int, int, str]] = []
-    pos = 1
-    for opts in per_note:
-        pick = next((o for o in opts if o[0] not in used), opts[0])
-        used.add(pick[0])
-        fb.append((pick[0], pick[1], pick[2]))
-        pos = pick[3]
+    picked = pick_unique_string_candidates(per_note, lambda o: o[0])
+    fb = [(o[0], o[1], o[2]) for o in picked]
+    pos = picked[-1][3]
     return [_StringPose(notes_pose=tuple(fb), position_base=pos, thumb_mode=is_cello and pos >= 7)]
 
 
@@ -122,26 +121,15 @@ def annotate_bowed_string_fingering(
         return score
 
     part = score.parts[0]
-    elements = sorted_playable_notes(part)
+    elements = prepare_playable_notes(
+        part, music21.articulations.Fingering, music21.articulations.StringIndication
+    )
     if not elements:
         return score
 
-    clear_technical_articulations(
-        elements, music21.articulations.Fingering, music21.articulations.StringIndication
-    )
-
     is_cello = instrument == Instrument.CELLO
     open_strings = INSTRUMENT_SPECS[instrument].open_string_midi
-    steps = [
-        _chord_poses(
-            [int(el.pitch.midi)]
-            if isinstance(el, music21.note.Note)
-            else [int(n.pitch.midi) for n in el.notes],
-            open_strings,
-            is_cello,
-        )
-        for el in elements
-    ]
+    steps = [_chord_poses(element_midis(el), open_strings, is_cello) for el in elements]
 
     pos_weight = 0.25 if is_cello else 0.28
     shift_base = 1.9 if is_cello else 1.8
@@ -184,10 +172,5 @@ def annotate_bowed_string_fingering(
             cost += same_finger_pen
         return cost
 
-    for el, pose in zip(elements, solve_viterbi(steps, _unary, _transition), strict=True):
-        for _, _, finger_label in pose.notes_pose:
-            el.articulations.append(music21.articulations.Fingering(finger_label))
-        for s_num, _, _ in pose.notes_pose:
-            el.articulations.append(music21.articulations.StringIndication(s_num))
-
+    apply_string_articulations(elements, solve_viterbi(steps, _unary, _transition), include_fret=False)
     return score

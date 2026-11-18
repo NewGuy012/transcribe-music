@@ -18,7 +18,6 @@ from transcribe_music.models import Instrument, OmrBackend
 from transcribe_music.transcribe.omr_pdf import (
     run_pdf_omr,
     stitch_musicxml_pages,
-    transcribe_pdf_omr,
 )
 from transcribe_music.transcribe.part_selector import select_and_adapt_parts
 
@@ -359,7 +358,9 @@ def test_batched_pdf_omr_invokes_homr_once_and_stitches_pages(
     monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/homr" if name == "homr" else None)
     monkeypatch.setattr("subprocess.run", _fake_subprocess_run)
 
-    score = transcribe_pdf_omr(pdf_path, tmp_path / "work", Instrument.VIOLIN, dpi=150)
+    score, backend, warnings = run_pdf_omr(pdf_path, tmp_path / "work", Instrument.VIOLIN, dpi=150)
+    assert backend == "homr"
+    assert not warnings
     assert len(subprocess_calls) == 1
     out_xml = tmp_path / "omr_out.musicxml"
     metrics, _ = export_musicxml(score, out_xml, Instrument.VIOLIN)

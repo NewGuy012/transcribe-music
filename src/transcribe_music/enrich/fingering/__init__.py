@@ -8,6 +8,7 @@ from transcribe_music.enrich.fingering.guitar import annotate_guitar_fingering
 from transcribe_music.enrich.fingering.piano import annotate_piano_fingering
 from transcribe_music.enrich.fingering.strings import annotate_bowed_string_fingering
 from transcribe_music.models import Instrument
+from transcribe_music.score_utils import iter_playable_notes
 
 
 def _has_existing_fingering(score: music21.stream.Score, instrument: Instrument) -> bool:
@@ -22,9 +23,7 @@ def _has_existing_fingering(score: music21.stream.Score, instrument: Instrument)
         target_types = (music21.articulations.Fingering,)
 
     for part in score.parts:
-        for n in part.recurse().notes:
-            if isinstance(n, music21.harmony.ChordSymbol):
-                continue
+        for n in iter_playable_notes(part):
             if any(isinstance(a, target_types) for a in n.articulations):
                 return True
     return False

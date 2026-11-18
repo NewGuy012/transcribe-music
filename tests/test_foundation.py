@@ -7,7 +7,7 @@ import music21
 import pymupdf
 import pytest
 
-from transcribe_music.export.musicxml import _extract_metrics_and_validate_xml, export_musicxml
+from transcribe_music.export.musicxml import _postprocess_and_validate_xml, export_musicxml
 from transcribe_music.ingest.pdf import render_pdf_pages
 from transcribe_music.models import (
     Instrument,
@@ -174,7 +174,7 @@ def test_xml_validator_rejects_duplicate_rests_and_overfull_measures(tmp_path: P
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="duplicate whole-measure rests"):
-        _extract_metrics_and_validate_xml(dup_rest_xml)
+        _postprocess_and_validate_xml(dup_rest_xml)
 
     overfull_xml = tmp_path / "overfull.musicxml"
     overfull_xml.write_text(
@@ -192,7 +192,7 @@ def test_xml_validator_rejects_duplicate_rests_and_overfull_measures(tmp_path: P
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="overflows active 4/4 meter"):
-        _extract_metrics_and_validate_xml(overfull_xml)
+        _postprocess_and_validate_xml(overfull_xml)
 
 
 def test_export_accepts_valid_multivoice_measure(tmp_path: Path) -> None:

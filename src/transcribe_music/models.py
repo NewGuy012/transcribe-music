@@ -44,7 +44,6 @@ class InstrumentSpec:
     midi_max: int
     clef_mode: Literal["grand", "treble", "treble_8vb", "bass"]
     transpose_semitones: int
-    max_polyphony: int
     gm_programs: tuple[int, ...]
     open_string_midi: tuple[int, ...]  # Ordered string 1 (highest) -> string N (lowest)
 
@@ -57,7 +56,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         midi_max=108,  # C8
         clef_mode="grand",
         transpose_semitones=0,
-        max_polyphony=10,
         gm_programs=tuple(range(8)),
         open_string_midi=(),
     ),
@@ -68,7 +66,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         midi_max=88,  # E6 sounding (E7 written)
         clef_mode="treble_8vb",
         transpose_semitones=-12,
-        max_polyphony=6,
         gm_programs=tuple(range(24, 32)),
         open_string_midi=(64, 59, 55, 50, 45, 40),  # E4, B3, G3, D3, A2, E2
     ),
@@ -79,7 +76,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         midi_max=105,  # A7
         clef_mode="treble",
         transpose_semitones=0,
-        max_polyphony=2,
         gm_programs=(40,),
         open_string_midi=(76, 69, 62, 55),  # E5, A4, D4, G3
     ),
@@ -90,7 +86,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         midi_max=84,  # C6
         clef_mode="bass",
         transpose_semitones=0,
-        max_polyphony=2,
         gm_programs=(42,),
         open_string_midi=(57, 50, 43, 36),  # A3, D3, G2, C2
     ),

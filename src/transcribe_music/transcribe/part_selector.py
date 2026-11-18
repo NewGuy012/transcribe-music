@@ -10,6 +10,13 @@ import music21
 
 from transcribe_music.ingest.digital import summarize_score_parts
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument, PartInfo
+from transcribe_music.score_utils import (
+    element_midis,
+    fill_stream_rest_gaps,
+    iter_playable_notes,
+    make_clef,
+    replace_or_insert_initial_clef,
+)
 
 _INSTRUMENT_KEYWORDS: dict[Instrument, tuple[str, ...]] = {
     Instrument.PIANO: ("piano", "klavier", "pno", "keyboard", "rh", "lh", "right", "left"),
@@ -190,35 +197,6 @@ def _auto_select_parts(
     return [best_idx], warnings
 
 
-def _fill_measure_gaps(
-    measure: music21.stream.Measure,
-    bar_ql: Fraction,
-) -> None:
-    """Fill uncovered beat intervals inside a single-voice Measure with non-overlapping Rests."""
-    notes_only = sorted(
-        [
-            el
-            for el in list(measure)
-            if isinstance(el, (music21.note.Note, music21.chord.Chord))
-            and not isinstance(el, music21.harmony.ChordSymbol)
-        ],
-        key=lambda e: float(e.offset),
-    )
-    if not notes_only:
-        measure.insert(Fraction(0, 1), music21.note.Rest(quarterLength=bar_ql))
-        return
-
-    cursor = Fraction(0, 1)
-    for el in notes_only:
-        off = Fraction(el.offset).limit_denominator(24)
-        dur = Fraction(el.duration.quarterLength).limit_denominator(24)
-        if off > cursor:
-            measure.insert(cursor, music21.note.Rest(quarterLength=off - cursor))
-        cursor = max(cursor, min(bar_ql, off + dur))
-    if cursor < bar_ql:
-        measure.insert(cursor, music21.note.Rest(quarterLength=bar_ql - cursor))
-
-
 def _insert_grouped_events(
     measure: music21.stream.Measure,
     events: list[tuple[Fraction, Fraction, list[int], music21.tie.Tie | None]],
@@ -254,7 +232,7 @@ def _insert_grouped_events(
             el.tie = copy.deepcopy(ties[0])
         measure.insert(off, el)
 
-    _fill_measure_gaps(measure, bar_ql)
+    fill_stream_rest_gaps(measure, bar_ql)
 
 
 def _split_single_part_piano(src_part: music21.stream.Part) -> tuple[music21.stream.Part, music21.stream.Part]:
@@ -303,25 +281,18 @@ def _split_single_part_piano(src_part: music21.stream.Part) -> tuple[music21.str
         rh_events: list[tuple[Fraction, Fraction, list[int], music21.tie.Tie | None]] = []
         lh_events: list[tuple[Fraction, Fraction, list[int], music21.tie.Tie | None]] = []
 
-        for el in m.recurse().notes:
-            if isinstance(el, music21.harmony.ChordSymbol):
-                continue
+        for el in iter_playable_notes(m):
             off = Fraction(float(el.getOffsetInHierarchy(m))).limit_denominator(24)
             dur = max(Fraction(1, 8), Fraction(float(el.duration.quarterLength)).limit_denominator(24))
-            if isinstance(el, music21.note.Note):
-                p = int(el.pitch.midi)
-                (rh_events if p >= 60 else lh_events).append((off, dur, [p], el.tie))
-            elif isinstance(el, music21.chord.Chord):
-                pitches = sorted(int(p.midi) for p in el.pitches)
-                if not pitches:
-                    continue
-                if pitches[-1] - pitches[0] > 12:
-                    mid = 0.5 * (pitches[0] + pitches[-1])
-                    r_p = [p for p in pitches if p >= mid]
-                    l_p = [p for p in pitches if p < mid]
-                else:
-                    r_p = [p for p in pitches if p >= 60]
-                    l_p = [p for p in pitches if p < 60]
+            pitches = sorted(element_midis(el))
+            if not pitches:
+                continue
+            if len(pitches) == 1:
+                (rh_events if pitches[0] >= 60 else lh_events).append((off, dur, pitches, el.tie))
+            else:
+                split_pt = 0.5 * (pitches[0] + pitches[-1]) if pitches[-1] - pitches[0] > 12 else 60
+                r_p = [p for p in pitches if p >= split_pt]
+                l_p = [p for p in pitches if p < split_pt]
                 if r_p:
                     rh_events.append((off, dur, r_p, el.tie))
                 if l_p:
@@ -335,28 +306,6 @@ def _split_single_part_piano(src_part: music21.stream.Part) -> tuple[music21.str
     return rh, lh
 
 
-def _replace_or_insert_initial_clef(
-    part: music21.stream.Part,
-    new_clef: music21.clef.Clef,
-    *,
-    force_replace_first: bool,
-) -> None:
-    measures = list(part.getElementsByClass(music21.stream.Measure))
-    target_stream: music21.stream.Stream = measures[0] if measures else part
-    existing = list(target_stream.getElementsByClass(music21.clef.Clef))
-    if not existing:
-        # Also remove any part-level clef if measures exist
-        if measures:
-            for c in list(part.getElementsByClass(music21.clef.Clef)):
-                part.remove(c)
-        target_stream.insert(0, new_clef)
-        return
-    if force_replace_first:
-        for c in existing:
-            target_stream.remove(c)
-        target_stream.insert(0, new_clef)
-
-
 def _adapt_guitar_part(
     part: music21.stream.Part,
     *,
@@ -367,12 +316,7 @@ def _adapt_guitar_part(
     existing_transposition = getattr(inst, "transposition", None) if inst is not None else None
     first_clef = part.recurse().getElementsByClass(music21.clef.Clef).first()
 
-    pitches = [
-        int(p.midi)
-        for el in part.recurse().notes
-        if not isinstance(el, music21.harmony.ChordSymbol)
-        for p in ([el.pitch] if isinstance(el, music21.note.Note) else el.pitches)
-    ]
+    pitches = [m for el in iter_playable_notes(part) for m in element_midis(el)]
     min_pitch = min(pitches) if pitches else None
 
     needs_octave_up = is_sounding_pitch_source or (
@@ -382,19 +326,17 @@ def _adapt_guitar_part(
         and min_pitch < 52
     )
     if needs_octave_up:
-        for el in part.recurse().notes:
-            if isinstance(el, music21.harmony.ChordSymbol):
-                continue
+        for el in iter_playable_notes(part):
             if isinstance(el, music21.note.Note):
                 el.pitch.midi += 12
-            elif isinstance(el, music21.chord.Chord):
+            else:
                 for p in el.pitches:
                     p.midi += 12
 
-    _replace_or_insert_initial_clef(
+    replace_or_insert_initial_clef(
         part,
         music21.clef.Treble8vbClef(),
-        force_replace_first=(
+        force_replace=(
             is_sounding_pitch_source
             or isinstance(first_clef, music21.clef.BassClef)
             or not isinstance(first_clef, music21.clef.Treble8vbClef)
@@ -442,13 +384,10 @@ def select_and_adapt_parts(
         else:
             for staff_idx, idx in enumerate(chosen_indices[:2]):
                 p_copy = copy.deepcopy(parts[idx])
-                default_clef = (
-                    music21.clef.TrebleClef() if staff_idx == 0 else music21.clef.BassClef()
-                )
-                _replace_or_insert_initial_clef(
+                replace_or_insert_initial_clef(
                     p_copy,
-                    default_clef,
-                    force_replace_first=is_sounding_pitch_source,
+                    make_clef("grand", staff_idx),
+                    force_replace=is_sounding_pitch_source,
                 )
                 out_score.insert(0, p_copy)
         return SelectedScore(
@@ -460,17 +399,11 @@ def select_and_adapt_parts(
     part_copy = copy.deepcopy(parts[chosen_indices[0]])
     if instrument == Instrument.GUITAR:
         _adapt_guitar_part(part_copy, is_sounding_pitch_source=is_sounding_pitch_source)
-    elif instrument == Instrument.CELLO:
-        _replace_or_insert_initial_clef(
+    else:
+        replace_or_insert_initial_clef(
             part_copy,
-            music21.clef.BassClef(),
-            force_replace_first=is_sounding_pitch_source,
-        )
-    elif instrument == Instrument.VIOLIN:
-        _replace_or_insert_initial_clef(
-            part_copy,
-            music21.clef.TrebleClef(),
-            force_replace_first=is_sounding_pitch_source,
+            make_clef(INSTRUMENT_SPECS[instrument].clef_mode),
+            force_replace=is_sounding_pitch_source,
         )
 
     out_score.insert(0, part_copy)

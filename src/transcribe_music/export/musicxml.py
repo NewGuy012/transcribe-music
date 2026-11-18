@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import math
+import copy
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from fractions import Fraction
@@ -11,6 +11,13 @@ from pathlib import Path
 import music21
 
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
+from transcribe_music.score_utils import (
+    coerce_to_score,
+    fill_stream_rest_gaps,
+    is_playable_chord,
+    make_clef,
+    replace_or_insert_initial_clef,
+)
 
 
 @dataclass(frozen=True)
@@ -23,34 +30,6 @@ class ExportMetrics:
     fingering_count: int
 
 
-def is_playable_chord(el: object) -> bool:
-    """Return True for performed Chord objects, excluding Harmony ChordSymbols."""
-    return isinstance(el, music21.chord.Chord) and not isinstance(
-        el, music21.harmony.ChordSymbol
-    )
-
-
-def sorted_playable_notes(
-    part: music21.stream.Stream,
-) -> list[music21.note.Note | music21.chord.Chord]:
-    """Return all performed Notes and Chords (excluding ChordSymbol) ordered by part offset."""
-    items = [
-        el
-        for el in part.recurse().notes
-        if isinstance(el, music21.note.Note) or is_playable_chord(el)
-    ]
-    return sorted(items, key=lambda el: float(el.getOffsetInHierarchy(part)))
-
-
-def clear_technical_articulations(
-    elements: list[music21.note.Note | music21.chord.Chord],
-    *articulation_types: type[music21.articulations.Articulation],
-) -> None:
-    """Remove any existing technical articulations of the given types before re-annotating."""
-    for el in elements:
-        el.articulations = [a for a in el.articulations if not isinstance(a, articulation_types)]
-
-
 def _make_music21_instrument(instrument: Instrument) -> music21.instrument.Instrument:
     if instrument == Instrument.PIANO:
         return music21.instrument.Piano()
@@ -59,16 +38,6 @@ def _make_music21_instrument(instrument: Instrument) -> music21.instrument.Instr
     if instrument == Instrument.VIOLIN:
         return music21.instrument.Violin()
     return music21.instrument.Violoncello()
-
-
-def _make_clef(spec_clef: str, staff_idx: int = 0) -> music21.clef.Clef:
-    if spec_clef == "grand":
-        return music21.clef.TrebleClef() if staff_idx == 0 else music21.clef.BassClef()
-    if spec_clef == "treble_8vb":
-        return music21.clef.Treble8vbClef()
-    if spec_clef == "bass":
-        return music21.clef.BassClef()
-    return music21.clef.TrebleClef()
 
 
 _UNEXPORTABLE_DURATION_TYPES = frozenset({"inexpressible", "zero", "2048th", "duplex-maxima"})
@@ -116,41 +85,6 @@ def _exact_fraction_or_none(value: float | Fraction) -> Fraction | None:
     if isinstance(value, Fraction):
         return value
     return Fraction(float(value)).limit_denominator(10000)
-
-
-def _is_pow2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
-
-def split_tuplet_interval(onset: Fraction, end: Fraction) -> list[tuple[Fraction, Fraction]]:
-    """Keep tuplet spans beat-local by splitting non-binary endpoints at integer beat boundaries."""
-    if onset >= end:
-        return []
-    if _is_pow2(onset.denominator) and _is_pow2(end.denominator):
-        return [(onset, end)]
-
-    segments: list[tuple[Fraction, Fraction]] = []
-    cur = onset
-    if not _is_pow2(cur.denominator):
-        first_beat_end = Fraction(math.floor(cur) + 1, 1)
-        if end <= first_beat_end:
-            return [(cur, end)]
-        segments.append((cur, first_beat_end))
-        cur = first_beat_end
-
-    if not _is_pow2(end.denominator):
-        last_beat_start = Fraction(math.floor(end), 1)
-        if cur < last_beat_start:
-            segments.append((cur, last_beat_start))
-            cur = last_beat_start
-    if cur < end:
-        segments.append((cur, end))
-    return segments
-
-
-def _insert_split_rests(st: music21.stream.Stream, start: Fraction, end: Fraction) -> None:
-    for seg_start, seg_end in split_tuplet_interval(start, end):
-        st.insert(seg_start, music21.note.Rest(quarterLength=seg_end - seg_start))
 
 
 def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) -> None:
@@ -221,15 +155,7 @@ def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) 
             if cur_ql > max_dur > 0:
                 n.duration = music21.duration.Duration(max_dur)
 
-    cursor = Fraction(0, 1)
-    for n in notes_only:
-        n_off = Fraction(n.offset).limit_denominator(24)
-        n_end = n_off + Fraction(n.duration.quarterLength).limit_denominator(24)
-        if n_off > cursor:
-            _insert_split_rests(st, cursor, min(n_off, bar_ql))
-        cursor = max(cursor, min(n_end, bar_ql))
-    if cursor < bar_ql:
-        _insert_split_rests(st, cursor, bar_ql)
+    fill_stream_rest_gaps(st, bar_ql, notes_only=notes_only)
 
 
 def _repair_unexportable_durations(part: music21.stream.Part) -> None:
@@ -268,17 +194,9 @@ def normalize_score_structure(
     if title:
         score.metadata.title = title
 
+    if not list(score.parts):
+        score, _ = coerce_to_score(score, default_title=title, ensure_part=True)
     parts = list(score.parts)
-    if not parts:
-        part = music21.stream.Part()
-        for el in list(score):
-            if not isinstance(el, (music21.metadata.Metadata, music21.layout.LayoutBase)):
-                part.append(el)
-        score = music21.stream.Score(id=f"{instrument.value}_score")
-        if title:
-            score.metadata = music21.metadata.Metadata(title=title)
-        score.insert(0, part)
-        parts = [part]
 
     for idx, part in enumerate(parts):
         for existing_inst in list(part.recurse().getElementsByClass(music21.instrument.Instrument)):
@@ -290,12 +208,11 @@ def normalize_score_structure(
         part.insert(0, m21_inst)
 
         measures = list(part.getElementsByClass(music21.stream.Measure))
-        had_measures = bool(measures)
-        if not had_measures:
+        if not measures:
             if not part.getElementsByClass(music21.meter.TimeSignature):
                 part.insert(0, music21.meter.TimeSignature("4/4"))
             if not part.getElementsByClass(music21.clef.Clef):
-                part.insert(0, _make_clef(spec.clef_mode, idx))
+                part.insert(0, make_clef(spec.clef_mode, idx))
             _repair_unexportable_durations(part)
             part.makeMeasures(inPlace=True)
             part.makeNotation(inPlace=True)
@@ -304,22 +221,23 @@ def normalize_score_structure(
 
         if measures:
             first_m = measures[0]
-            first_clefs = list(first_m.getElementsByClass(music21.clef.Clef))
-            if not first_clefs:
-                first_m.insert(0, _make_clef(spec.clef_mode, idx))
-            elif instrument == Instrument.GUITAR and not isinstance(
-                first_clefs[0], music21.clef.Treble8vbClef
-            ):
-                first_m.remove(first_clefs[0])
-                first_m.insert(0, _make_clef(spec.clef_mode, idx))
+            first_clef = first_m.getElementsByClass(music21.clef.Clef).first()
+            force_clef = instrument == Instrument.GUITAR and not isinstance(
+                first_clef, music21.clef.Treble8vbClef
+            )
+            replace_or_insert_initial_clef(
+                part, make_clef(spec.clef_mode, idx), force_replace=force_clef
+            )
 
             if not first_m.getElementsByClass(music21.meter.TimeSignature):
                 ts = part.recurse().getElementsByClass(music21.meter.TimeSignature).first()
-                first_m.insert(0, ts if ts is not None else music21.meter.TimeSignature("4/4"))
+                first_m.insert(
+                    0, copy.deepcopy(ts) if ts is not None else music21.meter.TimeSignature("4/4")
+                )
             if not first_m.getElementsByClass(music21.key.KeySignature):
                 ks = part.recurse().getElementsByClass(music21.key.KeySignature).first()
                 if ks is not None:
-                    first_m.insert(0, ks)
+                    first_m.insert(0, copy.deepcopy(ks))
 
         _repair_unexportable_durations(part)
 
@@ -346,12 +264,9 @@ def _strip_non_note_articulations(score: music21.stream.Score) -> None:
             h.activeSite.remove(h)
 
 
-def _redistribute_chord_technical_tags(xml_path: Path) -> None:
+def _redistribute_chord_technical_tags(root: ET.Element) -> bool:
     """Fix music21 Chord serialization by pairing <string>/<fret> 1-to-1 across chord notes."""
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
     changed = False
-
     for measure in root.findall(".//measure"):
         notes = measure.findall("note")
         i = 0
@@ -384,10 +299,7 @@ def _redistribute_chord_technical_tags(xml_path: Path) -> None:
                                 target_tech.append(frets[idx])
                                 changed = True
             i = j
-
-    if changed:
-        ET.indent(tree, space="  ")
-        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+    return changed
 
 
 def _validate_part_measures(parts: list[ET.Element]) -> None:
@@ -425,7 +337,7 @@ def _validate_part_measures(parts: list[ET.Element]) -> None:
             if measure.attrib.get("implicit") == "yes":
                 continue
 
-            expected_divs = (divisions * beats * 4) // beat_type
+            expected_divs = Fraction(divisions * beats * 4, beat_type)
             cursor = 0
             max_cursor = 0
             for child in measure:
@@ -453,12 +365,16 @@ def _validate_part_measures(parts: list[ET.Element]) -> None:
                 )
 
 
-def _extract_metrics_and_validate_xml(xml_path: Path) -> ExportMetrics:
-    """Validate serialized MusicXML structure and extract structural counts."""
+def _postprocess_and_validate_xml(xml_path: Path) -> ExportMetrics:
+    """Redistribute chord technical tags, validate MusicXML structure, and extract counts."""
     tree = ET.parse(xml_path)
     root = tree.getroot()
     if root.tag not in ("score-partwise", "score-timewise"):
         raise ValueError(f"Invalid MusicXML root element: {root.tag}")
+
+    if _redistribute_chord_technical_tags(root):
+        ET.indent(tree, space="  ")
+        tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 
     xml_measures = root.findall(".//measure")
     if not xml_measures:
@@ -503,6 +419,4 @@ def export_musicxml(
         _strip_non_note_articulations(normalized)
         normalized.write("musicxml", fp=str(output_path))
 
-    _redistribute_chord_technical_tags(output_path)
-    metrics = _extract_metrics_and_validate_xml(output_path)
-    return metrics, warnings
+    return _postprocess_and_validate_xml(output_path), warnings

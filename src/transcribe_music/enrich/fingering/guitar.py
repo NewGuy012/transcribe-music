@@ -7,9 +7,13 @@ from itertools import product
 
 import music21
 
+from transcribe_music.enrich.fingering._shared import (
+    apply_string_articulations,
+    pick_unique_string_candidates,
+)
 from transcribe_music.enrich.fingering.viterbi import solve_viterbi
-from transcribe_music.export.musicxml import clear_technical_articulations, sorted_playable_notes
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
+from transcribe_music.score_utils import element_midis, prepare_playable_notes
 
 _GUITAR_OPEN_MIDI = INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi  # Strings 1..6 (E4..E2)
 _MAX_FRET = 19
@@ -105,14 +109,8 @@ def _chord_poses(sounding_midis: list[int]) -> list[_GuitarPose]:
             break
 
     if not valid:
-        # Relaxed fallback if chord is wider than standard 4-fret grip
-        used_strings: set[int] = set()
-        fallback_list: list[tuple[int, int, int]] = []
-        for opts in per_note_opts:
-            choice = next(((s, f) for s, f in opts if s not in used_strings), opts[0])
-            used_strings.add(choice[0])
-            f = choice[1]
-            fallback_list.append((choice[0], f, 0 if f == 0 else 1))
+        picked = pick_unique_string_candidates(per_note_opts, lambda c: c[0])
+        fallback_list = [(s, f, 0 if f == 0 else 1) for s, f in picked]
         frets = [f for _, f, _ in fallback_list if f > 0]
         return [
             _GuitarPose(
@@ -132,35 +130,37 @@ def annotate_guitar_fingering(score: music21.stream.Score) -> music21.stream.Sco
     if not score.parts:
         return score
     part = score.parts[0]
-    first_clef = part.recurse().getElementsByClass(music21.clef.Clef).first()
-    is_written_8vb = part.atSoundingPitch is False or isinstance(
-        first_clef, music21.clef.Treble8vbClef
-    )
-    transpose = (
-        0
-        if (part.atSoundingPitch is True and not is_written_8vb)
-        else INSTRUMENT_SPECS[Instrument.GUITAR].transpose_semitones
-    )
-
-    elements = sorted_playable_notes(part)
-    if not elements:
-        return score
-
-    clear_technical_articulations(
-        elements,
+    elements = prepare_playable_notes(
+        part,
         music21.articulations.Fingering,
         music21.articulations.StringIndication,
         music21.articulations.FretIndication,
     )
+    if not elements:
+        return score
 
-    states_per_step: list[list[_GuitarPose]] = []
-    for el in elements:
-        if isinstance(el, music21.note.Note):
-            sounding = int(el.pitch.midi) + transpose
-            states_per_step.append(_single_note_poses(sounding))
-        elif isinstance(el, music21.chord.Chord):
-            sounding_list = [int(n.pitch.midi) + transpose for n in el.notes]
-            states_per_step.append(_chord_poses(sounding_list))
+    first_clef = part.recurse().getElementsByClass(music21.clef.Clef).first()
+    is_written_8vb = part.atSoundingPitch is False or isinstance(
+        first_clef, music21.clef.Treble8vbClef
+    )
+    if is_written_8vb:
+        transpose = INSTRUMENT_SPECS[Instrument.GUITAR].transpose_semitones
+    elif part.atSoundingPitch is True or isinstance(first_clef, music21.clef.BassClef):
+        transpose = 0
+    else:
+        pitches = [m for el in elements for m in element_midis(el)]
+        transpose = (
+            0
+            if pitches and min(pitches) < 52
+            else INSTRUMENT_SPECS[Instrument.GUITAR].transpose_semitones
+        )
+
+    states_per_step = [
+        _single_note_poses(element_midis(el)[0] + transpose)
+        if isinstance(el, music21.note.Note)
+        else _chord_poses([m + transpose for m in element_midis(el)])
+        for el in elements
+    ]
 
     def _unary(_step: int, pose: _GuitarPose) -> float:
         cost = 0.0
@@ -193,14 +193,5 @@ def annotate_guitar_fingering(score: music21.stream.Score) -> music21.stream.Sco
         return 1.6 * shift + 0.25 * string_jump + same_finger_penalty
 
     best_poses = solve_viterbi(states_per_step, _unary, _transition)
-
-    for el, pose in zip(elements, best_poses, strict=True):
-        # MusicXML Note: attach Finger, String, Fret directly.
-        # MusicXML Chord: attach Fingerings first, then String+Fret (redistributed 1-to-1 on export).
-        for _, _, finger in pose.notes_pose:
-            el.articulations.append(music21.articulations.Fingering(finger))
-        for s_num, fret, _ in pose.notes_pose:
-            el.articulations.append(music21.articulations.StringIndication(s_num))
-            el.articulations.append(music21.articulations.FretIndication(fret))
-
+    apply_string_articulations(elements, best_poses, include_fret=True)
     return score

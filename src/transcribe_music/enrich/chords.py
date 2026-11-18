@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import music21
 
-from transcribe_music.export.musicxml import is_playable_chord
+from transcribe_music.score_utils import is_playable_chord, iter_playable_notes
 
 _ROOT_NAMES = ("C", "C#", "D", "E-", "E", "F", "F#", "G", "A-", "A", "B-", "B")
 
@@ -66,9 +66,7 @@ def _compute_symbolic_chroma_by_window(
         sounding_score = score
 
     flat = sounding_score.flatten()
-    for el in flat.notes:
-        if isinstance(el, music21.harmony.ChordSymbol):
-            continue
+    for el in iter_playable_notes(flat):
         onset = float(el.offset)
         dur = max(0.125, float(el.duration.quarterLength))
         end = onset + dur
