@@ -136,3 +136,8 @@ def test_pdmx_duckdb_sync_search_extract_and_cli(tmp_path: Path) -> None:
     )
     assert sync_res.exit_code == 0, sync_res.stdout
     assert get_pdmx_status(cache_dir).score_count == 3
+
+    from transcribe_music.ingest.pdmx import extract_pdmx_member
+
+    with pytest.raises(ValueError, match="Unsafe PDMX member path"):
+        extract_pdmx_member(pdmx_dir, "../../etc/passwd", tmp_path / "out.mxl")

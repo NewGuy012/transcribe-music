@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import shutil
-import subprocess
 import tarfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import duckdb
 import requests
@@ -22,7 +22,8 @@ PDMX_CSV_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/files/PD
 PDMX_MXL_TAR_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/files/mxl.tar.gz/content"
 PDMX_MID_TAR_URL = f"https://zenodo.org/api/records/{PDMX_ZENODO_RECORD_ID}/files/mid.tar.gz/content"
 
-_USER_AGENT = "transcribe-music/0.2 (+https://github.com/transcribe-music)"
+USER_AGENT = "transcribe-music/0.2 (+https://github.com/transcribe-music)"
+_MAX_MEMBER_BYTES = 50 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,21 @@ class PdmxStatus:
     score_count: int
     mxl_available: bool
     mid_available: bool
+
+
+def validate_https_url(url: str) -> str:
+    """Require an HTTPS URL with a network host before or after redirects."""
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or not parsed.netloc:
+        raise ValueError(f"Only HTTPS download URLs are permitted, got: {url!r}")
+    return url
+
+
+def normalize_ascii(text: str) -> str:
+    """Fold Unicode accents to ASCII and normalize whitespace/casing."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    ascii_only = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(ascii_only.lower().split())
 
 
 def _config_file(cache_dir: Path) -> Path:
@@ -89,12 +105,6 @@ def get_pdmx_status(cache_dir: Path = Path(".transcribe_cache")) -> PdmxStatus:
     )
 
 
-def _normalize_ascii(text: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", text)
-    ascii_only = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-    return " ".join(ascii_only.lower().split())
-
-
 def build_pdmx_duckdb(
     csv_path: Path,
     db_path: Path,
@@ -109,10 +119,13 @@ def build_pdmx_duckdb(
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_db = db_path.with_suffix(".duckdb.tmp")
-    if tmp_db.exists():
-        tmp_db.unlink()
+    tmp_db.unlink(missing_ok=True)
 
-    conflict_filter = "" if include_license_conflicts else "AND TRY_CAST(\"subset:no_license_conflict\" AS BOOLEAN) IS TRUE"
+    conflict_filter = (
+        ""
+        if include_license_conflicts
+        else 'AND TRY_CAST("subset:no_license_conflict" AS BOOLEAN) IS TRUE'
+    )
 
     with duckdb.connect(str(tmp_db)) as con:
         con.execute(
@@ -164,15 +177,17 @@ def build_pdmx_duckdb(
 
 
 def _download_stream(url: str, dest: Path) -> Path:
+    validate_https_url(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(f"{dest.suffix}.tmp")
     with requests.get(
         url,
-        headers={"User-Agent": _USER_AGENT},
+        headers={"User-Agent": USER_AGENT},
         stream=True,
         timeout=60.0,
     ) as resp:
         resp.raise_for_status()
+        validate_https_url(str(resp.url))
         with tmp.open("wb") as fh:
             for chunk in resp.iter_content(chunk_size=1024 * 1024):
                 if chunk:
@@ -211,19 +226,17 @@ def sync_pdmx(
             f"PDMX.csv not found in {target_dir}. Run without --no-download or supply PDMX.csv."
         )
 
-    if download_mxl:
-        mxl_tar = target_dir / "mxl.tar.gz"
-        if force or not mxl_tar.exists():
-            _download_stream(PDMX_MXL_TAR_URL, mxl_tar)
-        if extract_archives and mxl_tar.exists():
-            _extract_full_archive(mxl_tar, target_dir)
-
-    if download_mid:
-        mid_tar = target_dir / "mid.tar.gz"
-        if force or not mid_tar.exists():
-            _download_stream(PDMX_MID_TAR_URL, mid_tar)
-        if extract_archives and mid_tar.exists():
-            _extract_full_archive(mid_tar, target_dir)
+    for enabled, name, url in (
+        (download_mxl, "mxl.tar.gz", PDMX_MXL_TAR_URL),
+        (download_mid, "mid.tar.gz", PDMX_MID_TAR_URL),
+    ):
+        if not enabled:
+            continue
+        tar_path = target_dir / name
+        if force or not tar_path.exists():
+            _download_stream(url, tar_path)
+        if extract_archives and tar_path.exists():
+            _extract_full_archive(tar_path, target_dir)
 
     db_path = target_dir / "pdmx.duckdb"
     build_pdmx_duckdb(
@@ -247,7 +260,7 @@ def search_pdmx_catalog(
     if not db_path.exists():
         return []
 
-    tokens = [tok for tok in _normalize_ascii(query).split() if tok]
+    tokens = [tok for tok in normalize_ascii(query).split() if tok]
     if not tokens:
         return []
 
@@ -313,7 +326,7 @@ def search_pdmx_catalog(
             if not archive_ready:
                 bonus -= 2.5
 
-            clean_rel = str(rel_path).lstrip("./")
+            clean_rel = str(rel_path).removeprefix("./")
             records.append(
                 {
                     "title": str(title),
@@ -331,19 +344,26 @@ def search_pdmx_catalog(
 
 
 def extract_pdmx_member(pdmx_dir: Path | str, member_rel: str, dest: Path) -> Path:
-    """Extract a single `.mxl` or `.mid` score from an extracted PDMX dir or `.tar.gz` archive."""
-    base_dir = Path(pdmx_dir)
-    clean_rel = member_rel.lstrip("./")
+    """Safely extract a single `.mxl` or `.mid` score from a PDMX dir or `.tar.gz` archive."""
+    base_resolved = Path(pdmx_dir).resolve()
+    clean_rel = member_rel.removeprefix("./")
+    rel_parts = Path(clean_rel).parts
+    if not clean_rel or Path(clean_rel).is_absolute() or ".." in rel_parts:
+        raise ValueError(f"Unsafe PDMX member path outside catalog directory: {member_rel!r}")
+
+    direct_file = (base_resolved / clean_rel).resolve()
+    if not direct_file.is_relative_to(base_resolved) or direct_file == base_resolved:
+        raise ValueError(f"Unsafe PDMX member path outside catalog directory: {member_rel!r}")
+
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    direct_file = base_dir / clean_rel
     if direct_file.exists():
         shutil.copy2(direct_file, dest)
         return dest
 
     top_folder = clean_rel.split("/", 1)[0]
-    tar_path = base_dir / f"{top_folder}.tar.gz"
+    tar_path = base_resolved / f"{top_folder}.tar.gz"
     if not tar_path.exists():
         flag = "--with-mxl" if top_folder == "mxl" else "--with-mid"
         raise FileNotFoundError(
@@ -351,31 +371,21 @@ def extract_pdmx_member(pdmx_dir: Path | str, member_rel: str, dest: Path) -> Pa
             f"Run: transcribe-music pdmx sync {flag}"
         )
 
-    # Fast path: extract via system `tar` CLI (libarchive C decoder) and cache locally
-    tar_bin = shutil.which("tar")
-    if tar_bin is not None:
-        for candidate_name in (clean_rel, f"./{clean_rel}"):
-            proc = subprocess.run(
-                [tar_bin, "-xzf", str(tar_path), "-O", candidate_name],
-                check=False,
-                capture_output=True,
-                timeout=120,
-            )
-            if proc.returncode == 0 and proc.stdout:
-                direct_file.parent.mkdir(parents=True, exist_ok=True)
-                direct_file.write_bytes(proc.stdout)
-                dest.write_bytes(proc.stdout)
-                return dest
-
     with tarfile.open(tar_path, "r:gz") as tf:
         for candidate_name in (clean_rel, f"./{clean_rel}"):
             try:
                 member = tf.getmember(candidate_name)
             except KeyError:
                 continue
+            if not member.isfile():
+                raise ValueError(f"PDMX archive entry '{clean_rel}' is not a regular file.")
+            if member.size > _MAX_MEMBER_BYTES:
+                raise ValueError(f"PDMX archive entry '{clean_rel}' exceeds size limit.")
             extracted = tf.extractfile(member)
             if extracted is not None:
-                data = extracted.read()
+                data = extracted.read(_MAX_MEMBER_BYTES + 1)
+                if len(data) > _MAX_MEMBER_BYTES:
+                    raise ValueError(f"PDMX archive entry '{clean_rel}' exceeds size limit.")
                 direct_file.parent.mkdir(parents=True, exist_ok=True)
                 direct_file.write_bytes(data)
                 dest.write_bytes(data)

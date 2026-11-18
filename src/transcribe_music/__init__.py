@@ -4,11 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 
 from transcribe_music.ingest.digital import inspect_digital_score as inspect_score
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
-from transcribe_music.ingest.search import (
-    ManualDownloadRequiredError,
-    download_score_result,
-    search_digital_scores,
-)
+from transcribe_music.ingest.search import download_score_result, search_digital_scores
 from transcribe_music.models import (
     Instrument,
     OmrBackend,
@@ -28,7 +24,6 @@ except PackageNotFoundError:
 
 __all__ = [
     "Instrument",
-    "ManualDownloadRequiredError",
     "OmrBackend",
     "PartInfo",
     "PdmxStatus",
