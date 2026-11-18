@@ -44,12 +44,10 @@ def _single_note_poses(sounding_midi: int) -> list[_GuitarPose]:
         if fret == 0:
             poses.append(_GuitarPose(notes_pose=((s_num, 0, 0),), anchor_fret=1.0, span=0))
         else:
-            # Allow fingers 1..4 in local hand-position window
             for finger in (1, 2, 3, 4):
                 anchor = max(1.0, float(fret - (finger - 1)))
                 poses.append(_GuitarPose(notes_pose=((s_num, fret, finger),), anchor_fret=anchor, span=0))
     if not poses:
-        # Clamp extreme out-of-range note to nearest string edge gracefully
         clamped = min(max(sounding_midi, _GUITAR_OPEN_MIDI[-1]), _GUITAR_OPEN_MIDI[0] + _MAX_FRET)
         return _single_note_poses(clamped)
     return poses
@@ -59,7 +57,6 @@ def _chord_poses(sounding_midis: list[int]) -> list[_GuitarPose]:
     """Generate playable 6-string chord voicings (distinct strings, <= 4 fret span)."""
     per_note_opts = [_single_note_candidates(m) for m in sounding_midis]
     if any(not opts for opts in per_note_opts):
-        # Fallback: solve each note independently when chord contains extreme pitch
         fallback = [_single_note_poses(m)[0].notes_pose[0] for m in sounding_midis]
         frets = [f for _, f, _ in fallback if f > 0]
         return [
@@ -74,7 +71,7 @@ def _chord_poses(sounding_midis: list[int]) -> list[_GuitarPose]:
     for combo in product(*per_note_opts):
         strings = [s for s, _ in combo]
         if len(set(strings)) != len(strings):
-            continue  # Two chord notes cannot occupy the same string
+            continue
         fretted = [(idx, s, f) for idx, (s, f) in enumerate(combo) if f > 0]
         if not fretted:
             poses = tuple((s, 0, 0) for s, _ in combo)
@@ -87,7 +84,6 @@ def _chord_poses(sounding_midis: list[int]) -> list[_GuitarPose]:
         if span > 4:
             continue
 
-        # Assign fingers 1..4 by fret offset from min_f (and string order for ties/barres)
         ordered_fretted = sorted(fretted, key=lambda item: (item[2], -item[1]))
         fingers_by_idx: dict[int, int] = {}
         barre_fret = min_f if sum(1 for f in fret_vals if f == min_f) >= 2 else None
@@ -120,7 +116,6 @@ def _chord_poses(sounding_midis: list[int]) -> list[_GuitarPose]:
             )
         ]
 
-    # Keep top-12 cleanest low-position compact voicings to keep Viterbi O(1) fast
     valid.sort(key=lambda p: (p.span, p.anchor_fret))
     return valid[:12]
 
@@ -165,24 +160,19 @@ def annotate_guitar_fingering(score: music21.stream.Score) -> music21.stream.Sco
     def _unary(_step: int, pose: _GuitarPose) -> float:
         cost = 0.0
         for s_num, fret, finger in pose.notes_pose:
-            # Prefer lower positions (< fret 7) and stronger fingers 1-3 over pinky stretch
             cost += 0.35 * fret + (0.45 if finger == 4 else 0.0)
-            # Slight bonus for open strings in first position
             if fret == 0:
                 cost -= 0.4
-            # Slight middle-string preference for warm classical tone
             if 2 <= s_num <= 5:
                 cost -= 0.1
         return cost + 0.5 * pose.span
 
     def _transition(_step: int, prev: _GuitarPose, cur: _GuitarPose) -> float:
         shift = abs(cur.anchor_fret - prev.anchor_fret)
-        # Penalize hand-position jumps and unnecessary string hops
         prev_avg_s = sum(p[0] for p in prev.notes_pose) / len(prev.notes_pose)
         cur_avg_s = sum(p[0] for p in cur.notes_pose) / len(cur.notes_pose)
         string_jump = abs(cur_avg_s - prev_avg_s)
 
-        # Penalize using the exact same fretted finger across wide pitch jumps
         same_finger_penalty = 0.0
         if len(prev.notes_pose) == 1 and len(cur.notes_pose) == 1:
             ps, pf, pfin = prev.notes_pose[0]
