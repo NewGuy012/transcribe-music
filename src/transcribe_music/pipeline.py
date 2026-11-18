@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from transcribe_music.enrich.chords import annotate_chords
@@ -132,13 +133,15 @@ def convert_music(
     path = Path(input_path)
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {path}")
+    if not path.is_file():
+        raise IsADirectoryError(f"Input path is not a file: {path}")
 
     t_start = time.perf_counter()
     source_type = SourceType.PDF if path.suffix.lower() == ".pdf" else SourceType.DIGITAL
     inst = Instrument(instrument)
     cfg = config or TranscriptionConfig(instrument=inst)
     if cfg.instrument != inst:
-        cfg = cfg.model_copy(update={"instrument": inst})
+        cfg = replace(cfg, instrument=inst)
 
     job_hash = compute_job_hash(source_type, hash_file(path), cfg)
 
@@ -151,18 +154,17 @@ def convert_music(
         cached = store.get_cached_job(job_hash)
         if cached is not None:
             _copy_if_needed(cached.musicxml_path, final_out)
-            return cached.model_copy(
-                update={
-                    "musicxml_path": final_out,
-                    "elapsed_sec": round(time.perf_counter() - t_start, 3),
-                }
+            return replace(
+                cached,
+                musicxml_path=final_out,
+                elapsed_sec=round(time.perf_counter() - t_start, 3),
             )
 
         result = _produce_enrich_and_export(
             path, source_type, job_hash, cfg, artifact_dir, canonical_out, store, t_start
         )
         _copy_if_needed(canonical_out, final_out)
-        return result.model_copy(update={"musicxml_path": final_out})
+        return replace(result, musicxml_path=final_out)
 
     if output_path is not None:
         with tempfile.TemporaryDirectory(prefix="tm_work_") as tmp_dir:

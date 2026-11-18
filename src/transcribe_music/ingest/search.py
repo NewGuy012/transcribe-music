@@ -553,7 +553,6 @@ def search_digital_scores(
                 source=str(rec["source"]),
                 filename=str(rec["filename"]),
                 download_url=rec.get("download_url"),
-                page_url=rec.get("page_url"),
                 edition_note=rec.get("edition_note"),
                 local_corpus_path=rec.get("local_corpus_path"),
                 pdmx_dir=rec.get("pdmx_dir"),

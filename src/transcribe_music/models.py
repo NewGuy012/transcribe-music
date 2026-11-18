@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Literal
-
-from pydantic import BaseModel, Field
 
 
 class Instrument(str, Enum):
@@ -100,7 +98,8 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
 }
 
 
-class PartInfo(BaseModel):
+@dataclass(frozen=True)
+class PartInfo:
     """Summary metadata for a single part/track inside a digital score."""
 
     index: int
@@ -117,16 +116,21 @@ class PartInfo(BaseModel):
     capo: int | None = None
 
 
-class ScoreInspection(BaseModel):
+@dataclass(frozen=True)
+class ScoreInspection:
     """Structured overview of all parts detected inside a digital music file."""
 
     source_path: Path
     format_name: str
     title: str | None = None
-    parts: list[PartInfo] = Field(default_factory=list)
+    parts: list[PartInfo] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_path", Path(self.source_path))
 
 
-class TranscriptionConfig(BaseModel):
+@dataclass(frozen=True)
+class TranscriptionConfig:
     """Runtime configuration for score ingestion, part selection, enrichment, and caching."""
 
     instrument: Instrument
@@ -140,11 +144,21 @@ class TranscriptionConfig(BaseModel):
     guitar_staff: GuitarStaffMode = GuitarStaffMode.NOTATION
     quantize_divisors: tuple[int, ...] = (4, 3)
     cache_dir: Path = Path(".transcribe_cache")
-    pdf_dpi: int = Field(default=300, ge=150, le=600)
+    pdf_dpi: int = 300
     omr_backend: OmrBackend = OmrBackend.AUTO
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "instrument", Instrument(self.instrument))
+        object.__setattr__(self, "guitar_staff", GuitarStaffMode(self.guitar_staff))
+        object.__setattr__(self, "omr_backend", OmrBackend(self.omr_backend))
+        object.__setattr__(self, "cache_dir", Path(self.cache_dir))
+        object.__setattr__(self, "quantize_divisors", tuple(self.quantize_divisors))
+        if not (150 <= self.pdf_dpi <= 600):
+            raise ValueError(f"pdf_dpi must be between 150 and 600, got {self.pdf_dpi}")
 
-class TranscriptionResult(BaseModel):
+
+@dataclass(frozen=True)
+class TranscriptionResult:
     """Structured result metadata returned by CLI, SDK, and pipeline."""
 
     job_hash: str
@@ -160,19 +174,24 @@ class TranscriptionResult(BaseModel):
     fingering_count: int = 0
     backend: str | None = None
     selected_part: str | None = None
-    warnings: list[str] = Field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_type", SourceType(self.source_type))
+        object.__setattr__(self, "instrument", Instrument(self.instrument))
+        object.__setattr__(self, "musicxml_path", Path(self.musicxml_path))
 
 
-class ScoreSearchResult(BaseModel):
+@dataclass(frozen=True)
+class ScoreSearchResult:
     """Search hit for a downloadable digital symbolic music score."""
 
     title: str
-    composer: str | None = None
     format_ext: str
     source: str
     filename: str
+    composer: str | None = None
     download_url: str | None = None
-    page_url: str | None = None
     edition_note: str | None = None
     local_corpus_path: str | None = None
     pdmx_dir: str | None = None

@@ -6,6 +6,7 @@ import io
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -233,7 +234,7 @@ def test_cli_search_and_download_security_guards(
     with pytest.raises(ValueError, match="Only HTTPS"):
         download_score_result(insecure, download_dir=tmp_path)
 
-    valid = insecure.model_copy(update={"download_url": "https://example.com/score.mxl"})
+    valid = replace(insecure, download_url="https://example.com/score.mxl")
     monkeypatch.setattr(
         urllib.request,
         "build_opener",

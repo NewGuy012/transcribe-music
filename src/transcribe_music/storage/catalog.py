@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -156,7 +157,7 @@ class CatalogStore:
                     result.source_type.value,
                     result.source_ref,
                     result.instrument.value,
-                    config.model_dump_json(),
+                    json.dumps(asdict(config), default=str),
                     str(result.musicxml_path),
                     result.measure_count,
                     result.note_count,
