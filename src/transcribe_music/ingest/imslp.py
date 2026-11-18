@@ -131,6 +131,7 @@ def _clean_template_value(raw: str) -> str:
     text = raw.strip()
     if not text:
         return ""
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     text = re.sub(
         r"\{\{Link(?:Ed|Arr|Comp)\|([^|{}]+)\|([^|{}]+)(?:\|[^{}]*)?\}\}",
         r"\1 \2",
@@ -201,6 +202,10 @@ def _score_imslp_edition(
     for tok in query_tokens:
         if tok in {"solo", "cello", "violin", "guitar", "piano"} and tok in hay:
             bonus += 1.0
+    if "cello" in query_tokens and "violin solo" in hay and "cello" not in description.lower():
+        bonus -= 3.5
+    if "violin" in query_tokens and "cello solo" in hay and "violin" not in description.lower():
+        bonus -= 3.5
 
     return bonus, " · ".join(notes[:3])
 
@@ -258,8 +263,8 @@ def search_imslp_works(
     *,
     user_agent: str,
     timeout: float = 7.0,
-    max_works: int = 4,
-    max_results_per_work: int = 8,
+    max_works: int = 5,
+    max_results_per_work: int = 3,
 ) -> list[dict[str, Any]]:
     """Search IMSLP via MediaWiki API and extract ranked edition/file entries."""
     clean_query = query.strip()
@@ -273,7 +278,7 @@ def search_imslp_works(
                 "action": "query",
                 "list": "search",
                 "srsearch": clean_query,
-                "srlimit": 6,
+                "srlimit": 12,
                 "format": "json",
             },
             headers={"User-Agent": user_agent, "Accept": "application/json"},
@@ -286,7 +291,22 @@ def search_imslp_works(
         return []
 
     hits = search_data.get("query", {}).get("search", [])
-    titles = [str(h.get("title", "")).strip() for h in hits if h.get("title")]
+    titles: list[str] = []
+    seen_titles: set[str] = set()
+    for h in hits:
+        snippet = str(h.get("snippet", ""))
+        title = str(h.get("title", "")).strip()
+        if not title:
+            continue
+        if snippet.lstrip().upper().startswith("#REDIRECT"):
+            target_match = re.search(r"\[\[([^\]|#]+)", snippet)
+            if target_match:
+                title = re.sub(r"<[^>]+>", "", target_match.group(1)).strip()
+            else:
+                continue
+        if title and title not in seen_titles:
+            seen_titles.add(title)
+            titles.append(title)
     if not titles:
         return []
 
@@ -349,7 +369,7 @@ def search_imslp_works(
                     note = f"{note} · {credit}" if note else credit
 
                 page_file_url = f"{IMSLP_WIKI_PREFIX}File:{quote(fname.replace(' ', '_'))}"
-                tag_bits = [bit for bit in (desc, credit) if bit]
+                tag_bits = [bit.strip() for bit in (desc, credit) if bit and bit.strip()]
                 label = f"{work_title} ({', '.join(tag_bits)})" if tag_bits else work_title
                 work_candidates.append(
                     {

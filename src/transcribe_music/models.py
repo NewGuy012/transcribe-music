@@ -169,4 +169,6 @@ class ScoreSearchResult(BaseModel):
     edition_note: str | None = None
     local_corpus_path: str | None = None
     archive_identifier: str | None = None
+    pdmx_dir: str | None = None
+    pdmx_member: str | None = None
     score: float = 0.0

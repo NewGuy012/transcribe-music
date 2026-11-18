@@ -26,6 +26,7 @@ import requests
 
 from transcribe_music.ingest.digital import DIGITAL_EXTENSIONS
 from transcribe_music.ingest.imslp import search_imslp_works
+from transcribe_music.ingest.pdmx import extract_pdmx_member, search_pdmx_catalog
 from transcribe_music.models import ScoreSearchResult
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ _SOURCE_BIAS: dict[str, float] = {
     "OpenScore Lieder": 1.0,
     "OpenScore StringQuartets": 1.0,
     "When-in-Rome": 0.95,
+    "PDMX": 0.9,
     "Mutopia Project": 0.75,
     "music21 Corpus": 0.6,
     "Humdrum GitHub": 0.55,
@@ -904,10 +906,12 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
 
     hay_words = set(haystack.split())
     title_words = set(title_norm.split())
+    composer_words = set(composer_norm.split())
 
     matched = 0
     exact_word_hits = 0
     title_hits = 0
+    composer_hits = 0
     for tok in q_tokens:
         if tok in hay_words:
             matched += 1
@@ -916,6 +920,8 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
             matched += 1
         if tok in title_words or tok in title_norm:
             title_hits += 1
+        if tok in composer_words:
+            composer_hits += 1
 
     min_required = len(q_tokens) if len(q_tokens) <= 2 else math.ceil(len(q_tokens) * 0.6)
     if matched < min_required:
@@ -923,10 +929,10 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
 
     coverage = matched / len(q_tokens)
     exact_ratio = exact_word_hits / len(q_tokens)
-    score = 10.0 * coverage + 3.0 * exact_ratio
+    score = 14.0 * coverage + 3.0 * exact_ratio + 4.0 * (composer_hits > 0)
 
     if matched == len(q_tokens):
-        score += 4.0
+        score += 8.0
         if ext in MUSICXML_SEARCH_EXTENSIONS:
             score += 15.0
     if q_norm in title_norm:
@@ -939,6 +945,8 @@ def _score_candidate(record: dict[str, Any], query: str) -> float:
     score += 18.0 * _FORMAT_PRIORITY.get(ext, 0.2)
     score += _SOURCE_BIAS.get(source, 0.0)
     score += float(record.get("source_bonus", 0.0) or 0.0)
+    if "cadenza" not in q_tokens and ("cadenza" in title_norm or "kadenz" in title_norm):
+        score -= 3.5
     if ".omr" in filename.lower() or str(record.get("archive_identifier", "")).endswith(".omr"):
         score -= 1.2
     return round(score, 4)
@@ -975,6 +983,7 @@ def search_digital_scores(
     musicxml_only: bool = False,
     formats: Iterable[str] | None = None,
     include_pdf: bool = True,
+    include_pdmx: bool = True,
     include_remote: bool = True,
     include_local: bool = True,
     cache_dir: Path = Path(".transcribe_cache"),
@@ -1020,6 +1029,14 @@ def search_digital_scores(
     ]
     if include_local:
         tasks.append(lambda: _search_music21_corpus(clean_query))
+    if include_pdmx:
+        tasks.append(
+            lambda: search_pdmx_catalog(
+                clean_query,
+                cache_dir=cache_dir,
+                allowed_exts=allowed_exts,
+            )
+        )
     if include_remote:
         tasks.append(lambda: _search_mutopia(clean_query, allowed_exts))
         tasks.append(lambda: _search_imslp(clean_query, allowed_exts))
@@ -1053,6 +1070,8 @@ def search_digital_scores(
                 edition_note=rec.get("edition_note"),
                 local_corpus_path=rec.get("local_corpus_path"),
                 archive_identifier=rec.get("archive_identifier"),
+                pdmx_dir=rec.get("pdmx_dir"),
+                pdmx_member=rec.get("pdmx_member"),
                 score=score,
             )
         )
@@ -1106,6 +1125,9 @@ def download_score_result(
         src_path = music21.corpus.getWork(result.local_corpus_path)
         shutil.copy2(src_path, dest)
         return dest
+
+    if result.pdmx_dir and result.pdmx_member:
+        return extract_pdmx_member(result.pdmx_dir, result.pdmx_member, dest)
 
     download_url = result.download_url
     if not download_url and result.archive_identifier:

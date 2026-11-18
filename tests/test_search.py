@@ -488,12 +488,13 @@ def test_imslp_solo_typeset_ranking_archive_pdf_and_gate_handling(
         frozenset({".pdf", ".mxl", ".mid"}),
         user_agent="test",
     )
-    assert len(imslp_hits) == 4
-    # Solo Typeset edition must rank first above Manuscript, Oboe, and Cadenza
+    assert len(imslp_hits) == 3
+    # Solo Typeset edition must rank first above Oboe, Cadenza, and trimmed Manuscript Scan
     assert imslp_hits[0]["filename"] == "PMLP18850-Haydn_Cello_Solo_Mandozzi.pdf"
     assert imslp_hits[0]["composer"] == "Joseph Haydn"
     assert "Typeset" in (imslp_hits[0]["edition_note"] or "")
     assert imslp_hits[0]["download_url"] == "https://imslp.org/images/c/cf/PMLP18850-Haydn_Cello_Solo_Mandozzi.pdf"
+    assert all("Manuscript" not in (h.get("edition_note") or "") for h in imslp_hits)
 
     # Digital results still outrank IMSLP PDFs, and include_pdf=False excludes PDFs
     _stub_remote_sources(

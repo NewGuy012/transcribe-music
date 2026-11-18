@@ -25,7 +25,7 @@ def _():
     mo.md(
         """
         # transcribe-music Workbench
-        Convert **digital symbolic scores** (`.musicxml`, `.mxl`, `.mid`, `.krn`, `.mei`, `.abc`, `.gp3`–`.gp5`, `.mscz`)
+        Convert **digital symbolic scores** (`.musicxml`, `.mxl`, `.mid`, `.krn`, `.mei`, `.abc`, `.gp*`, `.mscz`, `.capx`, `.ly`)
         — or **PDF sheet music** as an OMR fallback — into validated **MusicXML** with **chord symbols**,
         **guitar TAB**, and **ergonomic fingerings** for Piano, Guitar, Violin, and Cello.
         """
@@ -67,7 +67,7 @@ def _(DIGITAL_EXTENSIONS, Instrument, mo):
     digital_upload = mo.ui.file(
         filetypes=sorted(DIGITAL_EXTENSIONS),
         multiple=False,
-        label="Upload Digital Score (.mxl, .musicxml, .mid, .krn, .mei, .abc, .gp3-.gp5, .mscz)",
+        label="Upload Digital Score (.mxl, .musicxml, .mid, .krn, .mei, .abc, .gp*, .mscz, .capx, .ly)",
     )
     digital_path_input = mo.ui.text(
         value="",

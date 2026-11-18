@@ -17,15 +17,17 @@ Powered by **`uv`**, **`music21`**, **`converter21`**, **`pyguitarpro`**, **`duc
 - **MusicXML**: `.musicxml`, `.xml`, `.mxl`
 - **Humdrum / MEI / ABC** (via `converter21`): `.krn`, `.mei`, `.abc`
 - **MIDI**: `.mid`, `.midi` (quantized cleanly + auto-split Piano Grand Staff)
-- **Guitar Pro** (via `pyguitarpro`): `.gp3`, `.gp4`, `.gp5`
-- **MuseScore** (when MuseScore Studio CLI is installed locally): `.mscz`, `.mscx`
+- **Guitar Pro**: `.gp3`, `.gp4`, `.gp5` (via `pyguitarpro`); `.gp`, `.gpx` (via MuseScore Studio CLI)
+- **MuseScore & Capella**: `.mscz`, `.mscx`, `.cap` (via MuseScore Studio CLI); `.capx` (native `music21` XML parser with MuseScore fallback)
+- **LilyPond**: `.ly` (via `python-ly` or `lilypond` CLI when installed)
 
-**Where to get free digital scores:**
-- **Classical / Public Domain**: **PDMX** (250k+ MusicXML scores), **OpenScore** (curated chamber/lieder/orchestral `.mxl`), **MuseScore.com**, **KernScores** (`.krn`), and **IMSLP** (`.mxl`/`.mid` attachments or Solo Part PDFs).
-- **Modern / Rock / Pop / Anime**: **MuseScore.com** (`.mxl`/`.mscz`) or **Guitar Pro tabs** (`.gp5` via Ultimate Guitar / Songsterr).
+**Built-in Score Search Catalogs (`transcribe-music search`):**
+- **MusicXML Corpora**: **OpenScore Orchestra** (`MarkGotham/Hauptstimme`), **OpenScore Lieder**, **OpenScore StringQuartets**, **When-in-Rome** (`.mxl`), and optional local **PDMX** (254k+ public-domain MusicXML scores via DuckDB).
+- **Symbolic & MIDI Repositories**: Expanded **Humdrum / MuseData** classical repos (`.krn`: Vivaldi concertos, Haydn symphonies/quartets/sonatas, Bach Brandenburg/WTC, Corelli, Chopin, Scarlatti), **Mutopia Project** (`.mid`/`.ly`/`.pdf`), **`music21` Corpus**, and **Archive.org**.
+- **Classical Sheet Music Fallback**: **IMSLP MediaWiki API** (prioritizing Solo Part + Typeset PDFs, directing to browser verification when gated) & **Archive.org `collection:imslp`**.
 
 ### 2. Sheet Music PDFs (Fallback OMR)
-- **`.pdf`**: Rasterized with `pymupdf` and processed in a single batched **`homr`** Vision Transformer pass via `uvx` Python 3.14. Best accuracy on clean solo instrument parts rather than full orchestral conductor scores.
+- **`.pdf`**: Auto-selects **Audiveris CLI** (preferred for classical solo parts with Bass/Tenor/Treble C-clef shifts) when installed, or falls back to rasterizing with `pymupdf` and running a single batched **`homr`** Vision Transformer pass via `uvx` Python 3.14 (`--omr-backend auto|audiveris|homr`). Best accuracy on clean solo instrument parts rather than full orchestral conductor scores.
 
 ---
 
@@ -47,10 +49,16 @@ uv sync --all-extras
 ### CLI Usage
 
 ```bash
-# 0. Search public digital score catalogs (MusicXML preferred), show top 5, and download your pick
+# 0. Search public catalogs (MusicXML > digital > solo PDFs), show top 5, and download your pick
 uv run transcribe-music search "Moonlight Sonata"
+# Or search classical works including IMSLP solo parts / Mutopia MIDIs:
+uv run transcribe-music search "Haydn Cello Concerto"
 # Or download selection #1 and enrich immediately for piano:
 uv run transcribe-music search "Moonlight Sonata" --select 1 --instrument piano
+
+# Optional: sync the 254k-score PDMX DuckDB catalog (Zenodo 15571083)
+uv run transcribe-music pdmx sync --with-mid   # or --with-mxl for full .mxl archive
+uv run transcribe-music pdmx status
 
 # 1. Inspect parts/tracks inside a multi-part digital score
 uv run transcribe-music inspect haydn_cello_concerto.mxl
@@ -67,9 +75,9 @@ uv run transcribe-music score suite_or_sonata.mid \
 uv run transcribe-music convert song.gp5 \
   --instrument guitar -o song_guitar.musicxml
 
-# 5. Sheet music PDF fallback (batched homr OMR via uvx Python 3.14)
+# 5. Sheet music PDF fallback (Audiveris CLI when installed, else batched homr OMR)
 uv run transcribe-music pdf solo_cello_part.pdf \
-  --instrument cello -o cello_from_pdf.musicxml
+  --instrument cello --omr-backend auto -o cello_from_pdf.musicxml
 
 # 6. Launch the Marimo Interactive Workbench + Verovio SVG viewer + DuckDB explorer
 uv run transcribe-music ui

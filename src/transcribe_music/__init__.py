@@ -1,5 +1,6 @@
 """transcribe-music public Python SDK."""
 
+from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import (
     ManualDownloadRequiredError,
     download_score_result,
@@ -29,6 +30,7 @@ __all__ = [
     "ManualDownloadRequiredError",
     "OmrBackend",
     "PartInfo",
+    "PdmxStatus",
     "ScoreInspection",
     "ScoreSearchResult",
     "SourceType",
@@ -37,8 +39,10 @@ __all__ = [
     "__version__",
     "convert_music",
     "download_score_result",
+    "get_pdmx_status",
     "inspect_score",
     "search_digital_scores",
+    "sync_pdmx",
     "transcribe_pdf",
     "transcribe_score",
 ]

@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import (
     ManualDownloadRequiredError,
     download_score_result,
@@ -38,7 +39,9 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 cache_app = typer.Typer(help="Inspect or manage the DuckDB conversion cache.")
+pdmx_app = typer.Typer(help="Manage the optional local PDMX (254k+ public domain MusicXML) catalog.")
 app.add_typer(cache_app, name="cache")
+app.add_typer(pdmx_app, name="pdmx")
 
 console = Console()
 
@@ -483,3 +486,68 @@ def cache_clear(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
     store = CatalogStore(cache_dir)
     removed = store.clear_cache()
     console.print(f"Cleared {removed} job records from {store.db_path}")
+
+
+def _print_pdmx_status(status: PdmxStatus) -> None:
+    table = Table(title="PDMX Local Catalog")
+    table.add_column("Field", no_wrap=True)
+    table.add_column("Value")
+    table.add_row("PDMX Directory", str(status.pdmx_dir))
+    table.add_row("PDMX.csv Present", "Yes" if status.csv_exists else "No")
+    table.add_row("DuckDB Index", "Yes" if status.db_exists else "No")
+    table.add_row("Indexed Scores", f"{status.score_count:,}")
+    table.add_row("MXL Archive/Dir", "Available" if status.mxl_available else "Not synced (--with-mxl)")
+    table.add_row("MID Archive/Dir", "Available" if status.mid_available else "Not synced (--with-mid)")
+    console.print(table)
+
+
+@pdmx_app.command("status")
+def pdmx_status(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
+    """Inspect local PDMX catalog and score archive status."""
+    _print_pdmx_status(get_pdmx_status(cache_dir))
+
+
+@pdmx_app.command("sync")
+def pdmx_sync(
+    pdmx_dir: Annotated[
+        Path | None,
+        typer.Option("--pdmx-dir", help="Custom directory containing or receiving PDMX files."),
+    ] = None,
+    with_mxl: Annotated[
+        bool,
+        typer.Option("--with-mxl", help="Download mxl.tar.gz (~1.89 GB) for offline .mxl extraction."),
+    ] = False,
+    with_mid: Annotated[
+        bool,
+        typer.Option("--with-mid", help="Download mid.tar.gz (~214 MB) for offline .mid extraction."),
+    ] = False,
+    extract: Annotated[
+        bool,
+        typer.Option("--extract", help="Unpack downloaded .tar.gz archives into PDMX directory."),
+    ] = False,
+    no_download: Annotated[
+        bool,
+        typer.Option("--no-download", help="Index an existing local PDMX.csv without downloading."),
+    ] = False,
+    include_license_conflicts: Annotated[
+        bool,
+        typer.Option("--include-license-conflicts", help="Include rows flagged with license conflicts."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Re-download PDMX files even if already cached locally."),
+    ] = False,
+    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
+) -> None:
+    """Sync PDMX metadata (Zenodo 15571083) into DuckDB and optionally fetch score archives."""
+    status = sync_pdmx(
+        cache_dir=cache_dir,
+        pdmx_dir=pdmx_dir,
+        download_csv=not no_download,
+        download_mxl=with_mxl,
+        download_mid=with_mid,
+        extract_archives=extract,
+        include_license_conflicts=include_license_conflicts,
+        force=force,
+    )
+    _print_pdmx_status(status)
