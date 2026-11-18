@@ -17,8 +17,6 @@ from transcribe_music import (
     TranscriptionConfig,
     convert_music,
     inspect_score,
-    transcribe_pdf,
-    transcribe_score,
 )
 from transcribe_music.cli import app
 from transcribe_music.storage.catalog import CatalogStore
@@ -103,11 +101,12 @@ def test_end_to_end_mxl_concerto_verovio_and_duckdb_cache(tmp_path: Path) -> Non
     assert harmonies == ["D", "A"]
 
     out_xml_2 = tmp_path / "haydn_cello_cached.musicxml"
-    res2 = transcribe_score(mxl_path, Instrument.CELLO, output_path=out_xml_2, config=cfg)
+    res2 = convert_music(mxl_path, Instrument.CELLO, output_path=out_xml_2, config=cfg)
     assert res2.cached is True
     assert res2.job_hash == res1.job_hash
     assert res2.selected_part == "2: Solo Violoncello"
     assert out_xml_2.exists()
+    assert not out_xml_2.samefile(out_xml)
 
 
 def test_end_to_end_gp5_and_krn_conversion(tmp_path: Path) -> None:
@@ -167,7 +166,7 @@ def test_end_to_end_pdf_fallback_omr_mocked(
         cache_dir=tmp_path / ".cache",
         pdf_dpi=150,
     )
-    res = transcribe_pdf(pdf_path, Instrument.GUITAR, output_path=out_xml, config=cfg)
+    res = convert_music(pdf_path, Instrument.GUITAR, output_path=out_xml, config=cfg)
     assert out_xml.exists()
     assert res.backend == "homr"
     assert res.measure_count == 2
@@ -196,7 +195,7 @@ def test_cli_convert_score_inspect_and_cache_commands(tmp_path: Path) -> None:
     nc_res = runner.invoke(
         app,
         [
-            "score",
+            "convert",
             str(mxl_path),
             "--instrument",
             "cello",

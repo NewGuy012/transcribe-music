@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -76,20 +77,11 @@ class CatalogStore:
 
     def __init__(self, cache_dir: Path = Path(".transcribe_cache")) -> None:
         self.cache_dir = Path(cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir = self.cache_dir / "artifacts"
-        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.cache_dir / "catalog.duckdb"
-        self._init_schema()
 
-    def _connect(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self.db_path))
-
-    def _init_schema(self) -> None:
-        with self._connect() as con:
-            con.execute(_SCHEMA_SQL)
-            con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS backend VARCHAR")
-            con.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS selected_part VARCHAR")
+    def _connect(self, *, read_only: bool = False) -> duckdb.DuckDBPyConnection:
+        return duckdb.connect(str(self.db_path), read_only=read_only)
 
     def artifact_dir(self, job_hash: str) -> Path:
         path = self.artifacts_dir / job_hash
@@ -97,17 +89,22 @@ class CatalogStore:
         return path
 
     def get_cached_job(self, job_hash: str) -> TranscriptionResult | None:
-        with self._connect() as con:
-            row = con.execute(
-                """
-                SELECT job_hash, source_type, source_ref, instrument, musicxml_path,
-                       measure_count, note_count, chord_count, fingering_count,
-                       elapsed_sec, warnings_json, backend, selected_part
-                FROM jobs
-                WHERE job_hash = ?
-                """,
-                [job_hash],
-            ).fetchone()
+        if not self.db_path.exists():
+            return None
+        try:
+            with self._connect(read_only=True) as con:
+                row = con.execute(
+                    """
+                    SELECT job_hash, source_type, source_ref, instrument, musicxml_path,
+                           measure_count, note_count, chord_count, fingering_count,
+                           elapsed_sec, warnings_json, backend, selected_part
+                    FROM jobs
+                    WHERE job_hash = ?
+                    """,
+                    [job_hash],
+                ).fetchone()
+        except duckdb.Error:
+            return None
 
         if row is None:
             return None
@@ -138,8 +135,10 @@ class CatalogStore:
         result: TranscriptionResult,
         config: TranscriptionConfig,
     ) -> None:
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(UTC).replace(tzinfo=None)
         with self._connect() as con:
+            con.execute(_SCHEMA_SQL)
             con.execute(
                 """
                 INSERT OR REPLACE INTO jobs (
@@ -168,18 +167,23 @@ class CatalogStore:
             )
 
     def list_recent_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
-        with self._connect() as con:
-            rows = con.execute(
-                """
-                SELECT job_hash, source_type, source_ref, instrument,
-                       measure_count, note_count, chord_count, fingering_count,
-                       backend, selected_part, elapsed_sec, musicxml_path, created_at
-                FROM jobs
-                ORDER BY created_at DESC
-                LIMIT ?
-                """,
-                [limit],
-            ).fetchall()
+        if not self.db_path.exists():
+            return []
+        try:
+            with self._connect(read_only=True) as con:
+                rows = con.execute(
+                    """
+                    SELECT job_hash, source_type, source_ref, instrument,
+                           measure_count, note_count, chord_count, fingering_count,
+                           backend, selected_part, elapsed_sec, musicxml_path, created_at
+                    FROM jobs
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    [limit],
+                ).fetchall()
+        except duckdb.Error:
+            return []
         cols = [
             "job_hash",
             "source_type",
@@ -198,8 +202,15 @@ class CatalogStore:
         return [dict(zip(cols, row, strict=True)) for row in rows]
 
     def clear_cache(self) -> int:
-        with self._connect() as con:
-            count_row = con.execute("SELECT COUNT(*) FROM jobs").fetchone()
-            count = int(count_row[0]) if count_row else 0
-            con.execute("DELETE FROM jobs")
+        count = 0
+        if self.db_path.exists():
+            try:
+                with self._connect() as con:
+                    count_row = con.execute("SELECT COUNT(*) FROM jobs").fetchone()
+                    count = int(count_row[0]) if count_row else 0
+                    con.execute("DELETE FROM jobs")
+            except duckdb.Error:
+                pass
+        if self.artifacts_dir.exists():
+            shutil.rmtree(self.artifacts_dir, ignore_errors=True)
         return count

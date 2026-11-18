@@ -63,36 +63,8 @@ def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:
     assert cached.backend == "musicxml"
     assert cached.selected_part == "1: Violin"
     assert len(store.list_recent_jobs()) == 1
-
-    # Legacy DB schema without backend/selected_part columns migrates cleanly
-    import duckdb
-
-    legacy_dir = tmp_path / ".legacy_cache"
-    legacy_dir.mkdir(parents=True, exist_ok=True)
-    with duckdb.connect(str(legacy_dir / "catalog.duckdb")) as con:
-        con.execute(
-            """
-            CREATE TABLE jobs (
-                job_hash VARCHAR PRIMARY KEY,
-                source_type VARCHAR NOT NULL,
-                source_ref VARCHAR NOT NULL,
-                start_sec DOUBLE,
-                end_sec DOUBLE,
-                instrument VARCHAR NOT NULL,
-                config_json VARCHAR NOT NULL,
-                musicxml_path VARCHAR NOT NULL,
-                measure_count INTEGER NOT NULL,
-                note_count INTEGER NOT NULL,
-                chord_count INTEGER NOT NULL,
-                fingering_count INTEGER NOT NULL,
-                elapsed_sec DOUBLE NOT NULL,
-                warnings_json VARCHAR NOT NULL,
-                created_at TIMESTAMP NOT NULL
-            )
-            """
-        )
-    migrated = CatalogStore(legacy_dir)
-    assert migrated.list_recent_jobs() == []
+    assert store.clear_cache() == 1
+    assert store.list_recent_jobs() == []
 
 
 def test_pdf_rasterization(tmp_path: Path) -> None:

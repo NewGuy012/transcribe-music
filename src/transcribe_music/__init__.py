@@ -2,6 +2,7 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
+from transcribe_music.ingest.digital import inspect_digital_score as inspect_score
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import (
     ManualDownloadRequiredError,
@@ -18,12 +19,7 @@ from transcribe_music.models import (
     TranscriptionConfig,
     TranscriptionResult,
 )
-from transcribe_music.pipeline import (
-    convert_music,
-    inspect_score,
-    transcribe_pdf,
-    transcribe_score,
-)
+from transcribe_music.pipeline import convert_music
 
 try:
     __version__ = version("transcribe-music")
@@ -48,6 +44,4 @@ __all__ = [
     "inspect_score",
     "search_digital_scores",
     "sync_pdmx",
-    "transcribe_pdf",
-    "transcribe_score",
 ]

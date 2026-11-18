@@ -9,6 +9,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from transcribe_music.ingest.digital import inspect_digital_score
 from transcribe_music.ingest.pdmx import PdmxStatus, get_pdmx_status, sync_pdmx
 from transcribe_music.ingest.search import (
     ManualDownloadRequiredError,
@@ -22,12 +23,7 @@ from transcribe_music.models import (
     TranscriptionConfig,
     TranscriptionResult,
 )
-from transcribe_music.pipeline import (
-    convert_music,
-    inspect_score,
-    transcribe_pdf,
-    transcribe_score,
-)
+from transcribe_music.pipeline import convert_music
 from transcribe_music.storage.catalog import CatalogStore
 
 app = typer.Typer(
@@ -111,33 +107,6 @@ def _print_search_results(query: str, results: list[ScoreSearchResult]) -> None:
     console.print(table)
 
 
-def _build_config(
-    *,
-    instrument: Instrument,
-    part: str | None,
-    chords: bool,
-    fingering: bool,
-    preserve_chords: bool,
-    preserve_fingering: bool,
-    cache: bool,
-    cache_dir: Path,
-    dpi: int = 300,
-    omr_backend: OmrBackend = OmrBackend.AUTO,
-) -> TranscriptionConfig:
-    return TranscriptionConfig(
-        instrument=instrument,
-        part=part,
-        enrich_chords=chords,
-        enrich_fingering=fingering,
-        preserve_existing_chords=preserve_chords,
-        preserve_existing_fingering=preserve_fingering,
-        use_cache=cache,
-        cache_dir=cache_dir,
-        pdf_dpi=dpi,
-        omr_backend=omr_backend,
-    )
-
-
 @app.command()
 def convert(
     input_file: Annotated[
@@ -161,88 +130,19 @@ def convert(
     cache_dir: CacheDirOpt = Path(".transcribe_cache"),
 ) -> None:
     """Convert any supported digital score (primary) or sheet music PDF (fallback) to MusicXML."""
-    cfg = _build_config(
+    cfg = TranscriptionConfig(
         instrument=instrument,
         part=part,
-        chords=chords,
-        fingering=fingering,
-        preserve_chords=preserve_chords,
-        preserve_fingering=preserve_fingering,
-        cache=cache,
+        enrich_chords=chords,
+        enrich_fingering=fingering,
+        preserve_existing_chords=preserve_chords,
+        preserve_existing_fingering=preserve_fingering,
+        use_cache=cache,
         cache_dir=cache_dir,
-        dpi=dpi,
+        pdf_dpi=dpi,
         omr_backend=omr_backend,
     )
     res = convert_music(input_path=input_file, instrument=instrument, output_path=output, config=cfg)
-    _print_result(res)
-
-
-@app.command()
-def score(
-    score_file: Annotated[
-        Path,
-        typer.Argument(
-            exists=True,
-            readable=True,
-            help="Digital score (.musicxml/.xml/.mxl/.mid/.krn/.mei/.abc/.gp3-.gp5/.gp/.gpx/.mscz/.cap/.capx/.ly).",
-        ),
-    ],
-    instrument: InstrumentOpt,
-    output: OutputOpt = None,
-    part: PartOpt = None,
-    chords: ChordsOpt = True,
-    fingering: FingeringOpt = True,
-    preserve_chords: PreserveChordsOpt = False,
-    preserve_fingering: PreserveFingeringOpt = False,
-    cache: CacheOpt = True,
-    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
-) -> None:
-    """Convert and enrich a digital symbolic score file into MusicXML."""
-    cfg = _build_config(
-        instrument=instrument,
-        part=part,
-        chords=chords,
-        fingering=fingering,
-        preserve_chords=preserve_chords,
-        preserve_fingering=preserve_fingering,
-        cache=cache,
-        cache_dir=cache_dir,
-    )
-    res = transcribe_score(score_path=score_file, instrument=instrument, output_path=output, config=cfg)
-    _print_result(res)
-
-
-@app.command()
-def pdf(
-    pdf_file: Annotated[
-        Path, typer.Argument(exists=True, readable=True, help="Sheet music .pdf file (OMR fallback).")
-    ],
-    instrument: InstrumentOpt,
-    output: OutputOpt = None,
-    part: PartOpt = None,
-    dpi: Annotated[int, typer.Option("--dpi", help="PDF rasterization DPI for OMR.")] = 300,
-    omr_backend: OmrBackendOpt = OmrBackend.AUTO,
-    chords: ChordsOpt = True,
-    fingering: FingeringOpt = True,
-    preserve_chords: PreserveChordsOpt = False,
-    preserve_fingering: PreserveFingeringOpt = False,
-    cache: CacheOpt = True,
-    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
-) -> None:
-    """Run fallback OMR on a sheet music PDF and enrich with chords and fingerings."""
-    cfg = _build_config(
-        instrument=instrument,
-        part=part,
-        chords=chords,
-        fingering=fingering,
-        preserve_chords=preserve_chords,
-        preserve_fingering=preserve_fingering,
-        cache=cache,
-        cache_dir=cache_dir,
-        dpi=dpi,
-        omr_backend=omr_backend,
-    )
-    res = transcribe_pdf(pdf_path=pdf_file, instrument=instrument, output_path=output, config=cfg)
     _print_result(res)
 
 
@@ -254,7 +154,7 @@ def inspect(
     ],
 ) -> None:
     """List all parts, instruments, clefs, and note counts in a digital score file."""
-    info = inspect_score(score_file)
+    info = inspect_digital_score(score_file)
     table = Table(title=f"{info.title or info.source_path.name} ({info.format_name})")
     table.add_column("#", no_wrap=True)
     table.add_column("Part", no_wrap=True)
