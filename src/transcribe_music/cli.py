@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
@@ -142,6 +143,16 @@ def _bounded_int(lo: int, hi: int | None = None):
     return _parse
 
 
+def _positive_float(raw: str) -> float:
+    try:
+        val = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected positive number, got {raw!r}") from exc
+    if not math.isfinite(val) or val <= 0.0:
+        raise argparse.ArgumentTypeError(f"expected positive finite number, got {val}")
+    return val
+
+
 def _enum_choices(enum_cls: type[Enum]) -> list[str]:
     return [m.value for m in enum_cls]
 
@@ -161,6 +172,9 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         instrument=inst,
         part=args.part,
         enrich_chords=args.chords,
+        chord_window_beats=args.chord_window,
+        include_slash_chords=args.slash_chords,
+        roman_numerals=args.roman_numerals,
         enrich_fingering=args.fingering,
         preserve_existing_chords=args.preserve_chords,
         preserve_existing_fingering=args.preserve_fingering,
@@ -340,6 +354,24 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Annotate chord symbols.",
+    )
+    p_conv.add_argument(
+        "--chord-window",
+        type=_positive_float,
+        default=2.0,
+        help="Chord recognition window in quarter-note beats (default: 2.0).",
+    )
+    p_conv.add_argument(
+        "--slash-chords",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Emit slash-chord bass inversions like Dm7/C (disable with --no-slash-chords).",
+    )
+    p_conv.add_argument(
+        "--roman-numerals",
+        action="store_true",
+        default=False,
+        help="Annotate Roman numeral harmonic analysis below chord symbols.",
     )
     p_conv.add_argument(
         "--fingering",

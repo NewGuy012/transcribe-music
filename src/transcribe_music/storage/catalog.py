@@ -56,12 +56,15 @@ def compute_job_hash(
 ) -> str:
     """Compute a deterministic cache key for a score conversion/OMR job."""
     payload = {
-        "pipeline_version": "v3",
+        "pipeline_version": "v4",
         "source_type": source_type.value,
         "source_identity": source_identity,
         "instrument": config.instrument.value,
         "part": config.part,
         "enrich_chords": config.enrich_chords,
+        "chord_window_beats": config.chord_window_beats if config.enrich_chords else None,
+        "include_slash_chords": config.include_slash_chords if config.enrich_chords else None,
+        "roman_numerals": config.roman_numerals if config.enrich_chords else None,
         "enrich_fingering": config.enrich_fingering,
         "preserve_existing_chords": config.preserve_existing_chords,
         "preserve_existing_fingering": config.preserve_existing_fingering,

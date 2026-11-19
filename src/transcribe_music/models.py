@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -137,6 +138,9 @@ class TranscriptionConfig:
     part: str | None = None
     use_cache: bool = True
     enrich_chords: bool = True
+    chord_window_beats: float = 2.0
+    include_slash_chords: bool = True
+    roman_numerals: bool = False
     enrich_fingering: bool = True
     preserve_existing_chords: bool = False
     preserve_existing_fingering: bool = False
@@ -149,10 +153,17 @@ class TranscriptionConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instrument", Instrument(self.instrument))
+        object.__setattr__(self, "chord_window_beats", float(self.chord_window_beats))
+        object.__setattr__(self, "include_slash_chords", bool(self.include_slash_chords))
+        object.__setattr__(self, "roman_numerals", bool(self.roman_numerals))
         object.__setattr__(self, "guitar_staff", GuitarStaffMode(self.guitar_staff))
         object.__setattr__(self, "omr_backend", OmrBackend(self.omr_backend))
         object.__setattr__(self, "cache_dir", Path(self.cache_dir))
         object.__setattr__(self, "quantize_divisors", tuple(self.quantize_divisors))
+        if not math.isfinite(self.chord_window_beats) or self.chord_window_beats <= 0.0:
+            raise ValueError(
+                f"chord_window_beats must be a positive finite number, got {self.chord_window_beats}"
+            )
         if not (150 <= self.pdf_dpi <= 600):
             raise ValueError(f"pdf_dpi must be between 150 and 600, got {self.pdf_dpi}")
 

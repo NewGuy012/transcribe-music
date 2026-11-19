@@ -9,6 +9,7 @@ from pathlib import Path
 import music21
 from conftest import make_progression_score, note_tab_tags
 
+from transcribe_music.cli import main
 from transcribe_music.enrich.chords import annotate_chords
 from transcribe_music.enrich.fingering import apply_fingering
 from transcribe_music.export.musicxml import export_musicxml
@@ -53,6 +54,132 @@ def test_chord_recognition_viterbi_and_ensemble_reference(tmp_path: Path) -> Non
     custom = music21.stream.Score([music21.stream.Part([custom_m])])
     annotate_chords(custom, preserve_existing=True)
     assert [s.figure for s in custom.recurse().getElementsByClass(music21.harmony.ChordSymbol)] == ["Dmaj7"]
+
+
+def test_chords_key_enharmonics_slash_inversions_window_and_roman_numerals(tmp_path: Path) -> None:
+    # Flat key (-3 flats, C minor): Db chord spells D- (<root-step>D</root-step><root-alter>-1</root-alter>)
+    s_flat = music21.stream.Score()
+    p_flat = music21.stream.Part()
+    m1 = music21.stream.Measure(number=1)
+    m1.insert(0.0, music21.key.KeySignature(-3))
+    m1.insert(0.0, music21.chord.Chord(["C3", "E-3", "G3", "C4"], quarterLength=2.0))
+    m1.insert(2.0, music21.chord.Chord(["D-3", "F3", "A-3", "D-4"], quarterLength=2.0))
+    p_flat.append(m1)
+    s_flat.insert(0, p_flat)
+    flat_in = tmp_path / "flat_in.musicxml"
+    s_flat.write("musicxml", fp=str(flat_in))
+
+    flat_out = tmp_path / "flat_out.musicxml"
+    assert (
+        main(
+            [
+                "convert",
+                str(flat_in),
+                "-i",
+                "piano",
+                "--chord-window",
+                "2.0",
+                "--roman-numerals",
+                "--no-cache",
+                "-o",
+                str(flat_out),
+            ]
+        )
+        == 0
+    )
+    flat_root = ET.parse(flat_out).getroot()
+    harms_flat = [
+        (h.findtext("root/root-step"), h.findtext("root/root-alter"))
+        for h in flat_root.findall(".//harmony")
+    ]
+    assert harms_flat == [("C", None), ("D", "-1")]
+    words_flat = [w.text for w in flat_root.findall(".//direction/direction-type/words")]
+    assert len(words_flat) == 2
+
+    # Sharp key (+4 sharps, E major) spells C# minor rather than Db
+    s_sharp = music21.stream.Score()
+    p_sharp = music21.stream.Part()
+    ms1 = music21.stream.Measure(number=1)
+    ms1.insert(0.0, music21.key.KeySignature(4))
+    ms1.insert(0.0, music21.chord.Chord(["C#3", "E3", "G#3", "C#4"], quarterLength=4.0))
+    p_sharp.append(ms1)
+    s_sharp.insert(0, p_sharp)
+    annotate_chords(s_sharp, window_beats=4.0)
+    assert [
+        cs.figure for cs in s_sharp.recurse().getElementsByClass(music21.harmony.ChordSymbol)
+    ] == ["C#m"]
+
+    # Slash-chord inversions: C -> Dm7/C -> G7/B -> C, plus --no-slash-chords omitting <bass>
+    s_inv = music21.stream.Score()
+    p_inv = music21.stream.Part()
+    for chord_tones in (
+        ["C3", "E4", "G4", "C5"],
+        ["C3", "D4", "F4", "A4"],
+        ["B2", "D4", "F4", "G4"],
+        ["C3", "E4", "G4", "C5"],
+    ):
+        p_inv.append(music21.chord.Chord(chord_tones, quarterLength=4.0))
+    p_inv.makeMeasures(inPlace=True)
+    s_inv.insert(0, p_inv)
+    inv_in = tmp_path / "inv_in.musicxml"
+    s_inv.write("musicxml", fp=str(inv_in))
+
+    inv_with_slash = tmp_path / "inv_slash.musicxml"
+    assert (
+        main(
+            [
+                "convert",
+                str(inv_in),
+                "-i",
+                "piano",
+                "--chord-window",
+                "4.0",
+                "--no-cache",
+                "-o",
+                str(inv_with_slash),
+            ]
+        )
+        == 0
+    )
+    inv_root = ET.parse(inv_with_slash).getroot()
+    assert [
+        (h.findtext("root/root-step"), h.findtext("kind"), h.findtext("bass/bass-step"))
+        for h in inv_root.findall(".//harmony")
+    ] == [
+        ("C", "major", None),
+        ("D", "minor-seventh", "C"),
+        ("G", "dominant", "B"),
+        ("C", "major", None),
+    ]
+
+    inv_no_slash = tmp_path / "inv_noslash.musicxml"
+    assert (
+        main(
+            [
+                "convert",
+                str(inv_in),
+                "-i",
+                "piano",
+                "--chord-window",
+                "4.0",
+                "--no-slash-chords",
+                "--no-cache",
+                "-o",
+                str(inv_no_slash),
+            ]
+        )
+        == 0
+    )
+    assert not ET.parse(inv_no_slash).findall(".//harmony/bass")
+
+    # Custom chord_window_beats (1.0 vs 4.0) produces finer vs coarser harmony timeline
+    s_beat = copy.deepcopy(s_flat)
+    annotate_chords(s_beat, window_beats=1.0)
+    cs_1 = list(s_beat.recurse().getElementsByClass(music21.harmony.ChordSymbol))
+    s_bar = copy.deepcopy(s_flat)
+    annotate_chords(s_bar, window_beats=4.0)
+    cs_4 = list(s_bar.recurse().getElementsByClass(music21.harmony.ChordSymbol))
+    assert len(cs_1) == 2 and len(cs_4) == 1
 
 
 def test_piano_fingering_notes_and_chords(tmp_path: Path) -> None:

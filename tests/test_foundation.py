@@ -232,3 +232,23 @@ def test_export_atomic_rollback_and_guitar_meta(
         TranscriptionConfig(instrument=Instrument.GUITAR, preserve_existing_tab=False),
     )
     assert len({h_not, h_tab, h_recomp}) == 3
+
+    h_w2 = compute_job_hash(SourceType.DIGITAL, "abc", TranscriptionConfig(instrument=Instrument.PIANO))
+    h_w1 = compute_job_hash(
+        SourceType.DIGITAL,
+        "abc",
+        TranscriptionConfig(instrument=Instrument.PIANO, chord_window_beats=1.0),
+    )
+    h_noslash = compute_job_hash(
+        SourceType.DIGITAL,
+        "abc",
+        TranscriptionConfig(instrument=Instrument.PIANO, include_slash_chords=False),
+    )
+    h_rn = compute_job_hash(
+        SourceType.DIGITAL,
+        "abc",
+        TranscriptionConfig(instrument=Instrument.PIANO, roman_numerals=True),
+    )
+    assert len({h_w2, h_w1, h_noslash, h_rn}) == 4
+    with pytest.raises(ValueError, match="chord_window_beats"):
+        TranscriptionConfig(instrument=Instrument.PIANO, chord_window_beats=0.0)

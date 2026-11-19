@@ -75,8 +75,11 @@ def _produce_enrich_and_export(
             annotate_chords(
                 score,
                 harmonic_reference_score=raw_score,
+                window_beats=cfg.chord_window_beats,
                 preserve_existing=cfg.preserve_existing_chords,
                 instrument=cfg.instrument,
+                include_slash_chords=cfg.include_slash_chords,
+                roman_numerals=cfg.roman_numerals,
             )
         except Exception as exc:  # noqa: BLE001 — non-fatal fallback
             warnings.append(f"Chord enrichment skipped safely: {exc}")
