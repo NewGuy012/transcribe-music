@@ -8,7 +8,6 @@ import logging
 import math
 import os
 import re
-import shutil
 import time
 import urllib.error
 from collections.abc import Callable, Iterable
@@ -20,13 +19,19 @@ from urllib.parse import quote
 import music21
 
 from transcribe_music.ingest._io import (
+    MAX_MEMBER_BYTES,
     atomic_write_text,
+    copy_file_safe,
     download_https_stream,
     http_get_json,
     http_get_text,
     normalize_ascii,
 )
-from transcribe_music.ingest.digital import DIGITAL_EXTENSIONS
+from transcribe_music.ingest.digital import (
+    DIGITAL_EXTENSIONS,
+    GUITAR_TAB_EXTENSIONS,
+    MUSICXML_EXTENSIONS,
+)
 from transcribe_music.ingest.gp_catalog import extract_gp_catalog_member, search_gp_catalog
 from transcribe_music.ingest.pdmx import extract_pdmx_member, search_pdmx_catalog
 from transcribe_music.models import Instrument, ScoreSearchResult
@@ -34,8 +39,7 @@ from transcribe_music.models import Instrument, ScoreSearchResult
 logger = logging.getLogger(__name__)
 
 SUPPORTED_SEARCH_EXTENSIONS: frozenset[str] = DIGITAL_EXTENSIONS
-MUSICXML_SEARCH_EXTENSIONS: frozenset[str] = frozenset({".musicxml", ".mxl", ".xml"})
-_GUITAR_TAB_EXTENSIONS: frozenset[str] = frozenset({".gp", ".gpx", ".gp5", ".gp4", ".gp3", ".tab"})
+MUSICXML_SEARCH_EXTENSIONS: frozenset[str] = MUSICXML_EXTENSIONS
 
 _FORMAT_PRIORITY: dict[str, float] = {
     ".musicxml": 1.00,
@@ -72,7 +76,7 @@ _SOURCE_BIAS: dict[str, float] = {
 
 _DEFAULT_INDEX_TTL_SEC = 86_400
 _REQUEST_TIMEOUT_SEC = 7.0
-_MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+_MAX_DOWNLOAD_BYTES = MAX_MEMBER_BYTES
 
 _OPENSCORE_LIEDER_INDEX_URL = (
     "https://raw.githubusercontent.com/OpenScore/Lieder/main/data/corpus_conversion.json"
@@ -176,23 +180,29 @@ def _load_or_fetch_index(
     allow_network: bool,
     ttl_sec: int = _DEFAULT_INDEX_TTL_SEC,
 ) -> list[dict[str, Any]]:
-    index_dir = Path(cache_dir) / "search_index"
-    cache_path = index_dir / f"{name}.json"
+    cache_path = Path(cache_dir) / "search_index" / f"{name}.json"
+    stale_records: list[dict[str, Any]] | None = None
 
     if cache_path.exists():
-        age = time.time() - cache_path.stat().st_mtime
-        if not allow_network or age <= ttl_sec:
-            try:
-                loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-                if isinstance(loaded, list):
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                if not allow_network or (time.time() - cache_path.stat().st_mtime) <= ttl_sec:
                     return loaded
-            except (OSError, ValueError):
-                pass
+                stale_records = loaded
+        except (OSError, ValueError):
+            pass
 
     if not allow_network:
         return []
 
-    records = fetcher()
+    try:
+        records = fetcher()
+    except (urllib.error.URLError, ValueError, OSError, RuntimeError) as exc:
+        if stale_records is not None:
+            logger.debug("Using stale search index %s after fetch error: %s", name, exc)
+            return stale_records
+        raise
     try:
         atomic_write_text(cache_path, json.dumps(records))
     except OSError:
@@ -390,17 +400,17 @@ def _is_guitar_intent(q_tokens: list[str], instrument: Instrument | None) -> boo
 
 def _effective_format_priority(ext: str, guitar_intent: bool, default: float = 0.0) -> float:
     prio = _FORMAT_PRIORITY.get(ext, default)
-    return max(prio, 0.96) if (guitar_intent and ext in _GUITAR_TAB_EXTENSIONS) else prio
+    return max(prio, 0.96) if (guitar_intent and ext in GUITAR_TAB_EXTENSIONS) else prio
 
 
 def _score_candidate(
     record: dict[str, Any],
-    query: str,
+    q_norm: str,
+    q_tokens: list[str],
     *,
     instrument: Instrument | None = None,
+    guitar_intent: bool = False,
 ) -> float:
-    q_norm = _normalize_text(query)
-    q_tokens = q_norm.split()
     if not q_tokens:
         return 0.0
 
@@ -444,9 +454,8 @@ def _score_candidate(
     if matched < min_required:
         return 0.0
 
-    guitar_intent = _is_guitar_intent(q_tokens, instrument)
     is_preferred_fmt = ext in MUSICXML_SEARCH_EXTENSIONS or (
-        guitar_intent and ext in _GUITAR_TAB_EXTENSIONS
+        guitar_intent and ext in GUITAR_TAB_EXTENSIONS
     )
     fmt_prio = _effective_format_priority(ext, guitar_intent, default=0.2)
 
@@ -519,7 +528,9 @@ def search_digital_scores(
         raise ValueError("limit must be a positive integer.")
 
     allowed_exts = _normalize_allowed_formats(formats, musicxml_only=musicxml_only)
-    guitar_intent = _is_guitar_intent(_normalize_text(clean_query).split(), instrument)
+    q_norm = _normalize_text(clean_query)
+    q_tokens = q_norm.split()
+    guitar_intent = _is_guitar_intent(q_tokens, instrument)
 
     def _safe_index(name: str, fetcher: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
         try:
@@ -557,10 +568,17 @@ def search_digital_scores(
         )
 
     raw_records: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-        for fut in as_completed(pool.submit(fn) for fn in tasks):
+    if include_remote and len(tasks) > 1:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            for fut in as_completed(pool.submit(fn) for fn in tasks):
+                try:
+                    raw_records.extend(fut.result())
+                except Exception as exc:  # noqa: BLE001 — isolate failing search backend
+                    logger.debug("Search backend failed safely: %s", exc)
+    else:
+        for fn in tasks:
             try:
-                raw_records.extend(fut.result())
+                raw_records.extend(fn())
             except Exception as exc:  # noqa: BLE001 — isolate failing search backend
                 logger.debug("Search backend failed safely: %s", exc)
 
@@ -569,7 +587,9 @@ def search_digital_scores(
         ext = str(rec.get("format_ext", "")).lower()
         if ext not in allowed_exts:
             continue
-        score = _score_candidate(rec, clean_query, instrument=instrument)
+        score = _score_candidate(
+            rec, q_norm, q_tokens, instrument=instrument, guitar_intent=guitar_intent
+        )
         if score <= 0.0:
             continue
         scored_candidates.append(
@@ -632,8 +652,7 @@ def download_score_result(
 
     if result.local_corpus_path:
         src_path = music21.corpus.getWork(result.local_corpus_path)
-        shutil.copy2(src_path, dest)
-        return dest
+        return copy_file_safe(Path(src_path), dest)
 
     if result.pdmx_dir and result.pdmx_member:
         return extract_pdmx_member(result.pdmx_dir, result.pdmx_member, dest)

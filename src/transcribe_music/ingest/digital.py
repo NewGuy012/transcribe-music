@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import music21
 
+from transcribe_music.ingest._io import MAX_MEMBER_BYTES, check_zip_safety
 from transcribe_music.ingest.ascii_tab import parse_ascii_tab_file
 from transcribe_music.ingest.guitarpro import parse_gp35_file, parse_gpif_file
 from transcribe_music.models import PartInfo, ScoreInspection
@@ -35,6 +38,7 @@ MUSESCORE_GP_EXTENSIONS = frozenset({".gp", ".gpx"})
 CAPELLA_EXTENSIONS = frozenset({".cap", ".capx"})
 LILYPOND_EXTENSIONS = frozenset({".ly"})
 ASCII_TAB_EXTENSIONS = frozenset({".tab"})
+GUITAR_TAB_EXTENSIONS = GUITARPRO_EXTENSIONS | MUSESCORE_GP_EXTENSIONS | ASCII_TAB_EXTENSIONS
 _LOCAL_ASCII_TAB_EXTENSIONS = frozenset({".tab", ".txt"})
 
 DIGITAL_EXTENSIONS = (
@@ -106,7 +110,7 @@ def _load_musescore_file(path: Path) -> LoadedDigitalScore:
         raise RuntimeError(f"Cannot parse {label} directly because MuseScore Studio CLI was not found. {hint}")
 
     with tempfile.TemporaryDirectory(prefix="tm_mscore_") as tmp_dir:
-        tmp_xml = Path(tmp_dir) / f"{path.stem}.musicxml"
+        tmp_xml = Path(tmp_dir) / "converted.musicxml"
         proc = subprocess.run(
             [mscore_bin, str(path.resolve()), "-o", str(tmp_xml)],
             check=False,
@@ -159,11 +163,10 @@ def _load_lilypond_file(path: Path) -> LoadedDigitalScore:
     if proc.returncode != 0 or ("<score-partwise" not in xml_text and "<score-timewise" not in xml_text):
         detail = proc.stderr.strip() or proc.stdout.strip() or "invalid MusicXML output"
         raise RuntimeError(f"python-ly failed converting {path.name}: {detail}")
-    with tempfile.TemporaryDirectory(prefix="tm_ly_") as tmp_dir:
-        tmp_xml = Path(tmp_dir) / f"{path.stem}.musicxml"
-        tmp_xml.write_text(xml_text, encoding="utf-8")
-        parsed = music21.converter.parse(str(tmp_xml), format="musicxml")
-        return _to_loaded_score(parsed, path, "python_ly", format_name="ly")
+    if re.search(r"<!ENTITY\b", xml_text, re.IGNORECASE):
+        raise ValueError(f"Unsafe XML entity declaration in converted {path.name}")
+    parsed = music21.converter.parseData(xml_text, format="musicxml")
+    return _to_loaded_score(parsed, path, "python_ly", format_name="ly")
 
 
 def load_digital_score(
@@ -174,6 +177,10 @@ def load_digital_score(
     src = Path(path)
     if not src.exists():
         raise FileNotFoundError(f"Digital score file not found: {src}")
+    if not src.is_file():
+        raise IsADirectoryError(f"Digital score path is not a file: {src}")
+    if src.stat().st_size > MAX_MEMBER_BYTES:
+        raise ValueError(f"{src.name} exceeds {MAX_MEMBER_BYTES} byte safety limit.")
 
     suffix = src.suffix.lower()
     if suffix == ".pdf":
@@ -184,6 +191,9 @@ def load_digital_score(
     if suffix not in (DIGITAL_EXTENSIONS | _LOCAL_ASCII_TAB_EXTENSIONS):
         supported = ", ".join(sorted(DIGITAL_EXTENSIONS))
         raise ValueError(f"Unsupported digital score format {suffix!r}. Supported: {supported}")
+
+    if suffix in {".mxl", ".capx", ".mscz"} and zipfile.is_zipfile(src):
+        check_zip_safety(src)
 
     if suffix in _LOCAL_ASCII_TAB_EXTENSIONS:
         score, warnings = parse_ascii_tab_file(src)

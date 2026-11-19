@@ -146,10 +146,41 @@ def attach_guitar_techniques(
 
 
 def is_playable_chord(el: object) -> bool:
-    """Return True for performed Chord objects, excluding Harmony ChordSymbols."""
-    return isinstance(el, music21.chord.Chord) and not isinstance(
-        el, music21.harmony.ChordSymbol
+    """Return True for non-empty performed Chord objects, excluding ChordSymbols."""
+    return (
+        isinstance(el, music21.chord.Chord)
+        and not isinstance(el, music21.harmony.ChordSymbol)
+        and bool(el.pitches)
     )
+
+
+def is_playable_note(el: object) -> bool:
+    """Return True for performed Note or non-empty Chord objects."""
+    return isinstance(el, music21.note.Note) or is_playable_chord(el)
+
+
+def to_frac(value: float | Fraction, max_den: int = 24) -> Fraction:
+    """Convert float/Fraction to a bounded Fraction (default denominator <= 24)."""
+    return (
+        value.limit_denominator(max_den)
+        if isinstance(value, Fraction)
+        else Fraction(float(value)).limit_denominator(max_den)
+    )
+
+
+def extract_tab_tags(el: music21.note.Note | music21.chord.Chord) -> tuple[list[int], list[int]]:
+    """Return (string_numbers, fret_numbers) attached to a Note or Chord."""
+    strings = [
+        int(a.number)
+        for a in el.articulations
+        if isinstance(a, music21.articulations.StringIndication) and a.number is not None
+    ]
+    frets = [
+        int(a.number)
+        for a in el.articulations
+        if isinstance(a, music21.articulations.FretIndication) and a.number is not None
+    ]
+    return strings, frets
 
 
 def iter_playable_notes(
@@ -157,14 +188,12 @@ def iter_playable_notes(
 ) -> Iterator[music21.note.Note | music21.chord.Chord]:
     """Yield performed Notes and Chords (excluding ChordSymbols) from a stream."""
     for el in stream.recurse().notes:
-        if isinstance(el, music21.note.Note) or is_playable_chord(el):
+        if is_playable_note(el):
             yield el
 
 
 def element_midis(el: music21.note.Note | music21.chord.Chord) -> list[int]:
     """Return integer MIDI pitches for a Note or playable Chord."""
-    if isinstance(el, music21.note.Note):
-        return [int(el.pitch.midi)]
     return [int(p.midi) for p in el.pitches]
 
 
@@ -197,37 +226,27 @@ def coerce_to_score(
                 f"Input Opus contains {len(scores)} movements/tunes; loaded the first score only."
             )
         score = scores[0]
-    elif isinstance(parsed, music21.stream.Score):
-        if list(parsed.parts):
-            score = parsed
-        else:
-            loose = [
-                el
-                for el in list(parsed)
-                if not isinstance(el, (music21.metadata.Metadata, music21.layout.LayoutBase))
-            ]
-            if loose or ensure_part:
-                score = music21.stream.Score()
-                if parsed.metadata is not None:
-                    score.metadata = copy.deepcopy(parsed.metadata)
-                part = music21.stream.Part()
-                for el in loose:
-                    part.append(el)
-                score.insert(0, part)
-            else:
-                score = parsed
     elif isinstance(parsed, music21.stream.Part):
         score = music21.stream.Score()
         score.insert(0, parsed)
+    elif isinstance(parsed, music21.stream.Score) and list(parsed.parts):
+        score = parsed
     else:
-        score = music21.stream.Score()
-        part = music21.stream.Part()
-        for el in list(parsed):
-            if isinstance(el, music21.metadata.Metadata):
-                score.metadata = el
-            elif not isinstance(el, music21.layout.LayoutBase):
+        loose = [
+            el
+            for el in list(parsed)
+            if not isinstance(el, (music21.metadata.Metadata, music21.layout.LayoutBase))
+        ]
+        if isinstance(parsed, music21.stream.Score) and not loose and not ensure_part:
+            score = parsed
+        else:
+            score = music21.stream.Score()
+            if parsed.metadata is not None:
+                score.metadata = copy.deepcopy(parsed.metadata)
+            part = music21.stream.Part()
+            for el in loose:
                 part.append(el)
-        score.insert(0, part)
+            score.insert(0, part)
 
     if score.metadata is None:
         score.metadata = music21.metadata.Metadata()
@@ -310,12 +329,7 @@ def fill_stream_rest_gaps(
     """Fill uncovered beat intervals in a single-voice Measure/Voice with non-overlapping Rests."""
     if notes_only is None:
         notes_only = sorted(
-            [
-                el
-                for el in list(st)
-                if (isinstance(el, music21.note.Note) or is_playable_chord(el))
-                and not el.duration.isGrace
-            ],
+            [el for el in list(st) if is_playable_note(el) and not el.duration.isGrace],
             key=lambda e: (float(e.offset), id(e)),
         )
     if not notes_only:
@@ -324,8 +338,8 @@ def fill_stream_rest_gaps(
 
     cursor = Fraction(0, 1)
     for el in notes_only:
-        off = Fraction(el.offset).limit_denominator(24)
-        end = off + Fraction(el.duration.quarterLength).limit_denominator(24)
+        off = to_frac(el.offset)
+        end = off + to_frac(el.duration.quarterLength)
         if off > cursor:
             for seg_start, seg_end in split_tuplet_interval(cursor, min(off, bar_ql)):
                 st.insert(seg_start, music21.note.Rest(quarterLength=seg_end - seg_start))

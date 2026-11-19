@@ -9,7 +9,6 @@ from pathlib import Path
 import music21
 
 from transcribe_music.ingest._io import MAX_MEMBER_BYTES
-from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 from transcribe_music.score_utils import (
     GuitarTrackMeta,
     attach_guitar_techniques,
@@ -22,41 +21,16 @@ _TAB_LINE_RE = re.compile(
     r"^\s*(?P<label>[A-Ga-g][#b]?\d?)\s*[:|]\s*(?P<body>[-0-9hHpPbBrRxX/\\~^()*.\s|]+)\s*$"
 )
 _HEADER_RE = re.compile(r"^\s*(?P<key>[A-Za-z]+)\s*:\s*(?P<val>.+?)\s*$")
-_DEFAULT_GUITAR_TUNING = INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi
-
-_PC_BY_NAME: dict[str, int] = {
-    "C": 0,
-    "C#": 1,
-    "DB": 1,
-    "D": 2,
-    "D#": 3,
-    "EB": 3,
-    "E": 4,
-    "FB": 4,
-    "E#": 5,
-    "F": 5,
-    "F#": 6,
-    "GB": 6,
-    "G": 7,
-    "G#": 8,
-    "AB": 8,
-    "A": 9,
-    "A#": 10,
-    "BB": 10,
-    "B": 11,
-    "CB": 11,
-}
+_BASE_PC: dict[str, int] = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
 
 
 def _parse_pitch_label(token: str) -> tuple[int, int | None]:
     m = re.match(r"^([A-Ga-g])([#b]?)(-?\d+)?$", token.strip())
     if not m:
         raise ValueError(f"Unrecognized string tuning label: {token!r}")
-    acc = "#" if m.group(2) == "#" else ("B" if m.group(2).lower() == "b" else "")
-    note_key = f"{m.group(1).upper()}{acc}"
-    if note_key not in _PC_BY_NAME:
-        raise ValueError(f"Unrecognized pitch name: {token!r}")
-    return _PC_BY_NAME[note_key], (int(m.group(3)) if m.group(3) is not None else None)
+    acc = 1 if m.group(2) == "#" else (-1 if m.group(2).lower() == "b" else 0)
+    pc = (_BASE_PC[m.group(1).upper()] + acc) % 12
+    return pc, (int(m.group(3)) if m.group(3) is not None else None)
 
 
 def _resolve_tuning(labels: list[str]) -> tuple[int, ...]:
@@ -152,12 +126,14 @@ def parse_ascii_tab_file(path: Path) -> tuple[music21.stream.Score, list[str]]:
                     tempo_bpm = float(num_m.group(0))
             elif key in {"time", "meter"}:
                 ts_m = re.match(r"^(\d+)/(\d+)", val)
-                if ts_m and int(ts_m.group(1)) > 0 and int(ts_m.group(2)) > 0:
-                    ts_str = f"{ts_m.group(1)}/{ts_m.group(2)}"
+                if ts_m:
+                    num, den = int(ts_m.group(1)), int(ts_m.group(2))
+                    if num > 0 and 1 <= den <= 64 and (den & (den - 1)) == 0:
+                        ts_str = f"{num}/{den}"
             elif key == "capo":
                 num_m = re.search(r"\d+", val)
                 if num_m:
-                    capo_fret = int(num_m.group(0))
+                    capo_fret = min(24, int(num_m.group(0)))
             elif key == "tuning":
                 tokens = [tok for tok in re.split(r"[\s,-]+", val) if tok]
                 if 4 <= len(tokens) <= 8:
@@ -171,7 +147,7 @@ def parse_ascii_tab_file(path: Path) -> tuple[music21.stream.Score, list[str]]:
     if not systems:
         raise ValueError(f"No valid ASCII guitar tab staves found in {path.name}.")
 
-    base_tuning = explicit_tuning or _resolve_tuning(systems[0][0]) or _DEFAULT_GUITAR_TUNING
+    base_tuning = explicit_tuning or _resolve_tuning(systems[0][0])
     ts_obj = music21.meter.TimeSignature(ts_str)
     bar_ql = Fraction(ts_obj.barDuration.quarterLength).limit_denominator(24)
 

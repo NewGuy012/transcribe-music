@@ -8,6 +8,7 @@ import zipfile
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from xml.parsers import expat
 
 import music21
 
@@ -33,6 +34,7 @@ _NOTE_VALUE_QL: dict[str, Fraction] = {
     "64th": Fraction(1, 16),
 }
 _DEFAULT_GUITAR_TUNING = INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi
+_GUITAR_GM_PROGRAMS = frozenset(INSTRUMENT_SPECS[Instrument.GUITAR].gm_programs)
 
 
 @dataclass(frozen=True)
@@ -258,7 +260,7 @@ def parse_gp35_file(path: Path) -> tuple[music21.stream.Score, list[str]]:
     for track in non_percussion:
         gm_prog = int(getattr(track.channel, "instrument", 25))
         capo_offset = int(getattr(track, "offset", 0) or 0)
-        is_guitar = 24 <= gm_prog <= 31
+        is_guitar = gm_prog in _GUITAR_GM_PROGRAMS
         open_strings = tuple(
             int(s.value)
             for s in sorted(
@@ -449,8 +451,12 @@ def _decompress_bcfz(raw: bytes, *, max_bytes: int = MAX_MEMBER_BYTES) -> bytes 
                     return None
                 start = len(out) - offset
                 remaining = min(length, expected_len - len(out))
-                for idx in range(remaining):
-                    out.append(out[start + (idx % offset)])
+                chunk = bytes(out[start : start + min(remaining, offset)])
+                if len(chunk) >= remaining:
+                    out.extend(chunk[:remaining])
+                else:
+                    reps, rem = divmod(remaining, len(chunk))
+                    out.extend(chunk * reps + chunk[:rem])
             else:
                 lit_count = _read_bits_reversed(2)
                 for _ in range(lit_count):
@@ -566,17 +572,35 @@ def _gpif_initial_tempo(root: ET.Element) -> float | None:
     return None
 
 
+def _parse_safe_gpif_xml(xml_bytes: bytes, source_name: str) -> ET.Element | None:
+    """Parse GPIF XML in one Expat pass, rejecting DTDs and entities in any encoding."""
+    builder = ET.TreeBuilder()
+    parser = expat.ParserCreate()
+
+    def _reject(*_args: object) -> None:
+        raise ValueError(f"Unsafe XML DTD/entity declaration in {source_name}")
+
+    parser.StartDoctypeDeclHandler = _reject
+    parser.EntityDeclHandler = _reject
+    parser.UnparsedEntityDeclHandler = _reject
+    parser.ExternalEntityRefHandler = _reject
+    parser.StartElementHandler = builder.start
+    parser.EndElementHandler = builder.end
+    parser.CharacterDataHandler = builder.data
+    try:
+        parser.Parse(xml_bytes, True)
+        return builder.close()
+    except (expat.ExpatError, ET.ParseError):
+        return None
+
+
 def parse_gpif_file(gp_path: Path) -> tuple[music21.stream.Score, list[str]] | None:
     """Parse a `.gp` (GP7/8 ZIP) or `.gpx` (GP6 BCFZ/BCFS) file via stdlib GPIF XML."""
     xml_bytes = _read_gpif_xml_bytes(gp_path)
     if xml_bytes is None:
         return None
-    head_upper = xml_bytes[:4096].upper()
-    if b"<!DOCTYPE" in head_upper or b"<!ENTITY" in head_upper:
-        raise ValueError(f"Unsafe XML DTD/entity declaration in {gp_path.name}")
-    try:
-        root = ET.fromstring(xml_bytes)
-    except ET.ParseError:
+    root = _parse_safe_gpif_xml(xml_bytes, gp_path.name)
+    if root is None:
         return None
 
     tracks_elems = root.findall("./Tracks/Track")
@@ -599,7 +623,7 @@ def parse_gpif_file(gp_path: Path) -> tuple[music21.stream.Score, list[str]] | N
                 gm_prog = max(0, min(127, prog))
                 break
         tuning, capo_fret = _gpif_tuning_and_capo(track_el)
-        is_guitar = 24 <= gm_prog <= 31 or tuning is not None
+        is_guitar = gm_prog in _GUITAR_GM_PROGRAMS or tuning is not None
         open_strings = tuning or (_DEFAULT_GUITAR_TUNING if is_guitar else ())
 
         measures: list[_GpMeasureData] = []

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
 
-class Instrument(str, Enum):
+class Instrument(StrEnum):
     """Supported target instruments for score adaptation and fingering generation."""
 
     PIANO = "piano"
@@ -18,14 +18,14 @@ class Instrument(str, Enum):
     CELLO = "cello"
 
 
-class SourceType(str, Enum):
+class SourceType(StrEnum):
     """Supported score ingestion source types."""
 
     DIGITAL = "digital"
     PDF = "pdf"
 
 
-class OmrBackend(str, Enum):
+class OmrBackend(StrEnum):
     """Supported Optical Music Recognition backends for PDF fallback."""
 
     AUTO = "auto"
@@ -33,7 +33,7 @@ class OmrBackend(str, Enum):
     HOMR = "homr"
 
 
-class GuitarStaffMode(str, Enum):
+class GuitarStaffMode(StrEnum):
     """Supported MusicXML staff layouts when exporting guitar scores."""
 
     NOTATION = "notation"
@@ -45,7 +45,6 @@ class GuitarStaffMode(str, Enum):
 class InstrumentSpec:
     """Acoustic, notation, and biomechanical metadata for an instrument."""
 
-    instrument: Instrument
     display_name: str
     midi_min: int
     midi_max: int
@@ -57,7 +56,6 @@ class InstrumentSpec:
 
 INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
     Instrument.PIANO: InstrumentSpec(
-        instrument=Instrument.PIANO,
         display_name="Piano",
         midi_min=21,  # A0
         midi_max=108,  # C8
@@ -67,7 +65,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         open_string_midi=(),
     ),
     Instrument.GUITAR: InstrumentSpec(
-        instrument=Instrument.GUITAR,
         display_name="Guitar",
         midi_min=40,  # E2 sounding (E3 written)
         midi_max=88,  # E6 sounding (E7 written)
@@ -77,7 +74,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         open_string_midi=(64, 59, 55, 50, 45, 40),  # E4, B3, G3, D3, A2, E2
     ),
     Instrument.VIOLIN: InstrumentSpec(
-        instrument=Instrument.VIOLIN,
         display_name="Violin",
         midi_min=55,  # G3
         midi_max=105,  # A7
@@ -87,7 +83,6 @@ INSTRUMENT_SPECS: dict[Instrument, InstrumentSpec] = {
         open_string_midi=(76, 69, 62, 55),  # E5, A4, D4, G3
     ),
     Instrument.CELLO: InstrumentSpec(
-        instrument=Instrument.CELLO,
         display_name="Cello",
         midi_min=36,  # C2
         midi_max=84,  # C6
