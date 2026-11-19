@@ -23,7 +23,6 @@ from conftest import (
 
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.ingest.digital import (
-    ensure_converter21_registered,
     inspect_digital_score,
     load_digital_score,
 )
@@ -58,11 +57,26 @@ def test_digital_formats_bridges_and_errors(
 
     krn_path = tmp_path / "bach.krn"
     krn_path.write_text("**kern\n*clefF4\n*M4/4\n4D\n4E\n4F#\n4G\n==\n*-\n", encoding="utf-8")
-    assert load_digital_score(krn_path).backend == "converter21_humdrum"
+    assert load_digital_score(krn_path).backend == "music21_humdrum"
 
     abc_path = tmp_path / "tune.abc"
     abc_path.write_text("X:1\nT:Test\nM:4/4\nL:1/4\nK:D\nD E F G |]\n", encoding="utf-8")
-    assert load_digital_score(abc_path).backend == "converter21_abc"
+    assert load_digital_score(abc_path).backend == "music21_abc"
+
+    mei_path = tmp_path / "violin.mei"
+    mei_path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<mei xmlns="http://www.music-encoding.org/ns/mei"><music><body><mdiv><score>'
+        '<scoreDef><staffGrp><staffDef n="1" lines="5" clef.shape="G" clef.line="2" meter.count="4" meter.unit="4"/></staffGrp></scoreDef>'
+        '<section><measure n="1"><staff n="1"><layer n="1">'
+        '<note pname="g" oct="3" dur="4"/><note pname="a" oct="3" dur="4"/>'
+        '<note pname="b" oct="3" dur="4"/><note pname="d" oct="4" dur="4"/>'
+        "</layer></staff></measure></section></score></mdiv></body></music></mei>",
+        encoding="utf-8",
+    )
+    loaded_mei = load_digital_score(mei_path)
+    assert loaded_mei.backend == "music21_mei"
+    assert len(list(loaded_mei.score.recurse().notes)) == 4
 
     v_score = music21.stream.Score()
     v_part = music21.stream.Part()
@@ -71,9 +85,6 @@ def test_digital_formats_bridges_and_errors(
         v_part.append(music21.note.Note(pitch, quarterLength=1.0))
     v_part.makeMeasures(inPlace=True)
     v_score.insert(0, v_part)
-    mei_path = tmp_path / "violin.mei"
-    v_score.write("mei", fp=str(mei_path))
-    assert load_digital_score(mei_path).backend == "converter21_mei"
 
     capx_path = tmp_path / "study.capx"
     with zipfile.ZipFile(capx_path, "w") as zf:
@@ -138,7 +149,7 @@ def test_digital_formats_bridges_and_errors(
     real_import = builtins.__import__
 
     def _block_extras(name: str, *args: object, **kwargs: object) -> object:
-        if name.startswith("guitarpro") or name == "converter21":
+        if name.startswith("guitarpro"):
             raise ImportError(f"No module named {name!r}")
         return real_import(name, *args, **kwargs)
 
@@ -147,11 +158,6 @@ def test_digital_formats_bridges_and_errors(
     monkeypatch.setattr(builtins, "__import__", _block_extras)
     with pytest.raises(RuntimeError, match="uv sync --extra gp"):
         load_digital_score(gp5_stub)
-
-    ensure_converter21_registered.cache_clear()
-    with pytest.raises(RuntimeError, match="uv sync --extra formats"):
-        load_digital_score(krn_path)
-    ensure_converter21_registered.cache_clear()
 
 
 def test_part_selection_piano_midi_split_and_guitar_adaptation(tmp_path: Path) -> None:

@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
-from functools import cache
 from pathlib import Path
 
 import music21
@@ -24,10 +23,10 @@ from transcribe_music.score_utils import (
 )
 
 MUSICXML_EXTENSIONS = frozenset({".musicxml", ".xml", ".mxl"})
-CONVERTER21_EXTENSIONS: dict[str, str] = {
-    ".krn": "converter21_humdrum",
-    ".mei": "converter21_mei",
-    ".abc": "converter21_abc",
+NATIVE_M21_EXTENSIONS: dict[str, str] = {
+    ".krn": "music21_humdrum",
+    ".mei": "music21_mei",
+    ".abc": "music21_abc",
 }
 MIDI_EXTENSIONS = frozenset({".mid", ".midi"})
 GUITARPRO_EXTENSIONS = frozenset({".gp3", ".gp4", ".gp5"})
@@ -40,7 +39,7 @@ _LOCAL_ASCII_TAB_EXTENSIONS = frozenset({".tab", ".txt"})
 
 DIGITAL_EXTENSIONS = (
     MUSICXML_EXTENSIONS
-    | frozenset(CONVERTER21_EXTENSIONS)
+    | frozenset(NATIVE_M21_EXTENSIONS)
     | MIDI_EXTENSIONS
     | GUITARPRO_EXTENSIONS
     | MUSESCORE_EXTENSIONS
@@ -60,19 +59,6 @@ class LoadedDigitalScore:
     format_name: str
     is_sounding_pitch_source: bool
     warnings: list[str] = field(default_factory=list)
-
-
-@cache
-def ensure_converter21_registered() -> None:
-    """Register converter21 parsers once for Humdrum (.krn), MEI, and ABC."""
-    try:
-        import converter21
-    except ImportError as exc:
-        raise RuntimeError(
-            "Loading .krn/.mei/.abc requires the optional 'formats' extra (`converter21`). "
-            "Install with: uv sync --extra formats"
-        ) from exc
-    converter21.register()
 
 
 def _to_loaded_score(
@@ -229,10 +215,9 @@ def load_digital_score(
         )
         return _to_loaded_score(parsed, src, "midi", format_name="midi", is_sounding=True)
 
-    if suffix in CONVERTER21_EXTENSIONS:
-        ensure_converter21_registered()
+    if suffix in NATIVE_M21_EXTENSIONS:
         parsed = music21.converter.parse(str(src))
-        return _to_loaded_score(parsed, src, CONVERTER21_EXTENSIONS[suffix])
+        return _to_loaded_score(parsed, src, NATIVE_M21_EXTENSIONS[suffix])
 
     return _to_loaded_score(music21.converter.parse(str(src)), src, "musicxml")
 

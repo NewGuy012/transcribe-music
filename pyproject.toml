@@ -19,7 +19,6 @@ environments = ["sys_platform == 'darwin' and platform_machine == 'arm64'"]
 [project.optional-dependencies]
 pdf = ["pymupdf"]
 gp = ["pyguitarpro"]
-formats = ["converter21"]
 dev = [
     "pytest",
     "ruff",
