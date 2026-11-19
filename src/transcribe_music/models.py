@@ -136,6 +136,8 @@ class TranscriptionConfig:
 
     instrument: Instrument
     part: str | None = None
+    title: str | None = None
+    composer: str | None = None
     use_cache: bool = True
     enrich_chords: bool = True
     chord_window_beats: float = 2.0

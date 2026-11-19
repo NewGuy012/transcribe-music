@@ -171,6 +171,8 @@ def _cmd_convert(args: argparse.Namespace) -> int:
     cfg = TranscriptionConfig(
         instrument=inst,
         part=args.part,
+        title=args.title,
+        composer=args.composer,
         enrich_chords=args.chords,
         chord_window_beats=args.chord_window,
         include_slash_chords=args.slash_chords,
@@ -345,6 +347,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_conv.add_argument(
         "--part", "-p", default=None, help="Part number (1-based) or name filter (e.g. 'cello' or '1,2')."
     )
+    p_conv.add_argument("--title", default=None, help="Override MusicXML work/movement title.")
+    p_conv.add_argument("--composer", default=None, help="Override MusicXML composer metadata.")
     p_conv.add_argument(
         "--dpi", type=_bounded_int(150, 600), default=300, help="PDF rasterization DPI (150-600)."
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import re
 import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -388,11 +389,74 @@ def _repair_overfull_measures(part: music21.stream.Part, warnings: list[str]) ->
     )
 
 
+_SCORE_EXT_RE = re.compile(
+    r"\.(?:musicxml|mxl|xml|mid|midi|gp|gp3|gp4|gp5|gpx|krn|mei|abc|tab|txt|pdf|mscz|mscx|ly|cap|capx)$",
+    re.IGNORECASE,
+)
+_CATALOG_PREFIXES: dict[str, str] = {
+    "op": "Op.",
+    "no": "No.",
+    "d": "D.",
+    "k": "K.",
+    "kv": "KV",
+    "bwv": "BWV",
+    "hwv": "HWV",
+    "rv": "RV",
+    "hob": "Hob.",
+    "mwv": "MWV",
+    "woo": "WoO",
+    "wtc": "WTC",
+}
+_CATALOG_PREFIX_RE = re.compile(
+    r"^(op|no|bwv|hwv|mwv|woo|hob|wtc|kv|rv|d|k)([0-9]+[a-z]?)$",
+    re.IGNORECASE,
+)
+_TITLE_MINOR_WORDS = frozenset(
+    {"a", "an", "and", "as", "at", "by", "de", "des", "du", "en", "for", "from", "in", "of", "on", "or", "the", "to", "van", "von"}
+)
+
+
+def looks_like_raw_filename(text: str) -> bool:
+    """Return True if a metadata title looks like an unformatted filename or slug."""
+    s = text.strip()
+    if not s:
+        return False
+    if _SCORE_EXT_RE.search(s):
+        return True
+    if "_" in s and " " not in s:
+        return True
+    return "-" in s and " " not in s and s == s.lower()
+
+
+def format_score_title(raw: str) -> str:
+    """Format a filename stem or raw slug into clean musical Title Case."""
+    cleaned = _SCORE_EXT_RE.sub("", raw.strip())
+    tokens = [tok for tok in re.split(r"[\s_-]+", cleaned) if tok]
+    if not tokens:
+        return raw.strip()
+
+    formatted: list[str] = []
+    last_idx = len(tokens) - 1
+    for idx, tok in enumerate(tokens):
+        low = tok.lower()
+        if m := _CATALOG_PREFIX_RE.match(low):
+            prefix = _CATALOG_PREFIXES[m.group(1)]
+            formatted.append(f"{prefix} {m.group(2)}")
+        elif low in {"op", "no", "bwv", "hwv", "mwv", "woo", "wtc", "kv", "rv"}:
+            formatted.append(_CATALOG_PREFIXES[low])
+        elif 0 < idx < last_idx and low in _TITLE_MINOR_WORDS:
+            formatted.append(low)
+        else:
+            formatted.append(tok[0].upper() + tok[1:].lower() if tok.isalpha() else tok.capitalize())
+    return " ".join(formatted)
+
+
 def normalize_score_structure(
     score: music21.stream.Score,
     instrument: Instrument,
     title: str | None = None,
     *,
+    composer: str | None = None,
     repair_overflows: bool = False,
     warnings: list[str] | None = None,
 ) -> music21.stream.Score:
@@ -402,10 +466,14 @@ def normalize_score_structure(
     if score.metadata is None:
         score.metadata = music21.metadata.Metadata()
     if title:
-        score.metadata.title = title
+        clean_title = format_score_title(title) if looks_like_raw_filename(title) else title.strip()
+        score.metadata.title = clean_title
+        score.metadata.movementName = clean_title
+    if composer:
+        score.metadata.composer = composer.strip()
 
     if not list(score.parts):
-        score, _ = coerce_to_score(score, default_title=title, ensure_part=True)
+        score, _ = coerce_to_score(score, default_title=score.metadata.title or title, ensure_part=True)
     parts = list(score.parts)
 
     for idx, part in enumerate(parts):
@@ -943,6 +1011,7 @@ def export_musicxml(
     instrument: Instrument,
     title: str | None = None,
     *,
+    composer: str | None = None,
     guitar_staff: GuitarStaffMode = GuitarStaffMode.NOTATION,
     repair_overflows: bool = False,
 ) -> tuple[ExportMetrics, list[str]]:
@@ -963,6 +1032,7 @@ def export_musicxml(
         score,
         instrument=instrument,
         title=title,
+        composer=composer,
         repair_overflows=repair_overflows,
         warnings=warnings,
     )

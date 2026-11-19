@@ -11,7 +11,12 @@ import music21
 import pytest
 from conftest import write_pdf_file
 
-from transcribe_music.export.musicxml import _postprocess_and_validate_xml, export_musicxml
+from transcribe_music.cli import main
+from transcribe_music.export.musicxml import (
+    _postprocess_and_validate_xml,
+    export_musicxml,
+    format_score_title,
+)
 from transcribe_music.models import (
     GuitarStaffMode,
     Instrument,
@@ -252,3 +257,71 @@ def test_export_atomic_rollback_and_guitar_meta(
     assert len({h_w2, h_w1, h_noslash, h_rn}) == 4
     with pytest.raises(ValueError, match="chord_window_beats"):
         TranscriptionConfig(instrument=Instrument.PIANO, chord_window_beats=0.0)
+
+
+def test_title_casing_metadata_overrides_and_key_mode_refinement(tmp_path: Path) -> None:
+    assert (
+        format_score_title("schubert_moments_musicaux_op94_no3_d780")
+        == "Schubert Moments Musicaux Op. 94 No. 3 D. 780"
+    )
+    assert (
+        format_score_title("massenet_thais_meditation_violin_piano")
+        == "Massenet Thais Meditation Violin Piano"
+    )
+    assert (
+        format_score_title("bach_bwv1007_cello_suite_1_prelude")
+        == "Bach BWV 1007 Cello Suite 1 Prelude"
+    )
+    assert (
+        format_score_title("bach_wtc1_prelude_01_c_major.mxl")
+        == "Bach WTC 1 Prelude 01 C Major"
+    )
+
+    # MIDI file with F minor music tagged with -4 sharps major key signature refines to minor
+    s_fm = music21.stream.Score()
+    p_fm = music21.stream.Part()
+    p_fm.insert(0, music21.key.Key("A-"))
+    for chord_notes in (
+        ["F3", "A-3", "C4", "F4"],
+        ["B-3", "D-4", "F4"],
+        ["C3", "E4", "G4", "B-4"],
+        ["F3", "A-3", "C4", "F4"],
+    ):
+        p_fm.append(music21.chord.Chord(chord_notes, quarterLength=2.0))
+    s_fm.insert(0, p_fm)
+    mid_in = tmp_path / "schubert_moments_musicaux_op94_no3_d780.mid"
+    s_fm.write("midi", fp=str(mid_in))
+
+    auto_out = tmp_path / "auto.musicxml"
+    assert main(["convert", str(mid_in), "-i", "piano", "--no-cache", "-o", str(auto_out)]) == 0
+    auto_root = ET.parse(auto_out).getroot()
+    assert auto_root.findtext("work/work-title") == "Schubert Moments Musicaux Op. 94 No. 3 D. 780"
+    assert (
+        auto_root.findtext("movement-title") == "Schubert Moments Musicaux Op. 94 No. 3 D. 780"
+    )
+    assert auto_root.findtext(".//measure[@number='1']/attributes/key/fifths") == "-4"
+    assert auto_root.findtext(".//measure[@number='1']/attributes/key/mode") == "minor"
+
+    custom_out = tmp_path / "custom.musicxml"
+    assert (
+        main(
+            [
+                "convert",
+                str(mid_in),
+                "-i",
+                "piano",
+                "--title",
+                "Moment Musicaux No. 3, Op. 94 (D. 780)",
+                "--composer",
+                "Franz Schubert",
+                "--no-cache",
+                "-o",
+                str(custom_out),
+            ]
+        )
+        == 0
+    )
+    custom_root = ET.parse(custom_out).getroot()
+    assert custom_root.findtext("work/work-title") == "Moment Musicaux No. 3, Op. 94 (D. 780)"
+    assert custom_root.findtext("movement-title") == "Moment Musicaux No. 3, Op. 94 (D. 780)"
+    assert custom_root.findtext("identification/creator[@type='composer']") == "Franz Schubert"

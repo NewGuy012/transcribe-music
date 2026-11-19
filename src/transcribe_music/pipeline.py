@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import copy
 import shutil
 import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
 
+import music21
+
 from transcribe_music.enrich.chords import annotate_chords
 from transcribe_music.enrich.fingering import apply_fingering
-from transcribe_music.export.musicxml import export_musicxml
+from transcribe_music.export.musicxml import (
+    export_musicxml,
+    format_score_title,
+    looks_like_raw_filename,
+)
 from transcribe_music.ingest.digital import load_digital_score
 from transcribe_music.models import (
     Instrument,
@@ -33,6 +40,66 @@ def _copy_if_needed(src: Path, dst: Path) -> Path:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
     return dst
+
+
+def _refine_initial_key_mode(
+    score: music21.stream.Score,
+    reference_score: music21.stream.Score,
+    *,
+    is_midi: bool,
+) -> None:
+    """Disambiguate relative major/minor <mode> when untyped or MIDI-defaulted, preserving fifths."""
+    parts = list(score.parts)
+    if not parts:
+        return
+
+    first_ks: music21.key.KeySignature | None = None
+    for part in parts:
+        first_m = part.getElementsByClass(music21.stream.Measure).first()
+        container = first_m if first_m is not None else part
+        ks = container.getElementsByClass(music21.key.KeySignature).first()
+        if ks is not None:
+            first_ks = ks
+            break
+    if first_ks is None:
+        return
+    if isinstance(first_ks, music21.key.Key) and not is_midi:
+        return
+
+    try:
+        analyzed = reference_score.analyze("key")
+    except Exception:  # noqa: BLE001 — non-fatal heuristic
+        return
+    if not isinstance(analyzed, music21.key.Key):
+        return
+    if analyzed.sharps != first_ks.sharps:
+        return
+    if float(getattr(analyzed, "correlationCoefficient", 0.0) or 0.0) < 0.70:
+        return
+    if isinstance(first_ks, music21.key.Key) and first_ks.mode == analyzed.mode:
+        return
+
+    for part in parts:
+        first_m = part.getElementsByClass(music21.stream.Measure).first()
+        container = first_m if first_m is not None else part
+        for ks in list(container.getElementsByClass(music21.key.KeySignature)):
+            if ks.sharps == analyzed.sharps:
+                off = ks.offset
+                container.remove(ks)
+                container.insert(off, copy.deepcopy(analyzed))
+
+
+def _resolve_export_title(
+    score: music21.stream.Score,
+    input_path: Path,
+    override_title: str | None,
+) -> str:
+    if override_title and override_title.strip():
+        return override_title.strip()
+    existing = score.metadata.title.strip() if score.metadata and score.metadata.title else ""
+    if existing and existing not in {input_path.name, input_path.stem} and not looks_like_raw_filename(existing):
+        return existing
+    return format_score_title(existing or input_path.stem)
 
 
 def _produce_enrich_and_export(
@@ -95,12 +162,16 @@ def _produce_enrich_and_export(
         except Exception as exc:  # noqa: BLE001 — non-fatal fallback
             warnings.append(f"Fingering enrichment skipped safely: {exc}")
 
-    existing_title = score.metadata.title.strip() if score.metadata and score.metadata.title else ""
+    _refine_initial_key_mode(score, raw_score, is_midi=(backend == "midi"))
+
+    resolved_title = _resolve_export_title(score, input_path, cfg.title)
+    resolved_composer = cfg.composer.strip() if cfg.composer and cfg.composer.strip() else None
     metrics, export_warnings = export_musicxml(
         score,
         output_path=export_path,
         instrument=cfg.instrument,
-        title=existing_title or input_path.stem,
+        title=resolved_title,
+        composer=resolved_composer,
         guitar_staff=cfg.guitar_staff,
         repair_overflows=(source_type == SourceType.PDF),
     )
