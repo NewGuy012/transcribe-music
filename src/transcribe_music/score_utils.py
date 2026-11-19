@@ -4,11 +4,35 @@ from __future__ import annotations
 
 import copy
 import math
-from collections.abc import Iterator
+import os
+import shutil
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 
 import music21
+
+
+def try_int(text: str | None) -> int | None:
+    """Parse an integer string cleanly without failing on malformed signs."""
+    if not text:
+        return None
+    try:
+        return int(text.strip())
+    except ValueError:
+        return None
+
+
+def find_executable(names: Sequence[str], candidates: Sequence[Path]) -> str | None:
+    """Locate an executable on PATH or among standard fallback installation paths."""
+    for name in names:
+        if found := shutil.which(name):
+            return found
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 @dataclass(frozen=True)

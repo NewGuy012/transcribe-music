@@ -85,7 +85,7 @@ def test_digital_formats_bridges_and_errors(
 
     pdf_stub = tmp_path / "sheet.pdf"
     pdf_stub.write_bytes(b"%PDF-1.4")
-    with pytest.raises(ValueError, match="PDF fallback"):
+    with pytest.raises(ValueError, match="got PDF"):
         load_digital_score(pdf_stub)
 
     bad_stub = tmp_path / "unknown.xyz"
@@ -129,8 +129,8 @@ def test_digital_formats_bridges_and_errors(
     real_import = builtins.__import__
 
     def _block_gp(name: str, *args: object, **kwargs: object) -> object:
-        if name.startswith("guitarpro"):
-            raise ImportError("No module named 'guitarpro'")
+        if name.startswith("guitarpro") or name == "converter21":
+            raise ImportError(f"No module named {name!r}")
         return real_import(name, *args, **kwargs)
 
     gp5_stub = tmp_path / "missing_extra.gp5"
@@ -138,6 +138,13 @@ def test_digital_formats_bridges_and_errors(
     monkeypatch.setattr(builtins, "__import__", _block_gp)
     with pytest.raises(RuntimeError, match="uv sync --extra gp"):
         load_digital_score(gp5_stub)
+
+    from transcribe_music.ingest.digital import ensure_converter21_registered
+
+    ensure_converter21_registered.cache_clear()
+    with pytest.raises(RuntimeError, match="uv sync --extra formats"):
+        load_digital_score(krn_path)
+    ensure_converter21_registered.cache_clear()
 
 
 def test_guitarpro_gp5_and_part_selector(tmp_path: Path) -> None:

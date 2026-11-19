@@ -49,18 +49,14 @@ _PC_BY_NAME: dict[str, int] = {
 
 
 def _parse_pitch_label(token: str) -> tuple[int, int | None]:
-    clean = token.strip()
-    m = re.match(r"^([A-Ga-g])([#b]?)(-?\d+)?$", clean)
+    m = re.match(r"^([A-Ga-g])([#b]?)(-?\d+)?$", token.strip())
     if not m:
         raise ValueError(f"Unrecognized string tuning label: {token!r}")
-    name = (m.group(1).upper() + m.group(2).upper()).replace("B", "B")
-    # Preserve flat 'b' vs note 'B'
-    note_key = m.group(1).upper() + ("#" if m.group(2) == "#" else ("B" if m.group(2).lower() == "b" else ""))
+    acc = "#" if m.group(2) == "#" else ("B" if m.group(2).lower() == "b" else "")
+    note_key = f"{m.group(1).upper()}{acc}"
     if note_key not in _PC_BY_NAME:
-        raise ValueError(f"Unrecognized pitch name: {name!r}")
-    pc = _PC_BY_NAME[note_key]
-    octave = int(m.group(3)) if m.group(3) is not None else None
-    return pc, octave
+        raise ValueError(f"Unrecognized pitch name: {token!r}")
+    return _PC_BY_NAME[note_key], (int(m.group(3)) if m.group(3) is not None else None)
 
 
 def _resolve_tuning(labels: list[str]) -> tuple[int, ...]:
@@ -155,9 +151,9 @@ def parse_ascii_tab_file(path: Path) -> tuple[music21.stream.Score, list[str]]:
                 if num_m:
                     tempo_bpm = float(num_m.group(0))
             elif key in {"time", "meter"}:
-                ts_m = re.match(r"^(\d+/\d+)", val)
-                if ts_m:
-                    ts_str = ts_m.group(1)
+                ts_m = re.match(r"^(\d+)/(\d+)", val)
+                if ts_m and int(ts_m.group(1)) > 0 and int(ts_m.group(2)) > 0:
+                    ts_str = f"{ts_m.group(1)}/{ts_m.group(2)}"
             elif key == "capo":
                 num_m = re.search(r"\d+", val)
                 if num_m:
