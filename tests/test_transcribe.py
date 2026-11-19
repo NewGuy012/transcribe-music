@@ -191,6 +191,49 @@ def test_part_selection_piano_midi_split_and_guitar_adaptation(tmp_path: Path) -
     assert "Lead Guitar" in select_and_adapt_parts(gtr_score, Instrument.GUITAR, is_sounding_pitch_source=True).selected_part
     assert "Rhythm Guitar" in select_and_adapt_parts(gtr_score, Instrument.GUITAR, part_selector="rhythm", is_sounding_pitch_source=True).selected_part
 
+    # Cello MIDI auto-clef switching: Bass -> Tenor -> Bass hysteresis on sounding pitch; MusicXML untouched
+    cel_s = music21.stream.Score()
+    cel_p = music21.stream.Part()
+    cel_p.insert(0, music21.instrument.Violoncello())
+    for pitch in (
+        "C2", "G2", "C3", "E3",  # M1: low bass
+        "G3", "B3", "D4", "A4",  # M2: high tenor (min >= 50, max >= 65)
+        "D3", "E3", "F#3", "G3",  # M3: drops below G3 and <= D4 -> back to Bass
+    ):
+        cel_p.append(music21.note.Note(pitch, quarterLength=1.0))
+    cel_p.makeMeasures(inPlace=True)
+    cel_s.insert(0, cel_p)
+
+    cel_mid_path = tmp_path / "cello_clefs.mid"
+    cel_s.write("midi", fp=str(cel_mid_path))
+    cel_loaded = load_digital_score(cel_mid_path)
+    cel_sel = select_and_adapt_parts(
+        cel_loaded.score,
+        Instrument.CELLO,
+        is_sounding_pitch_source=cel_loaded.is_sounding_pitch_source,
+    )
+    cel_clefs = [
+        (m.number, type(c).__name__)
+        for m in cel_sel.score.parts[0].getElementsByClass(music21.stream.Measure)
+        for c in m.getElementsByClass(music21.clef.Clef)
+    ]
+    assert cel_clefs == [(1, "BassClef"), (2, "TenorClef"), (3, "BassClef")]
+
+    # Authored MusicXML clefs remain untouched (is_sounding_pitch_source=False)
+    authored_s = music21.stream.Score()
+    authored_p = music21.stream.Part()
+    am1 = music21.stream.Measure(number=1)
+    am1.insert(0, music21.clef.TrebleClef())
+    for pitch in ("A4", "B4", "C5", "D5"):
+        am1.append(music21.note.Note(pitch, quarterLength=1.0))
+    authored_p.append(am1)
+    authored_s.insert(0, authored_p)
+    authored_sel = select_and_adapt_parts(authored_s, Instrument.CELLO, is_sounding_pitch_source=False)
+    assert [
+        type(c).__name__
+        for c in authored_sel.score.parts[0].recurse().getElementsByClass(music21.clef.Clef)
+    ] == ["TrebleClef"]
+
 
 def test_gp5_gpif_and_ascii_tab_parsers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path

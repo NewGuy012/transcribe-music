@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from fractions import Fraction
+from statistics import median
 
 import music21
 
@@ -381,6 +382,39 @@ def _adapt_guitar_part(
     part.atSoundingPitch = False
 
 
+def _apply_cello_auto_clefs(part: music21.stream.Part) -> None:
+    """Insert Bass/Tenor clef switches at measure boundaries for sounding-pitch cello sources."""
+    measures = list(part.getElementsByClass(music21.stream.Measure))
+    if not measures:
+        return
+
+    in_tenor = False
+    for m_idx, m in enumerate(measures):
+        if m_idx > 0:
+            for stray in list(m.getElementsByClass(music21.clef.Clef)):
+                m.remove(stray)
+
+        midis = [midi for el in iter_playable_notes(m) for midi in element_midis(el)]
+        if not midis:
+            continue
+
+        lo = min(midis)
+        hi = max(midis)
+        med = median(midis)
+
+        if not in_tenor:
+            if lo >= 50 and (hi >= 65 or med >= 60):
+                for c in list(m.getElementsByClass(music21.clef.Clef)):
+                    m.remove(c)
+                m.insert(0.0, music21.clef.TenorClef())
+                in_tenor = True
+        elif lo < 55 and hi <= 62:
+            for c in list(m.getElementsByClass(music21.clef.Clef)):
+                m.remove(c)
+            m.insert(0.0, music21.clef.BassClef())
+            in_tenor = False
+
+
 def select_and_adapt_parts(
     score: music21.stream.Score,
     instrument: Instrument,
@@ -441,6 +475,8 @@ def select_and_adapt_parts(
             make_clef(INSTRUMENT_SPECS[instrument].clef_mode),
             force_replace=is_sounding_pitch_source,
         )
+        if instrument == Instrument.CELLO and is_sounding_pitch_source:
+            _apply_cello_auto_clefs(part_copy)
 
     out_score.insert(0, part_copy)
     return SelectedScore(
