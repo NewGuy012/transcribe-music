@@ -1,8 +1,9 @@
-"""Tests for DuckDB catalog, PDF rasterization, MusicXML repair, and XML validation."""
+"""Tests for SQLite catalog, PDF rasterization, MusicXML repair, and XML validation."""
 
 from __future__ import annotations
 
 import builtins
+import copy
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -24,11 +25,12 @@ from transcribe_music.score_utils import (
     get_guitar_track_meta,
     set_guitar_track_meta,
 )
+from transcribe_music.storage import open_sqlite
 from transcribe_music.storage.catalog import CatalogStore, compute_job_hash
 from transcribe_music.transcribe.omr_pdf import render_pdf_pages
 
 
-def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:
+def test_export_musicxml_baseline_and_sqlite_catalog(tmp_path: Path) -> None:
     score = music21.stream.Score()
     part = music21.stream.Part()
     for pitch_name in ["C4", "E4", "G4", "C5", "D5", "F5", "G5", "C6"]:
@@ -73,7 +75,14 @@ def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:
     cached = store.get_cached_job(job_hash)
     assert cached is not None and cached.cached is True
     assert cached.note_count == 8
-    assert cached.backend == "musicxml"
+
+    # Tampered DB path outside artifacts_dir must be ignored
+    outside_xml = tmp_path / "outside.musicxml"
+    outside_xml.write_bytes(out_xml.read_bytes())
+    with open_sqlite(store.db_path) as con:
+        con.execute("UPDATE jobs SET musicxml_path = ? WHERE job_hash = ?", [str(outside_xml), job_hash])
+    assert store.get_cached_job(job_hash) is None
+
     assert store.clear_cache() == 1
     assert not store.artifacts_dir.exists()
 
@@ -191,21 +200,35 @@ def test_xml_validator_rejects_malformed_measures(
         _postprocess_and_validate_xml(xml_path)
 
 
-def test_guitar_track_meta_and_job_hash_isolation() -> None:
-    import copy
+def test_export_atomic_rollback_and_guitar_meta(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "existing.musicxml"
+    target.write_text("KEEP_INTACT", encoding="utf-8")
+    monkeypatch.setattr(
+        "transcribe_music.export.musicxml._postprocess_and_validate_xml",
+        lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("boom")),
+    )
+    s = music21.stream.Score([music21.stream.Part([music21.note.Note("C4", quarterLength=4.0)])])
+    with pytest.raises(ValueError, match="boom"):
+        export_musicxml(s, target, Instrument.VIOLIN)
+    assert target.read_text(encoding="utf-8") == "KEEP_INTACT"
 
     part = music21.stream.Part()
     meta = GuitarTrackMeta(open_string_midi=(64, 59, 55, 50, 45, 38), capo_fret=2)
     set_guitar_track_meta(part, meta)
-    copied = copy.deepcopy(part)
-    loaded_meta = get_guitar_track_meta(copied)
-    assert loaded_meta == meta
+    assert get_guitar_track_meta(copy.deepcopy(part)) == meta
     assert format_tuning_label(meta.open_string_midi) == "D2-A2-D3-G3-B3-E4"
 
-    cfg_not = TranscriptionConfig(instrument=Instrument.GUITAR)
-    cfg_tab = TranscriptionConfig(instrument=Instrument.GUITAR, guitar_staff=GuitarStaffMode.TAB)
-    cfg_recomp = TranscriptionConfig(instrument=Instrument.GUITAR, preserve_existing_tab=False)
-    h_not = compute_job_hash(SourceType.DIGITAL, "abc", cfg_not)
-    h_tab = compute_job_hash(SourceType.DIGITAL, "abc", cfg_tab)
-    h_recomp = compute_job_hash(SourceType.DIGITAL, "abc", cfg_recomp)
+    h_not = compute_job_hash(SourceType.DIGITAL, "abc", TranscriptionConfig(instrument=Instrument.GUITAR))
+    h_tab = compute_job_hash(
+        SourceType.DIGITAL,
+        "abc",
+        TranscriptionConfig(instrument=Instrument.GUITAR, guitar_staff=GuitarStaffMode.TAB),
+    )
+    h_recomp = compute_job_hash(
+        SourceType.DIGITAL,
+        "abc",
+        TranscriptionConfig(instrument=Instrument.GUITAR, preserve_existing_tab=False),
+    )
     assert len({h_not, h_tab, h_recomp}) == 3

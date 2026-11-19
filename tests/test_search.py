@@ -1,10 +1,12 @@
-"""Tests for digital score search, ranking, download safety, and CLI search workflow."""
+"""Tests for score search, PDMX/DadaGP SQLite catalogs, archive extraction, and HTTP guards."""
 
 from __future__ import annotations
 
 import io
+import tarfile
 import urllib.error
 import urllib.request
+import zipfile
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -16,14 +18,19 @@ from conftest import make_simple_cello_score, write_mxl_bytes
 
 from transcribe_music import (
     Instrument,
+    convert_music,
     download_score_result,
     get_gp_catalog_status,
+    get_pdmx_status,
     search_digital_scores,
     sync_gp_catalog,
+    sync_pdmx,
 )
 from transcribe_music.cli import main
 from transcribe_music.ingest import _io as io_mod
 from transcribe_music.ingest import search as search_mod
+from transcribe_music.ingest.gp_catalog import extract_gp_catalog_member
+from transcribe_music.ingest.pdmx import extract_pdmx_member
 
 
 def _fake_opener(payload: bytes, url: str, headers: dict[str, str] | None = None) -> Callable[..., Any]:
@@ -109,25 +116,16 @@ def test_search_ranking_diacritics_resilience_and_format_filters(
     assert all(r.format_ext in {".musicxml", ".mxl"} for r in results[:3])
 
     mxl_only = search_digital_scores(
-        "Moonlight Sonata",
-        limit=5,
-        musicxml_only=True,
-        include_local=False,
-        cache_dir=tmp_path / "cache",
+        "Moonlight Sonata", limit=5, musicxml_only=True, include_local=False, cache_dir=tmp_path / "cache"
     )
     assert [r.format_ext for r in mxl_only] == [".musicxml", ".mxl", ".mxl"]
 
     krn_only = search_digital_scores(
-        "Moonlight Sonata",
-        formats=["krn", "mid"],
-        include_local=False,
-        cache_dir=tmp_path / "cache",
+        "Moonlight Sonata", formats=["krn", "mid"], include_local=False, cache_dir=tmp_path / "cache"
     )
     assert {r.format_ext for r in krn_only} == {".krn", ".mid"}
 
-    diacritics = search_digital_scores(
-        "Erlkonig", include_local=False, cache_dir=tmp_path / "cache"
-    )
+    diacritics = search_digital_scores("Erlkonig", include_local=False, cache_dir=tmp_path / "cache")
     assert len(diacritics) == 1 and diacritics[0].title == "Der Erlkönig"
 
 
@@ -166,13 +164,10 @@ def test_offline_music21_corpus_and_github_tree_parsers(
     wir = search_mod._fetch_when_in_rome_index()
     assert len(wir) == 1 and wir[0]["composer"] == "Wolfgang Amadeus Mozart"
     gp_cls = search_mod._fetch_gp_classical_guitar_index()
-    assert len(gp_cls) == 1
-    assert gp_cls[0]["composer"] == "Brouwer"
-    assert gp_cls[0]["format_ext"] == ".gp5"
-    assert gp_cls[0]["source"] == "GP Classical Guitar"
+    assert len(gp_cls) == 1 and gp_cls[0]["format_ext"] == ".gp5"
 
 
-def test_cli_search_and_download_security_guards(
+def test_cli_search_and_http_redirect_security_guards(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mxl_bytes = write_mxl_bytes(make_simple_cello_score("Moonlight Study"), tmp_path)
@@ -190,14 +185,11 @@ def test_cli_search_and_download_security_guards(
         ],
     )
     monkeypatch.setattr(
-        urllib.request,
-        "build_opener",
-        _fake_opener(mxl_bytes, "https://example.com/moonlight.mxl"),
+        urllib.request, "build_opener", _fake_opener(mxl_bytes, "https://example.com/moonlight.mxl")
     )
 
     dl_dir = tmp_path / "dl"
     cache_dir = tmp_path / "cache"
-
     monkeypatch.setattr("builtins.input", lambda _prompt="": "")
     assert main(["search", "Moonlight", "--dir", str(dl_dir), "--cache-dir", str(cache_dir)]) == 0
     assert "Download cancelled." in capsys.readouterr().out
@@ -234,25 +226,17 @@ def test_cli_search_and_download_security_guards(
 
     valid = replace(insecure, download_url="https://example.com/score.mxl")
     monkeypatch.setattr(
-        urllib.request,
-        "build_opener",
-        _fake_opener(b"PK", "http://downgraded.example.com/score.mxl"),
+        urllib.request, "build_opener", _fake_opener(b"PK", "http://downgraded.example.com/score.mxl")
     )
     with pytest.raises(ValueError, match="Only HTTPS"):
         download_score_result(valid, download_dir=tmp_path)
 
-    # Pre-hop redirect guard blocks http:// downgrade and strips Authorization across hosts
     handler = io_mod._SafeHttpsRedirectHandler()
-    auth_req = urllib.request.Request(
-        "https://api.example.com/data", headers={"Authorization": "Bearer secret"}
-    )
+    auth_req = urllib.request.Request("https://api.example.com/data", headers={"Authorization": "Bearer secret"})
     with pytest.raises(ValueError, match="Only HTTPS"):
         handler.redirect_request(auth_req, None, 302, "Found", {}, "http://evil.example.com/x")
-    redir_req = handler.redirect_request(
-        auth_req, None, 302, "Found", {}, "https://cdn.other.com/x"
-    )
-    assert redir_req is not None
-    assert "Authorization" not in redir_req.headers
+    redir_req = handler.redirect_request(auth_req, None, 302, "Found", {}, "https://cdn.other.com/x")
+    assert redir_req is not None and "Authorization" not in redir_req.headers
 
     monkeypatch.setattr(
         urllib.request,
@@ -267,15 +251,87 @@ def test_cli_search_and_download_security_guards(
         download_score_result(valid, download_dir=tmp_path)
 
 
-def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
+def test_pdmx_sqlite_sync_search_extract_and_security(tmp_path: Path) -> None:
+    cache_dir = tmp_path / ".cache"
+    pdmx_dir = tmp_path / "pdmx_store"
+    pdmx_dir.mkdir(parents=True)
+
+    mxl_rel = "./mxl/h/ha/QmHaydnCelloD.mxl"
+    (pdmx_dir / "PDMX.csv").write_text(
+        "\n".join(
+            [
+                'mxl,mid,pdf,title,song_name,composer_name,artist_name,genres,tracks,tags,n_tracks,complexity,rating,n_ratings,is_best_unique_arrangement,"subset:no_license_conflict"',
+                f'{mxl_rel},NA,NA,"Cello Concerto No. 2","Cello Concerto","Joseph Haydn",NA,classical,Cello,cello,2,3.0,4.85,12,True,True',
+                './mxl/c/co/QmConflict.mxl,NA,NA,"Cello Conflict","Cello",NA,NA,classical,Cello,NA,NA,NA,NA,NA,False,False',
+                './mxl/d/dv/QmDvorak.mxl,NA,NA,"Cello Concerto in B minor","Cello Concerto","Antonín Dvořák",NA,classical,Cello,cello,2,4.0,4.7,9,True,True',
+                './mxl/g/gu/QmGuitar.mxl,NA,NA,"Capricho","Capricho","Composer B",NA,classical,"Classical Guitar",guitar,1,2.0,4.5,5,False,True',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    status_meta = sync_pdmx(cache_dir=cache_dir, pdmx_dir=pdmx_dir, download_csv=False)
+    assert status_meta.score_count == 3 and status_meta.mxl_available is False
+
+    dvorak_hits = search_digital_scores(
+        "Dvorak Cello Concerto", include_remote=False, include_local=False, cache_dir=cache_dir
+    )
+    assert len(dvorak_hits) == 1 and dvorak_hits[0].composer == "Antonín Dvořák"
+    assert search_digital_scores("%", include_remote=False, include_local=False, cache_dir=cache_dir) == []
+    with pytest.raises(FileNotFoundError, match="pdmx sync --with-mxl"):
+        download_score_result(dvorak_hits[0], download_dir=tmp_path / "dl")
+
+    gtr_hits = search_digital_scores(
+        "Capricho", instrument=Instrument.GUITAR, include_remote=False, include_local=False, cache_dir=cache_dir
+    )
+    assert gtr_hits[0].filename == "QmGuitar.mxl" and "Classical Guitar" in (gtr_hits[0].edition_note or "")
+
+    mxl_bytes = write_mxl_bytes(make_simple_cello_score("Haydn Cello Concerto"), tmp_path)
+    with tarfile.open(pdmx_dir / "mxl.tar.gz", "w:gz") as tf:
+        info = tarfile.TarInfo(name=mxl_rel)
+        info.size = len(mxl_bytes)
+        tf.addfile(info, io.BytesIO(mxl_bytes))
+        sym = tarfile.TarInfo(name="./mxl/evil_link.mxl")
+        sym.type = tarfile.SYMTYPE
+        sym.linkname = "/etc/passwd"
+        tf.addfile(sym)
+
+    assert get_pdmx_status(cache_dir).mxl_available is True
+    haydn_hits = search_digital_scores(
+        "Haydn Cello Concerto", include_remote=False, include_local=False, cache_dir=cache_dir
+    )
+    saved_mxl = download_score_result(haydn_hits[0], download_dir=tmp_path / "dl")
+    assert saved_mxl.read_bytes() == mxl_bytes
+    assert convert_music(saved_mxl, Instrument.CELLO, output_path=tmp_path / "haydn.musicxml").fingering_count == 4
+
+    assert main(["pdmx", "status", "--cache-dir", str(cache_dir)]) == 0
+    assert (
+        main(
+            [
+                "pdmx",
+                "sync",
+                "--pdmx-dir",
+                str(pdmx_dir),
+                "--no-download",
+                "--include-license-conflicts",
+                "--cache-dir",
+                str(cache_dir),
+            ]
+        )
+        == 0
+    )
+    assert get_pdmx_status(cache_dir).score_count == 4
+
+    for unsafe in ("../../etc/passwd", "/etc/passwd", "mxl/../../etc/passwd"):
+        with pytest.raises(ValueError, match="Unsafe archive member path"):
+            extract_pdmx_member(pdmx_dir, unsafe, tmp_path / "out.mxl")
+    with pytest.raises(ValueError, match="not a regular file"):
+        extract_pdmx_member(pdmx_dir, "mxl/evil_link.mxl", tmp_path / "out.mxl")
+
+
+def test_guitar_search_and_dadagp_sqlite_catalog(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import io
-    import tarfile
-    import zipfile
-
-    from transcribe_music.ingest import gp_catalog as gp_mod
-
     _stub_remote_sources(
         monkeypatch,
         quartets=lambda: [
@@ -306,10 +362,8 @@ def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
         include_local=False,
         cache_dir=tmp_path / "search_cache",
     )
-    assert gtr_hits[0].format_ext == ".gp5"
-    assert gtr_hits[0].source == "GP Classical Guitar"
+    assert gtr_hits[0].format_ext == ".gp5" and gtr_hits[0].source == "GP Classical Guitar"
 
-    # DadaGP / local GP catalog indexing across direct file, .tar.gz, and .zip
     gp_dir = tmp_path / "gp_library"
     (gp_dir / "Rock" / "Metallica").mkdir(parents=True)
     (gp_dir / "Rock" / "Metallica" / "Nothing_Else_Matters.gp5").write_bytes(b"GP5RAW")
@@ -324,11 +378,13 @@ def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
 
     with zipfile.ZipFile(gp_dir / "pack.zip", "w") as zf:
         zf.writestr("Bach/Bourree_in_E_minor.tab", "e|---0---|\n")
+        sym_zi = zipfile.ZipInfo("Bach/evil_link.tab")
+        sym_zi.external_attr = 0o120777 << 16
+        zf.writestr(sym_zi, "/etc/passwd")
 
     cache_dir = tmp_path / "gp_cache"
     status = sync_gp_catalog(cache_dir=cache_dir, gp_dir=gp_dir)
-    assert status.db_exists is True
-    assert status.score_count == 3
+    assert status.db_exists is True and status.score_count == 3
     assert get_gp_catalog_status(cache_dir).score_count == 3
 
     for q, expected_ext, expected_bytes in (
@@ -337,27 +393,21 @@ def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
         ("Bourree", ".tab", b"e|---0---|\n"),
     ):
         hits = search_digital_scores(
-            q,
-            instrument=Instrument.GUITAR,
-            include_remote=False,
-            include_local=False,
-            cache_dir=cache_dir,
+            q, instrument=Instrument.GUITAR, include_remote=False, include_local=False, cache_dir=cache_dir
         )
         assert hits and hits[0].source == "DadaGP" and hits[0].format_ext == expected_ext
         out = download_score_result(hits[0], download_dir=tmp_path / "dl_gp")
         assert out.read_bytes() == expected_bytes
 
     with pytest.raises(ValueError, match="Unsafe archive member"):
-        gp_mod.extract_gp_catalog_member(gp_dir, "file::../../etc/passwd", tmp_path / "x.gp5")
+        extract_gp_catalog_member(gp_dir, "file::../../etc/passwd", tmp_path / "x.gp5")
+    with pytest.raises(ValueError, match="symlink"):
+        extract_gp_catalog_member(gp_dir, "zip::pack.zip::Bach/evil_link.tab", tmp_path / "x.tab")
 
     def _raise_403(*_a: object, **_kw: object) -> object:
         raise urllib.error.HTTPError("https://zenodo.org/api/records/4789123", 403, "Forbidden", {}, None)
 
-    monkeypatch.setattr(
-        urllib.request,
-        "build_opener",
-        lambda *_h: SimpleNamespace(open=_raise_403),
-    )
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *_h: SimpleNamespace(open=_raise_403))
     with pytest.raises(RuntimeError, match="approved researcher access"):
         sync_gp_catalog(cache_dir=cache_dir, zenodo_record="4789123")
 

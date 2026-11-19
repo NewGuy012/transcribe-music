@@ -1,4 +1,4 @@
-"""Shared synthetic music score and fixture builders for tests."""
+"""Shared synthetic score builders and helpers for tests."""
 
 from __future__ import annotations
 
@@ -7,6 +7,21 @@ from pathlib import Path
 
 import music21
 import pytest
+
+
+def note_tab_tags(el: music21.note.Note | music21.chord.Chord) -> tuple[list[int], list[int]]:
+    """Return (string_numbers, fret_numbers) attached to a Note or Chord."""
+    strings = [
+        int(a.number)
+        for a in el.articulations
+        if isinstance(a, music21.articulations.StringIndication) and a.number is not None
+    ]
+    frets = [
+        int(a.number)
+        for a in el.articulations
+        if isinstance(a, music21.articulations.FretIndication) and a.number is not None
+    ]
+    return strings, frets
 
 
 def make_simple_cello_score(title: str = "Cello Fixture") -> music21.stream.Score:
@@ -139,9 +154,7 @@ def write_gp5_file(
         song.measureHeaders[0].repeatClose = 2
 
     v0 = gtr_track.measures[0].voices[0]
-    beat_groups: list[tuple[tuple[int, int], ...]] = (
-        list(chord_beats) if chord_beats else [(nf,) for nf in notes]
-    )
+    beat_groups = list(chord_beats) if chord_beats else [(nf,) for nf in notes]
     for b_idx, group in enumerate(beat_groups):
         beat = gm.Beat(v0, duration=gm.Duration(value=4), status=gm.BeatStatus.normal)
         for string_num, fret in group:
@@ -154,12 +167,11 @@ def write_gp5_file(
                     note.effect.slides = [gm.SlideType.shiftSlideTo]
                     note.effect.harmonic = gm.NaturalHarmonic()
                 elif b_idx == 2:
-                    bend = gm.BendEffect(
+                    note.effect.bend = gm.BendEffect(
                         type=gm.BendType.bend,
                         value=100,
                         points=[gm.BendPoint(0, 0), gm.BendPoint(6, 4), gm.BendPoint(12, 4)],
                     )
-                    note.effect.bend = bend
             beat.notes.append(note)
         v0.beats.append(beat)
     guitarpro.write(song, str(path))
@@ -173,115 +185,55 @@ def write_gpif_file(
     artist: str = "GPIF Artist",
     tuning_low_to_high: str = "38 45 50 55 59 64",
     capo: int = 2,
+    doctype: str = "",
 ) -> Path:
     """Create a synthetic Guitar Pro 7/8 `.gp` archive with `Content/score.gpif`."""
-    gpif_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<GPIF>
-  <Score>
-    <Title>{title}</Title>
-    <Artist>{artist}</Artist>
-  </Score>
-  <MasterTrack>
-    <Automations>
-      <Automation><Type>Tempo</Type><Position>0</Position><Value>112 2</Value></Automation>
-    </Automations>
-  </MasterTrack>
-  <Tracks>
-    <Track id="0">
-      <Name>Lead Guitar</Name>
-      <InstrumentSet><Type>guitar</Type><Name>Electric Guitar</Name></InstrumentSet>
-      <GeneralMidi><Program>27</Program><PrimaryChannel>0</PrimaryChannel></GeneralMidi>
-      <Staves>
-        <Staff>
-          <Properties>
-            <Property name="Tuning"><Pitches>{tuning_low_to_high}</Pitches></Property>
-            <Property name="CapoFret"><Fret>{capo}</Fret></Property>
-          </Properties>
-        </Staff>
-      </Staves>
-    </Track>
-    <Track id="1">
-      <Name>Drumkit</Name>
-      <InstrumentSet><Type>drumKit</Type><Name>Drumkit</Name></InstrumentSet>
-      <GeneralMidi><Program>0</Program><PrimaryChannel>9</PrimaryChannel></GeneralMidi>
-    </Track>
-  </Tracks>
-  <MasterBars>
-    <MasterBar>
-      <Time>4/4</Time>
-      <Key><AccidentalCount>1</AccidentalCount></Key>
-      <Repeat start="true" end="true" count="2"/>
-      <Bars>0 1</Bars>
-    </MasterBar>
-  </MasterBars>
-  <Bars>
-    <Bar id="0"><Voices>0 -1</Voices></Bar>
-    <Bar id="1"><Voices>1 -1</Voices></Bar>
-  </Bars>
-  <Voices>
-    <Voice id="0"><Beats>0 1 2</Beats></Voice>
-    <Voice id="1"><Beats>3</Beats></Voice>
-  </Voices>
-  <Beats>
-    <Beat id="0"><Rhythm ref="0"/><Notes>0 1</Notes></Beat>
-    <Beat id="1"><Rhythm ref="0"/><Notes>2</Notes></Beat>
-    <Beat id="2"><Rhythm ref="1"/><Notes>3</Notes></Beat>
-    <Beat id="3"><Rhythm ref="2"/><Notes></Notes></Beat>
-  </Beats>
-  <Notes>
-    <Note id="0">
-      <Properties>
-        <Property name="String"><String>0</String></Property>
-        <Property name="Fret"><Fret>0</Fret></Property>
-        <Property name="PalmMuted"><Enable/></Property>
-      </Properties>
-    </Note>
-    <Note id="1">
-      <Properties>
-        <Property name="String"><String>5</String></Property>
-        <Property name="Fret"><Fret>3</Fret></Property>
-        <Property name="HopOOrigin"><Enable/></Property>
-      </Properties>
-    </Note>
-    <Note id="2">
-      <Properties>
-        <Property name="String"><String>5</String></Property>
-        <Property name="Fret"><Fret>5</Fret></Property>
-        <Property name="Bended"><Enable/></Property>
-        <Property name="BendDestinationValue"><Float>100</Float></Property>
-      </Properties>
-    </Note>
-    <Note id="3">
-      <Properties>
-        <Property name="String"><String>4</String></Property>
-        <Property name="Fret"><Fret>12</Fret></Property>
-        <Property name="Harmonic"><Enable/></Property>
-      </Properties>
-    </Note>
-  </Notes>
-  <Rhythms>
-    <Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>
-    <Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>
-    <Rhythm id="2"><NoteValue>Whole</NoteValue></Rhythm>
-  </Rhythms>
-</GPIF>"""
+    gpif_xml = (
+        f'<?xml version="1.0" encoding="utf-8"?>{doctype}<GPIF>'
+        f"<Score><Title>{title}</Title><Artist>{artist}</Artist></Score>"
+        "<MasterTrack><Automations><Automation><Type>Tempo</Type><Value>112 2</Value></Automation></Automations></MasterTrack>"
+        "<Tracks>"
+        '<Track id="0"><Name>Lead Guitar</Name>'
+        "<GeneralMidi><Program>27</Program><PrimaryChannel>0</PrimaryChannel></GeneralMidi>"
+        f'<Staves><Staff><Properties><Property name="Tuning"><Pitches>{tuning_low_to_high}</Pitches></Property>'
+        f'<Property name="CapoFret"><Fret>{capo}</Fret></Property></Properties></Staff></Staves></Track>'
+        '<Track id="1"><Name>Drumkit</Name><InstrumentSet><Type>drumKit</Type></InstrumentSet>'
+        "<GeneralMidi><Program>0</Program><PrimaryChannel>9</PrimaryChannel></GeneralMidi></Track>"
+        "</Tracks>"
+        '<MasterBars><MasterBar><Time>4/4</Time><Key><AccidentalCount>1</AccidentalCount></Key>'
+        '<Repeat start="true" end="true" count="2"/><Bars>0 1</Bars></MasterBar></MasterBars>'
+        '<Bars><Bar id="0"><Voices>0 -1</Voices></Bar><Bar id="1"><Voices>1 -1</Voices></Bar></Bars>'
+        '<Voices><Voice id="0"><Beats>0 1 2</Beats></Voice><Voice id="1"><Beats>3</Beats></Voice></Voices>'
+        '<Beats><Beat id="0"><Rhythm ref="0"/><Notes>0 1</Notes></Beat>'
+        '<Beat id="1"><Rhythm ref="0"/><Notes>2</Notes></Beat>'
+        '<Beat id="2"><Rhythm ref="1"/><Notes>3</Notes></Beat>'
+        '<Beat id="3"><Rhythm ref="2"/><Notes></Notes></Beat></Beats>'
+        "<Notes>"
+        '<Note id="0"><Properties><Property name="String"><String>0</String></Property>'
+        '<Property name="Fret"><Fret>0</Fret></Property><Property name="PalmMuted"><Enable/></Property></Properties></Note>'
+        '<Note id="1"><Properties><Property name="String"><String>5</String></Property>'
+        '<Property name="Fret"><Fret>3</Fret></Property><Property name="HopOOrigin"><Enable/></Property></Properties></Note>'
+        '<Note id="2"><Properties><Property name="String"><String>5</String></Property>'
+        '<Property name="Fret"><Fret>5</Fret></Property><Property name="Bended"><Enable/></Property>'
+        '<Property name="BendDestinationValue"><Float>100</Float></Property></Properties></Note>'
+        '<Note id="3"><Properties><Property name="String"><String>4</String></Property>'
+        '<Property name="Fret"><Fret>12</Fret></Property><Property name="Harmonic"><Enable/></Property></Properties></Note>'
+        "</Notes>"
+        '<Rhythms><Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>'
+        '<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>'
+        '<Rhythm id="2"><NoteValue>Whole</NoteValue></Rhythm></Rhythms></GPIF>'
+    )
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("Content/score.gpif", gpif_xml)
     return path
 
 
 def write_ascii_tab_file(path: Path, content: str | None = None) -> Path:
-    default_tab = """Title: Riff Study
-Artist: Tab Author
-Time: 4/4
-Capo: 2
-
-e|---0---3h5---7\\5---12b--|
-B|---1--------------------|
-G|---0--------------------|
-D|---2--------------------|
-A|---3--------------------|
-E|------------------------|
-"""
+    default_tab = (
+        "Title: Riff Study\nArtist: Tab Author\nTime: 4/4\nCapo: 2\n\n"
+        "e|---0---3h5---7\\5---12b--|\nB|---1--------------------|\n"
+        "G|---0--------------------|\nD|---2--------------------|\n"
+        "A|---3--------------------|\nE|------------------------|\n"
+    )
     path.write_text(content if content is not None else default_tab, encoding="utf-8")
     return path

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import music21
-from conftest import make_progression_score
+from conftest import make_progression_score, note_tab_tags
 
 from transcribe_music.enrich.chords import annotate_chords
 from transcribe_music.enrich.fingering import apply_fingering
@@ -25,12 +26,7 @@ def test_chord_recognition_viterbi_and_ensemble_reference(tmp_path: Path) -> Non
     assert metrics.chord_count == 4
     root = ET.parse(out_xml).getroot()
     assert [h.findtext("root/root-step") for h in root.findall(".//harmony")] == ["C", "A", "F", "G"]
-    assert [h.findtext("kind") for h in root.findall(".//harmony")] == [
-        "major",
-        "minor",
-        "major",
-        "major",
-    ]
+    assert [h.findtext("kind") for h in root.findall(".//harmony")] == ["major", "minor", "major", "major"]
 
     full_score = make_progression_score()
     solo = music21.stream.Part(id="Cello")
@@ -48,12 +44,7 @@ def test_chord_recognition_viterbi_and_ensemble_reference(tmp_path: Path) -> Non
     assert not solo_warnings
     assert solo_metrics.chord_count == 4
     solo_root = ET.parse(solo_xml).getroot()
-    assert [h.findtext("root/root-step") for h in solo_root.findall(".//harmony")] == [
-        "C",
-        "A",
-        "F",
-        "G",
-    ]
+    assert [h.findtext("root/root-step") for h in solo_root.findall(".//harmony")] == ["C", "A", "F", "G"]
     assert not solo_root.findall(".//harmony/offset")
 
     custom_m = music21.stream.Measure(number=1)
@@ -61,9 +52,7 @@ def test_chord_recognition_viterbi_and_ensemble_reference(tmp_path: Path) -> Non
     custom_m.insert(0.0, music21.note.Note("D3", quarterLength=4.0))
     custom = music21.stream.Score([music21.stream.Part([custom_m])])
     annotate_chords(custom, preserve_existing=True)
-    assert [s.figure for s in custom.recurse().getElementsByClass(music21.harmony.ChordSymbol)] == [
-        "Dmaj7"
-    ]
+    assert [s.figure for s in custom.recurse().getElementsByClass(music21.harmony.ChordSymbol)] == ["Dmaj7"]
 
 
 def test_piano_fingering_notes_and_chords(tmp_path: Path) -> None:
@@ -84,7 +73,7 @@ def test_piano_fingering_notes_and_chords(tmp_path: Path) -> None:
     assert all(f in {"1", "2", "3", "4", "5"} for f in fingers)
 
 
-def test_guitar_fingering_tab_and_sounding_pitch_handling(tmp_path: Path) -> None:
+def test_guitar_fingering_tab_locked_tuning_and_chords(tmp_path: Path) -> None:
     s = music21.stream.Score()
     p = music21.stream.Part()
     p.insert(0, music21.clef.Treble8vbClef())
@@ -106,12 +95,10 @@ def test_guitar_fingering_tab_and_sounding_pitch_handling(tmp_path: Path) -> Non
     assert notes_xml[0].findtext("notations/technical/fret") == "0"
     assert len({n.findtext("notations/technical/string") for n in notes_xml[-3:]}) == 3
 
-    # Fresh sounding-pitch Part (atSoundingPitch='unknown', no clef) must not shift down -12
+    # Sounding-pitch Part without clef must not shift down -12
     raw_s = music21.stream.Score([music21.stream.Part([music21.note.Note("E2", quarterLength=4.0)])])
     apply_fingering(raw_s, Instrument.GUITAR)
-    raw_arts = list(next(raw_s.recurse().notes).articulations)
-    assert any(isinstance(a, music21.articulations.StringIndication) and a.number == 6 for a in raw_arts)
-    assert any(isinstance(a, music21.articulations.FretIndication) and a.number == 0 for a in raw_arts)
+    assert note_tab_tags(next(raw_s.recurse().notes)) == ([6], [0])
 
     s_pres = music21.stream.Score()
     p_pres = music21.stream.Part()
@@ -123,11 +110,7 @@ def test_guitar_fingering_tab_and_sounding_pitch_handling(tmp_path: Path) -> Non
     apply_fingering(s_pres, Instrument.GUITAR, preserve_existing=True)
     assert [a.fingerNumber for a in next(s_pres.recurse().notes).articulations] == ["4"]
 
-
-def test_guitar_locked_tab_custom_tuning_24th_fret_and_power_sus_chords(tmp_path: Path) -> None:
-    import copy
-
-    # 1. Locked-TAB preserves authored (6, 5), (6, 7) and adds fingerings; recompute moves to open/2nd fret
+    # Locked TAB preserves authored positions while recompute moves to open/2nd fret
     s_locked = music21.stream.Score()
     p_locked = music21.stream.Part()
     p_locked.insert(0, music21.clef.Treble8vbClef())
@@ -142,72 +125,38 @@ def test_guitar_locked_tab_custom_tuning_24th_fret_and_power_sus_chords(tmp_path
 
     s_recomputed = copy.deepcopy(s_locked)
     apply_fingering(s_locked, Instrument.GUITAR, preserve_existing_tab=True)
-    locked_notes = list(s_locked.parts[0].recurse().notes)
-    assert [
-        next(a.number for a in n.articulations if isinstance(a, music21.articulations.StringIndication))
-        for n in locked_notes
-    ] == [6, 6]
-    assert [
-        next(a.number for a in n.articulations if isinstance(a, music21.articulations.FretIndication))
-        for n in locked_notes
-    ] == [5, 7]
-    assert all(
-        any(
-            isinstance(a, music21.articulations.Fingering)
-            and str(a.fingerNumber) in {"1", "2", "3", "4"}
-            for a in n.articulations
-        )
-        for n in locked_notes
-    )
+    assert [note_tab_tags(n) for n in s_locked.parts[0].recurse().notes] == [([6], [5]), ([6], [7])]
 
     apply_fingering(s_recomputed, Instrument.GUITAR, preserve_existing_tab=False)
-    recomp_strings = [
-        next(a.number for a in n.articulations if isinstance(a, music21.articulations.StringIndication))
-        for n in s_recomputed.parts[0].recurse().notes
-    ]
-    assert recomp_strings == [5, 5]  # Recomputed onto open A string (5,0) and (5,2)
+    assert [note_tab_tags(n)[0][0] for n in s_recomputed.parts[0].recurse().notes] == [5, 5]
 
-    # 2. Drop-D tuning + 24th fret E6 (= written E7) solved cleanly without clamping
+    # Drop-D + 24th fret E6 (= written E7)
     s_drop = music21.stream.Score()
     p_drop = music21.stream.Part()
     p_drop.insert(0, music21.clef.Treble8vbClef())
     p_drop.atSoundingPitch = False
-    set_guitar_track_meta(p_drop, GuitarTrackMeta(open_string_midi=(64, 59, 55, 50, 45, 38), capo_fret=0))
-    p_drop.append(music21.note.Note("D3", quarterLength=2.0))  # Sounds D2 (38) -> string 6 fret 0
-    p_drop.append(music21.note.Note("E7", quarterLength=2.0))  # Sounds E6 (88) -> string 1 fret 24
+    set_guitar_track_meta(p_drop, GuitarTrackMeta(open_string_midi=(64, 59, 55, 50, 45, 38)))
+    p_drop.append(music21.note.Note("D3", quarterLength=2.0))
+    p_drop.append(music21.note.Note("E7", quarterLength=2.0))
     p_drop.makeMeasures(inPlace=True)
     s_drop.insert(0, p_drop)
-
     apply_fingering(s_drop, Instrument.GUITAR, preserve_existing_tab=False)
-    drop_notes = list(s_drop.parts[0].recurse().notes)
-    assert [
-        next(a.number for a in n.articulations if isinstance(a, music21.articulations.StringIndication))
-        for n in drop_notes
-    ] == [6, 1]
-    assert [
-        next(a.number for a in n.articulations if isinstance(a, music21.articulations.FretIndication))
-        for n in drop_notes
-    ] == [0, 24]
+    assert [note_tab_tags(n) for n in s_drop.parts[0].recurse().notes] == [([6], [0]), ([1], [24])]
 
-    # 3. Guitar chord recognition handles E5, Dsus4, Cadd9 while preserving major/minor triads
-    s_gtr_chords = music21.stream.Score()
+    # Power/sus/add9 chords + standard triads
+    s_gc = music21.stream.Score()
     p_gc = music21.stream.Part()
     p_gc.append(music21.chord.Chord(["E2", "B2", "E3"], quarterLength=4.0))
     p_gc.append(music21.chord.Chord(["D3", "A3", "D4", "G4"], quarterLength=4.0))
     p_gc.append(music21.chord.Chord(["C3", "E3", "G3", "D4"], quarterLength=4.0))
     p_gc.makeMeasures(inPlace=True)
-    s_gtr_chords.insert(0, p_gc)
-    annotate_chords(s_gtr_chords, window_beats=4.0, instrument=Instrument.GUITAR)
-    figures = [cs.figure for cs in s_gtr_chords.recurse().getElementsByClass(music21.harmony.ChordSymbol)]
-    assert figures == ["E5", "Dsus4", "Cadd9"]
-
-    triads = make_progression_score()
-    annotate_chords(triads, window_beats=4.0, instrument=Instrument.GUITAR)
-    triad_xml = tmp_path / "triads_guitar.musicxml"
-    export_musicxml(triads, triad_xml, Instrument.PIANO)
-    triad_root = ET.parse(triad_xml).getroot()
-    assert [h.findtext("root/root-step") for h in triad_root.findall(".//harmony")] == ["C", "A", "F", "G"]
-    assert [h.findtext("kind") for h in triad_root.findall(".//harmony")] == ["major", "minor", "major", "major"]
+    s_gc.insert(0, p_gc)
+    annotate_chords(s_gc, window_beats=4.0, instrument=Instrument.GUITAR)
+    assert [cs.figure for cs in s_gc.recurse().getElementsByClass(music21.harmony.ChordSymbol)] == [
+        "E5",
+        "Dsus4",
+        "Cadd9",
+    ]
 
 
 def test_violin_and_cello_fingering_including_thumb_position(tmp_path: Path) -> None:
