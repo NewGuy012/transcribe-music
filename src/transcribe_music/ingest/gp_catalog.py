@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import tarfile
 import urllib.error
@@ -13,8 +12,11 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from transcribe_music.ingest._io import (
+    atomic_write_bytes,
+    copy_file_safe,
     download_https_stream,
     http_get_json,
     is_zip_symlink,
@@ -23,9 +25,11 @@ from transcribe_music.ingest._io import (
     read_bounded_zip_member,
     resolve_catalog_dir,
     safe_resolve_member_path,
+    sanitize_relative_member,
     save_catalog_dir,
+    tokenize_ascii_query,
 )
-from transcribe_music.storage import open_sqlite
+from transcribe_music.storage import atomic_sqlite, count_sqlite_rows, open_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -70,18 +74,10 @@ def get_gp_catalog_status(cache_dir: Path = Path(".transcribe_cache")) -> GpCata
     """Inspect local Guitar Pro / DadaGP SQLite index and archive availability."""
     gp_dir = resolve_gp_catalog_dir(cache_dir)
     db_path = gp_dir / "gp_catalog.sqlite"
-    count = 0
-    if db_path.exists():
-        try:
-            with open_sqlite(db_path, read_only=True) as con:
-                row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
-                count = int(row[0]) if row else 0
-        except sqlite3.Error:
-            count = 0
     return GpCatalogStatus(
         gp_dir=gp_dir,
         db_exists=db_path.exists(),
-        score_count=count,
+        score_count=count_sqlite_rows(db_path, "gp_scores"),
         archive_available=_has_gp_sources(gp_dir),
     )
 
@@ -120,12 +116,11 @@ def _infer_entry_metadata(rel_path: str) -> tuple[str, str | None, str | None]:
     return title or p.stem, artist, genre
 
 
-def _is_safe_archive_member_name(name: str) -> str | None:
-    clean = name.removeprefix("./").replace("\\", "/")
-    parts = Path(clean).parts
-    if not clean or "\x00" in clean or Path(clean).is_absolute() or ".." in parts:
+def _safe_archive_member_name(name: str) -> str | None:
+    try:
+        return sanitize_relative_member(name.replace("\\", "/"))
+    except ValueError:
         return None
-    return clean
 
 
 def _make_gp_row(
@@ -141,9 +136,12 @@ def _make_gp_row(
 def _collect_gp_entries(target_dir: Path) -> list[tuple[str, str, str | None, str | None, str, str]]:
     """Scan local files, `.tar.gz`, and `.zip` archives inside `target_dir` for GP scores."""
     rows: list[tuple[str, str, str | None, str | None, str, str]] = []
+    base_resolved = target_dir.resolve()
 
     for path in sorted(target_dir.rglob("*")):
         if not path.is_file() or path.name.startswith("."):
+            continue
+        if path.is_symlink() and not path.resolve().is_relative_to(base_resolved):
             continue
         rel = path.relative_to(target_dir).as_posix()
         ext = path.suffix.lower()
@@ -157,8 +155,7 @@ def _collect_gp_entries(target_dir: Path) -> list[tuple[str, str, str | None, st
                     for member in tf.getmembers():
                         if not member.isfile():
                             continue
-                        clean_m = _is_safe_archive_member_name(member.name)
-                        if clean_m is None:
+                        if (clean_m := _safe_archive_member_name(member.name)) is None:
                             continue
                         m_ext = Path(clean_m).suffix.lower()
                         if m_ext in GP_CATALOG_EXTENSIONS:
@@ -171,8 +168,7 @@ def _collect_gp_entries(target_dir: Path) -> list[tuple[str, str, str | None, st
                     for info in zf.infolist():
                         if info.is_dir() or is_zip_symlink(info):
                             continue
-                        clean_m = _is_safe_archive_member_name(info.filename)
-                        if clean_m is None:
+                        if (clean_m := _safe_archive_member_name(info.filename)) is None:
                             continue
                         m_ext = Path(clean_m).suffix.lower()
                         if m_ext in GP_CATALOG_EXTENSIONS:
@@ -181,6 +177,11 @@ def _collect_gp_entries(target_dir: Path) -> list[tuple[str, str, str | None, st
                 logger.debug("Skipping unreadable zip archive %s: %s", path, exc)
 
     return rows
+
+
+def _is_zenodo_host(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "zenodo.org" or host.endswith(".zenodo.org")
 
 
 def _download_zenodo_record_archives(
@@ -218,7 +219,8 @@ def _download_zenodo_record_archives(
             continue
         _, clean_key, dest = safe_resolve_member_path(target_dir, key)
         if force or not dest.exists():
-            download_https_stream(dl_url, dest, headers=auth_headers)
+            dl_headers = auth_headers if _is_zenodo_host(dl_url) else None
+            download_https_stream(dl_url, dest, headers=dl_headers)
         downloaded += 1
         logger.debug("Synced Zenodo GP archive: %s", clean_key)
 
@@ -236,38 +238,26 @@ def build_gp_catalog_sqlite(gp_dir: Path, db_path: Path) -> int:
         raise FileNotFoundError(f"Guitar Pro catalog directory not found: {gp_dir}")
 
     entries = _collect_gp_entries(gp_dir)
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_db = db_path.with_suffix(".sqlite.tmp")
-    tmp_db.unlink(missing_ok=True)
-
-    try:
-        with open_sqlite(tmp_db) as con:
-            con.execute("PRAGMA journal_mode=OFF")
-            con.execute("PRAGMA synchronous=OFF")
-            con.execute(
-                """
-                CREATE TABLE gp_scores (
-                    member_ref TEXT PRIMARY KEY,
-                    format_ext TEXT NOT NULL,
-                    artist TEXT,
-                    genre TEXT,
-                    title TEXT NOT NULL,
-                    search_text TEXT NOT NULL
-                )
-                """
+    with atomic_sqlite(Path(db_path)) as con:
+        con.execute(
+            """
+            CREATE TABLE gp_scores (
+                member_ref TEXT PRIMARY KEY,
+                format_ext TEXT NOT NULL,
+                artist TEXT,
+                genre TEXT,
+                title TEXT NOT NULL,
+                search_text TEXT NOT NULL
             )
-            if entries:
-                con.executemany(
-                    "INSERT INTO gp_scores (member_ref, format_ext, artist, genre, title, search_text) VALUES (?, ?, ?, ?, ?, ?)",
-                    entries,
-                )
-            row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
-            count = int(row[0]) if row else 0
-        tmp_db.replace(db_path)
-    finally:
-        tmp_db.unlink(missing_ok=True)
-    return count
+            """
+        )
+        if entries:
+            con.executemany(
+                "INSERT OR REPLACE INTO gp_scores (member_ref, format_ext, artist, genre, title, search_text) VALUES (?, ?, ?, ?, ?, ?)",
+                entries,
+            )
+        row = con.execute("SELECT COUNT(*) FROM gp_scores").fetchone()
+        return int(row[0]) if row else 0
 
 
 def sync_gp_catalog(
@@ -310,7 +300,7 @@ def search_gp_catalog(
     if not db_path.exists():
         return []
 
-    tokens = [tok for tok in normalize_ascii(query).split() if tok]
+    tokens = tokenize_ascii_query(query)
     if not tokens:
         return []
 
@@ -357,25 +347,26 @@ def search_gp_catalog(
 
 def _decode_member_ref(member_ref: str) -> list[str]:
     if member_ref.startswith("["):
-        parsed = json.loads(member_ref)
-        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+        try:
+            parsed = json.loads(member_ref)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Malformed Guitar Pro member reference: {member_ref!r}") from exc
+        if isinstance(parsed, list) and parsed and all(isinstance(x, str) for x in parsed):
             return parsed
+        raise ValueError(f"Invalid Guitar Pro member reference: {member_ref!r}")
     return member_ref.split("::")
 
 
 def extract_gp_catalog_member(gp_dir: Path | str, member_ref: str, dest: Path) -> Path:
     """Safely extract a Guitar Pro / tab file from a catalog dir, `.tar.gz`, or `.zip`."""
     dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-
     parts = _decode_member_ref(member_ref)
     kind = parts[0]
     if kind == "file" and len(parts) == 2:
         _, _, src = safe_resolve_member_path(gp_dir, parts[1])
         if not src.exists():
             raise FileNotFoundError(f"Guitar Pro file not found in catalog: {src}")
-        shutil.copy2(src, dest)
-        return dest
+        return copy_file_safe(src, dest)
 
     if kind in {"tar", "zip"} and len(parts) == 3:
         _, clean_archive, archive_path = safe_resolve_member_path(gp_dir, parts[1])
@@ -390,7 +381,6 @@ def extract_gp_catalog_member(gp_dir: Path | str, member_ref: str, dest: Path) -
             data = read_bounded_zip_member(archive_path, lambda name: name in targets)
             if data is None:
                 raise FileNotFoundError(f"Member '{clean_member}' not found inside {archive_path}")
-        dest.write_bytes(data)
-        return dest
+        return atomic_write_bytes(dest, data)
 
     raise ValueError(f"Invalid Guitar Pro catalog member reference: {member_ref!r}")

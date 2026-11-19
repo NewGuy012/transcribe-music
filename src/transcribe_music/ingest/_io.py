@@ -1,9 +1,12 @@
-"""Shared hardened HTTP, bounded archive, path-safety, and catalog config helpers."""
+"""Shared hardened HTTP, bounded archive, path-safety, and atomic I/O helpers."""
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import re
+import shutil
 import stat
 import tarfile
 import tempfile
@@ -11,7 +14,8 @@ import unicodedata
 import urllib.error
 import urllib.request
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -21,16 +25,41 @@ MAX_MEMBER_BYTES = 50 * 1024 * 1024
 _MAX_REDIRECTS = 5
 
 
-def validate_https_url(url: str) -> str:
-    """Require an HTTPS URL with a network host before or after redirects."""
+def _host_port(url: str) -> tuple[str, int]:
     parsed = urlparse(url)
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
+    return (parsed.hostname or "").lower(), parsed.port or 443
+
+
+def validate_https_url(url: str) -> str:
+    """Require a public HTTPS URL without whitespace, credentials, or local/private hosts."""
+    if not url or any(ord(ch) < 32 or ch.isspace() for ch in url):
+        raise ValueError(f"Only clean HTTPS download URLs are permitted, got: {url!r}")
+    parsed = urlparse(url)
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid port in download URL: {url!r}") from exc
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         raise ValueError(f"Only HTTPS download URLs are permitted, got: {url!r}")
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        raise ValueError(f"Local download host is not permitted: {host!r}")
+    try:
+        if not ipaddress.ip_address(host).is_global:
+            raise ValueError(f"Non-public IP download host is not permitted: {host!r}")
+    except ValueError as exc:
+        if "not permitted" in str(exc):
+            raise
     return url
 
 
 class _SafeHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Validate HTTPS on every redirect hop and strip auth headers across hosts."""
+    """Validate HTTPS on every redirect hop and strip auth headers across origins."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -52,9 +81,7 @@ class _SafeHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is None:
             return None
-        old_host = urlparse(req.full_url).netloc.lower()
-        new_host = urlparse(new_req.full_url).netloc.lower()
-        if old_host != new_host:
+        if _host_port(req.full_url) != _host_port(new_req.full_url):
             for hdr_map in (new_req.headers, new_req.unredirected_hdrs):
                 for key in [k for k in hdr_map if k.lower() == "authorization"]:
                     del hdr_map[key]
@@ -125,6 +152,48 @@ def http_get_text(url: str, *, timeout: float = 12.0) -> str:
     return http_get_bytes(url, timeout=timeout).decode("utf-8", errors="replace")
 
 
+@contextmanager
+def atomic_write_path(dest: Path) -> Iterator[Path]:
+    """Yield a closed same-directory temp path and atomically replace `dest` on clean exit."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=dest.parent,
+        prefix=f".{dest.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as fh:
+        tmp_path = Path(fh.name)
+    try:
+        yield tmp_path
+        os.replace(tmp_path, dest)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def atomic_write_bytes(dest: Path, data: bytes) -> Path:
+    with atomic_write_path(dest) as tmp_path:
+        tmp_path.write_bytes(data)
+    return Path(dest)
+
+
+def atomic_write_text(dest: Path, content: str) -> None:
+    with atomic_write_path(dest) as tmp_path:
+        tmp_path.write_text(content, encoding="utf-8")
+
+
+def copy_file_safe(src: Path, dst: Path) -> Path:
+    """Copy a regular file to `dst`, skipping same-file overwrites."""
+    src = Path(src)
+    dst = Path(dst)
+    if not src.is_file():
+        raise FileNotFoundError(f"Source file not found: {src}")
+    if src.resolve() != dst.resolve():
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    return dst
+
+
 def download_https_stream(
     url: str,
     dest: Path,
@@ -136,19 +205,11 @@ def download_https_stream(
 ) -> Path:
     """Stream an HTTPS download atomically into `dest`, enforcing HTTPS redirects."""
     dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with open_https_response(url, headers=headers, timeout=timeout) as resp:
-            _check_content_length(getattr(resp, "headers", None), max_bytes)
-            with tempfile.NamedTemporaryFile(
-                dir=dest.parent,
-                prefix=f".{dest.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as fh:
-                tmp_path = Path(fh.name)
-                total = 0
+    with open_https_response(url, headers=headers, timeout=timeout) as resp:
+        _check_content_length(getattr(resp, "headers", None), max_bytes)
+        with atomic_write_path(dest) as tmp_path:
+            total = 0
+            with tmp_path.open("wb") as fh:
                 while chunk := resp.read(262_144):
                     total += len(chunk)
                     if max_bytes is not None and total > max_bytes:
@@ -158,33 +219,7 @@ def download_https_stream(
                     fh.write(chunk)
             if require_non_empty and total == 0:
                 raise RuntimeError(f"Downloaded file was empty: {url}")
-        os.replace(tmp_path, dest)
-        tmp_path = None
-        return dest
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-
-
-def atomic_write_text(dest: Path, content: str) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=dest.parent,
-            prefix=f".{dest.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
-            fh.write(content)
-        os.replace(tmp_path, dest)
-        tmp_path = None
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+    return dest
 
 
 def normalize_ascii(text: str) -> str:
@@ -192,6 +227,11 @@ def normalize_ascii(text: str) -> str:
     decomposed = unicodedata.normalize("NFKD", text)
     ascii_only = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
     return " ".join(ascii_only.lower().split())
+
+
+def tokenize_ascii_query(text: str) -> list[str]:
+    """Fold accents and split a search query into alphanumeric tokens."""
+    return re.sub(r"[^a-z0-9]+", " ", normalize_ascii(text)).split()
 
 
 def resolve_catalog_dir(cache_dir: Path, kind: str, config_key: str) -> Path:
@@ -213,19 +253,28 @@ def save_catalog_dir(cache_dir: Path, kind: str, config_key: str, target_dir: Pa
     atomic_write_text(cfg_path, json.dumps({config_key: str(target_dir.resolve())}))
 
 
-def safe_resolve_member_path(base_dir: Path | str, member_rel: str) -> tuple[Path, str, Path]:
-    """Validate `member_rel` stays strictly inside `base_dir` and return (base, clean_rel, target)."""
-    base_resolved = Path(base_dir).resolve()
-    clean_rel = member_rel.removeprefix("./")
+def sanitize_relative_member(member_rel: str) -> str:
+    """Validate and normalize a relative archive member path (rejecting traversal/absolutes)."""
+    clean_rel = member_rel
+    while clean_rel.startswith("./"):
+        clean_rel = clean_rel[2:]
     rel_parts = Path(clean_rel).parts
     if (
         not clean_rel
+        or clean_rel == "."
         or "\x00" in clean_rel
         or "\\" in clean_rel
         or Path(clean_rel).is_absolute()
         or ".." in rel_parts
     ):
         raise ValueError(f"Unsafe archive member path outside catalog directory: {member_rel!r}")
+    return clean_rel
+
+
+def safe_resolve_member_path(base_dir: Path | str, member_rel: str) -> tuple[Path, str, Path]:
+    """Validate `member_rel` stays strictly inside `base_dir` and return (base, clean_rel, target)."""
+    base_resolved = Path(base_dir).resolve()
+    clean_rel = sanitize_relative_member(member_rel)
     target = (base_resolved / clean_rel).resolve()
     if not target.is_relative_to(base_resolved) or target == base_resolved:
         raise ValueError(f"Unsafe archive member path outside catalog directory: {member_rel!r}")
@@ -260,6 +309,19 @@ def read_bounded_tar_member(
 
 def is_zip_symlink(info: zipfile.ZipInfo) -> bool:
     return stat.S_ISLNK(info.external_attr >> 16)
+
+
+def check_zip_safety(zip_path: Path, *, max_bytes: int = MAX_MEMBER_BYTES) -> None:
+    """Reject ZIP files containing symlink entries or uncompressed totals exceeding `max_bytes`."""
+    if not zipfile.is_zipfile(zip_path):
+        return
+    total = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            if is_zip_symlink(info):
+                raise ValueError(f"Archive entry '{info.filename}' is a symlink, not a regular file.")
+            if info.file_size > max_bytes or (total := total + info.file_size) > max_bytes:
+                raise ValueError(f"{zip_path.name} exceeds {max_bytes} byte uncompressed limit.")
 
 
 def read_bounded_zip_member(

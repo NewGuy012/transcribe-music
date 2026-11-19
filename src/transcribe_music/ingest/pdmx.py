@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import logging
-import shutil
 import sqlite3
 import tarfile
 from dataclasses import dataclass
@@ -12,15 +11,18 @@ from pathlib import Path
 from typing import Any
 
 from transcribe_music.ingest._io import (
+    atomic_write_bytes,
+    copy_file_safe,
     download_https_stream,
     normalize_ascii,
     read_bounded_tar_member,
     resolve_catalog_dir,
     safe_resolve_member_path,
     save_catalog_dir,
+    tokenize_ascii_query,
 )
 from transcribe_music.models import Instrument
-from transcribe_music.storage import open_sqlite
+from transcribe_music.storage import atomic_sqlite, count_sqlite_rows, open_sqlite
 
 logger = logging.getLogger(__name__)
 
@@ -56,19 +58,11 @@ def get_pdmx_status(cache_dir: Path = Path(".transcribe_cache")) -> PdmxStatus:
     pdmx_dir = resolve_pdmx_dir(cache_dir)
     csv_path = pdmx_dir / "PDMX.csv"
     db_path = pdmx_dir / "pdmx.sqlite"
-    count = 0
-    if db_path.exists():
-        try:
-            with open_sqlite(db_path, read_only=True) as con:
-                row = con.execute("SELECT COUNT(*) FROM pdmx_scores").fetchone()
-                count = int(row[0]) if row else 0
-        except sqlite3.Error:
-            count = 0
     return PdmxStatus(
         pdmx_dir=pdmx_dir,
         csv_exists=csv_path.exists(),
         db_exists=db_path.exists(),
-        score_count=count,
+        score_count=count_sqlite_rows(db_path, "pdmx_scores"),
         mxl_available=_pdmx_archive_available(pdmx_dir, "mxl"),
         mid_available=_pdmx_archive_available(pdmx_dir, "mid"),
     )
@@ -111,101 +105,91 @@ def build_pdmx_sqlite(
         raise FileNotFoundError(f"PDMX.csv not found at {csv_path}")
 
     db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_db = db_path.with_suffix(".sqlite.tmp")
-    tmp_db.unlink(missing_ok=True)
-
     count = 0
     csv.field_size_limit(max(csv.field_size_limit(), 1024 * 1024))
-    try:
-        with open_sqlite(tmp_db) as con:
-            con.execute("PRAGMA journal_mode=OFF")
-            con.execute("PRAGMA synchronous=OFF")
-            con.execute(
-                """
-                CREATE TABLE pdmx_scores (
-                    mxl_rel TEXT,
-                    mid_rel TEXT,
-                    title TEXT NOT NULL,
-                    composer TEXT,
-                    genres TEXT,
-                    tracks TEXT,
-                    tags TEXT,
-                    n_tracks INTEGER,
-                    rating REAL,
-                    n_ratings INTEGER,
-                    is_best_unique INTEGER NOT NULL,
-                    search_text TEXT NOT NULL
-                )
-                """
-            )
-            insert_sql = """
-                INSERT INTO pdmx_scores (
-                    mxl_rel, mid_rel, title, composer, genres, tracks, tags,
-                    n_tracks, rating, n_ratings, is_best_unique, search_text
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    with atomic_sqlite(db_path) as con:
+        con.execute(
             """
-            batch: list[tuple[Any, ...]] = []
-            with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
-                for row in csv.DictReader(fh):
-                    mxl_rel = _csv_str(row, "mxl")
-                    mid_rel = _csv_str(row, "mid")
-                    if mxl_rel is None and mid_rel is None:
-                        continue
-                    no_conflict = (_csv_str(row, "subset:no_license_conflict") or "").lower() in {
-                        "true",
-                        "1",
-                    }
-                    if not include_license_conflicts and not no_conflict:
-                        continue
+            CREATE TABLE pdmx_scores (
+                mxl_rel TEXT,
+                mid_rel TEXT,
+                title TEXT NOT NULL,
+                composer TEXT,
+                genres TEXT,
+                tracks TEXT,
+                tags TEXT,
+                n_tracks INTEGER,
+                rating REAL,
+                n_ratings INTEGER,
+                is_best_unique INTEGER NOT NULL,
+                search_text TEXT NOT NULL
+            )
+            """
+        )
+        insert_sql = """
+            INSERT INTO pdmx_scores (
+                mxl_rel, mid_rel, title, composer, genres, tracks, tags,
+                n_tracks, rating, n_ratings, is_best_unique, search_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        batch: list[tuple[Any, ...]] = []
+        with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+            for row in csv.DictReader(fh):
+                mxl_rel = _csv_str(row, "mxl")
+                mid_rel = _csv_str(row, "mid")
+                if mxl_rel is None and mid_rel is None:
+                    continue
+                no_conflict = (_csv_str(row, "subset:no_license_conflict") or "").lower() in {
+                    "true",
+                    "1",
+                }
+                if not include_license_conflicts and not no_conflict:
+                    continue
 
-                    title = _csv_str(row, "title") or _csv_str(row, "song_name") or "Untitled"
-                    composer = _csv_str(row, "composer_name") or _csv_str(row, "artist_name")
-                    genres = _csv_str(row, "genres")
-                    tracks = _csv_str(row, "tracks")
-                    tags = _csv_str(row, "tags")
-                    is_best = int(
-                        (_csv_str(row, "is_best_unique_arrangement") or "").lower() in {"true", "1"}
+                title = _csv_str(row, "title") or _csv_str(row, "song_name") or "Untitled"
+                composer = _csv_str(row, "composer_name") or _csv_str(row, "artist_name")
+                genres = _csv_str(row, "genres")
+                tracks = _csv_str(row, "tracks")
+                tags = _csv_str(row, "tags")
+                is_best = int(
+                    (_csv_str(row, "is_best_unique_arrangement") or "").lower() in {"true", "1"}
+                )
+                search_parts = [
+                    _csv_str(row, k)
+                    for k in (
+                        "title",
+                        "song_name",
+                        "composer_name",
+                        "artist_name",
+                        "genres",
+                        "tracks",
+                        "tags",
                     )
-                    search_parts = [
-                        _csv_str(row, k)
-                        for k in (
-                            "title",
-                            "song_name",
-                            "composer_name",
-                            "artist_name",
-                            "genres",
-                            "tracks",
-                            "tags",
-                        )
-                    ]
-                    search_text = normalize_ascii(" ".join(p for p in search_parts if p))
-                    batch.append(
-                        (
-                            mxl_rel,
-                            mid_rel,
-                            title,
-                            composer,
-                            genres,
-                            tracks,
-                            tags,
-                            _csv_int(row, "n_tracks"),
-                            _csv_float(row, "rating"),
-                            _csv_int(row, "n_ratings"),
-                            is_best,
-                            search_text,
-                        )
+                ]
+                search_text = normalize_ascii(" ".join(p for p in search_parts if p))
+                batch.append(
+                    (
+                        mxl_rel,
+                        mid_rel,
+                        title,
+                        composer,
+                        genres,
+                        tracks,
+                        tags,
+                        _csv_int(row, "n_tracks"),
+                        _csv_float(row, "rating"),
+                        _csv_int(row, "n_ratings"),
+                        is_best,
+                        search_text,
                     )
-                    if len(batch) >= 5000:
-                        con.executemany(insert_sql, batch)
-                        count += len(batch)
-                        batch.clear()
-                if batch:
+                )
+                if len(batch) >= 5000:
                     con.executemany(insert_sql, batch)
                     count += len(batch)
-        tmp_db.replace(db_path)
-    finally:
-        tmp_db.unlink(missing_ok=True)
+                    batch.clear()
+            if batch:
+                con.executemany(insert_sql, batch)
+                count += len(batch)
     return count
 
 
@@ -274,7 +258,7 @@ def search_pdmx_catalog(
     if not db_path.exists():
         return []
 
-    tokens = [tok for tok in normalize_ascii(query).split() if tok]
+    tokens = tokenize_ascii_query(query)
     if not tokens:
         return []
 
@@ -395,15 +379,14 @@ def search_pdmx_catalog(
 def extract_pdmx_member(pdmx_dir: Path | str, member_rel: str, dest: Path) -> Path:
     """Safely extract a single `.mxl` or `.mid` score from a PDMX dir or `.tar.gz` archive."""
     base_resolved, clean_rel, direct_file = safe_resolve_member_path(pdmx_dir, member_rel)
-
     dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
 
     if direct_file.exists():
-        shutil.copy2(direct_file, dest)
-        return dest
+        return copy_file_safe(direct_file, dest)
 
     top_folder = clean_rel.split("/", 1)[0]
+    if top_folder not in {"mxl", "mid"}:
+        raise ValueError(f"Unsupported PDMX archive folder for {clean_rel!r}: expected 'mxl' or 'mid'")
     tar_path = base_resolved / f"{top_folder}.tar.gz"
     if not tar_path.exists():
         flag = "--with-mxl" if top_folder == "mxl" else "--with-mid"
@@ -413,7 +396,5 @@ def extract_pdmx_member(pdmx_dir: Path | str, member_rel: str, dest: Path) -> Pa
         )
 
     data = read_bounded_tar_member(tar_path, clean_rel)
-    direct_file.parent.mkdir(parents=True, exist_ok=True)
-    direct_file.write_bytes(data)
-    dest.write_bytes(data)
-    return dest
+    atomic_write_bytes(direct_file, data)
+    return atomic_write_bytes(dest, data)

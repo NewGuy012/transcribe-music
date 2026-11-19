@@ -123,22 +123,28 @@ class CatalogStore:
         if not resolved_out.is_relative_to(artifacts_root) or not resolved_out.is_file():
             return None
 
-        return TranscriptionResult(
-            job_hash=row[0],
-            source_type=SourceType(row[1]),
-            source_ref=row[2],
-            instrument=Instrument(row[3]),
-            musicxml_path=musicxml_path,
-            cached=True,
-            elapsed_sec=float(row[9]),
-            measure_count=int(row[5]),
-            note_count=int(row[6]),
-            chord_count=int(row[7]),
-            fingering_count=int(row[8]),
-            backend=row[11],
-            selected_part=row[12],
-            warnings=json.loads(row[10]),
-        )
+        try:
+            warnings = json.loads(row[10])
+            if not isinstance(warnings, list):
+                return None
+            return TranscriptionResult(
+                job_hash=row[0],
+                source_type=SourceType(row[1]),
+                source_ref=row[2],
+                instrument=Instrument(row[3]),
+                musicxml_path=musicxml_path,
+                cached=True,
+                elapsed_sec=float(row[9]),
+                measure_count=int(row[5]),
+                note_count=int(row[6]),
+                chord_count=int(row[7]),
+                fingering_count=int(row[8]),
+                backend=row[11],
+                selected_part=row[12],
+                warnings=[str(w) for w in warnings],
+            )
+        except (ValueError, TypeError):
+            return None
 
     def record_job(
         self,
