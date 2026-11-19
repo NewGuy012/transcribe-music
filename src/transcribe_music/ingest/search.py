@@ -95,10 +95,10 @@ _WHEN_IN_ROME_TREE_URL = (
 _WHEN_IN_ROME_RAW_PREFIX = "https://raw.githubusercontent.com/MarkGotham/When-in-Rome/master/"
 
 _GP_CLASSICAL_GUITAR_TREE_URL = (
-    "https://api.github.com/repos/otnemrasordep/gp-classical-guitar/git/trees/main?recursive=1"
+    "https://api.github.com/repos/otnemrasordep/gp-classical-guitar/git/trees/master?recursive=1"
 )
 _GP_CLASSICAL_GUITAR_RAW_PREFIX = (
-    "https://raw.githubusercontent.com/otnemrasordep/gp-classical-guitar/main/"
+    "https://raw.githubusercontent.com/otnemrasordep/gp-classical-guitar/master/"
 )
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -306,6 +306,8 @@ def _fetch_gp_classical_guitar_index() -> list[dict[str, Any]]:
         if ext not in SUPPORTED_SEARCH_EXTENSIONS:
             return None
         parts = Path(rel_path).parts
+        if any(p.lower() == "dada" for p in parts[:-1]):
+            return None
         clean_dirs = [
             p.replace("_", " ").strip()
             for p in parts[:-1]

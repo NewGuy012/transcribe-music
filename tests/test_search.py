@@ -149,8 +149,11 @@ def test_offline_music21_corpus_and_github_tree_parsers(
             ]
             if "Hauptstimme" in url
             else (
-                [{"path": "Brouwer/Estudios_Sencillos/Estudio_01.gp5"}]
-                if "gp-classical-guitar" in url
+                [
+                    {"path": "Brouwer/Estudios_Sencillos/Estudio_01.gp5"},
+                    {"path": "Brouwer/dada/b1.gp5"},
+                ]
+                if "gp-classical-guitar/git/trees/master" in url
                 else [
                     {"path": "Corpus/Piano_Sonatas/Mozart,_Wolfgang_Amadeus/K331/01/score.mxl"},
                     {"path": "Corpus/Textbooks/Reger,_Max/ex01/score.mxl"},
@@ -164,7 +167,11 @@ def test_offline_music21_corpus_and_github_tree_parsers(
     wir = search_mod._fetch_when_in_rome_index()
     assert len(wir) == 1 and wir[0]["composer"] == "Wolfgang Amadeus Mozart"
     gp_cls = search_mod._fetch_gp_classical_guitar_index()
-    assert len(gp_cls) == 1 and gp_cls[0]["format_ext"] == ".gp5"
+    assert len(gp_cls) == 1
+    assert gp_cls[0]["format_ext"] == ".gp5"
+    assert gp_cls[0]["download_url"].startswith(
+        "https://raw.githubusercontent.com/otnemrasordep/gp-classical-guitar/master/"
+    )
 
 
 def test_cli_search_and_http_redirect_security_guards(
