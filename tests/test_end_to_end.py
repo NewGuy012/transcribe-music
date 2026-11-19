@@ -139,8 +139,10 @@ def test_end_to_end_guitar_staff_modes_and_cli(
     assert len(staff1_notes) == len(staff2_notes) == 4
     assert all(n.find("notations/technical/fingering") is not None for n in staff1_notes)
     assert all(n.find("notations/technical/string") is None for n in staff1_notes)
+    assert all(n.findtext("voice") == "1" for n in staff1_notes)
     assert all(n.find("notations/technical/string") is not None for n in staff2_notes)
     assert all(n.find("notations/technical/fingering") is None for n in staff2_notes)
+    assert all(n.findtext("voice") == "5" for n in staff2_notes)
 
     monkeypatch.setattr("transcribe_music.ingest.digital._find_musescore_executable", lambda: None)
     gp_path = write_gpif_file(tmp_path / "lead.gp")

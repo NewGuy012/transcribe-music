@@ -404,6 +404,37 @@ def _set_or_replace_staff(note_el: ET.Element, staff_num: int) -> None:
     _sort_children_by_order(note_el, _NOTE_TAG_ORDER)
 
 
+def _ensure_voice(note_el: ET.Element, voice_num: int) -> None:
+    voice_el = note_el.find("voice")
+    if voice_el is None:
+        voice_el = ET.Element("voice")
+        note_el.append(voice_el)
+    voice_el.text = str(voice_num)
+    _sort_children_by_order(note_el, _NOTE_TAG_ORDER)
+
+
+def _apply_multivoice_fingering_placement(root: ET.Element) -> bool:
+    """Set placement='above' on Voice 1 fingerings and 'below' on Voice 2+ on multi-voice Staff 1."""
+    changed = False
+    for measure in root.findall(".//measure"):
+        staff1_notes = [
+            n for n in measure.findall("note") if (n.findtext("staff") or "1") == "1"
+        ]
+        voices = {v for n in staff1_notes if (v := n.findtext("voice"))}
+        if len(voices) < 2:
+            continue
+        for note_el in staff1_notes:
+            v_num = try_int(note_el.findtext("voice"))
+            if v_num is None:
+                continue
+            placement = "above" if v_num == 1 else "below"
+            for fing_el in note_el.findall("./notations/technical/fingering"):
+                if fing_el.get("placement") != placement:
+                    fing_el.set("placement", placement)
+                    changed = True
+    return changed
+
+
 def _timeline_delta(child: ET.Element) -> int | None:
     if child.tag == "note":
         if child.find("grace") is not None or child.find("chord") is not None:
@@ -555,14 +586,16 @@ def _apply_guitar_staff_layout(
         for elem in timeline_elems:
             clone = copy.deepcopy(elem)
             if elem.tag == "note":
+                orig_voice = try_int(elem.findtext("voice"))
+                if orig_voice is None:
+                    orig_voice = 1
+                    _ensure_voice(elem, orig_voice)
                 _strip_technical_tags(elem, "string", "fret")
                 _set_or_replace_staff(elem, 1)
 
                 if had_8vb_transpose:
                     _shift_note_octave(clone, -1)
-                voice_el = clone.find("voice")
-                if voice_el is not None and (v_num := try_int(voice_el.text)) is not None:
-                    voice_el.text = str(v_num + voice_shift)
+                _ensure_voice(clone, orig_voice + voice_shift)
                 for drop_tag in ("stem", "beam", "accidental", "notehead", "lyric"):
                     for d_el in list(clone.findall(drop_tag)):
                         clone.remove(d_el)
@@ -656,6 +689,7 @@ def _postprocess_and_validate_xml(
     changed = _normalize_power_chord_harmonies(root) or changed
     if guitar_meta is not None:
         changed = _apply_guitar_staff_layout(root, guitar_staff, guitar_meta) or changed
+    changed = _apply_multivoice_fingering_placement(root) or changed
     if changed:
         ET.indent(tree, space="  ")
         tree.write(xml_path, encoding="utf-8", xml_declaration=True)

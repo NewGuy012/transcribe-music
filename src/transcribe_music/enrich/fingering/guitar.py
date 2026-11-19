@@ -255,4 +255,9 @@ def annotate_guitar_fingering(
 
     best_poses = solve_viterbi(states_per_step, _unary, _transition)
     apply_string_articulations(elements, best_poses, include_fret=True)
+    for el in elements:
+        if any(isinstance(a, music21.articulations.Harmonic) for a in el.articulations):
+            el.articulations = [
+                a for a in el.articulations if not isinstance(a, music21.articulations.Fingering)
+            ]
     return score

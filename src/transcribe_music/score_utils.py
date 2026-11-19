@@ -76,13 +76,14 @@ def build_fretted_element(
     duration: music21.duration.Duration,
 ) -> music21.note.Note | music21.chord.Chord:
     """Build a Note or Chord sorted ascending by MIDI pitch with aligned String/Fret tags."""
-    deduped: dict[int, tuple[int | None, int | None]] = {}
+    deduped: dict[tuple[int, int | None], tuple[int | None, int | None]] = {}
     for midi_val, s_num, fret in note_specs:
-        if midi_val not in deduped:
-            deduped[midi_val] = (s_num, fret)
-    ordered = sorted(deduped.items(), key=lambda item: item[0])
+        key = (midi_val, s_num)
+        if key not in deduped:
+            deduped[key] = (s_num, fret)
+    ordered = sorted(deduped.items(), key=lambda item: (item[0][0], -(item[0][1] or 0)))
 
-    pitches = [item[0] for item in ordered]
+    pitches = [item[0][0] for item in ordered]
     if len(pitches) == 1:
         el: music21.note.Note | music21.chord.Chord = music21.note.Note(
             pitches[0], duration=duration

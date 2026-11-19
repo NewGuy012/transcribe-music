@@ -14,7 +14,11 @@ from transcribe_music.enrich.chords import annotate_chords
 from transcribe_music.enrich.fingering import apply_fingering
 from transcribe_music.export.musicxml import export_musicxml
 from transcribe_music.models import GuitarStaffMode, Instrument
-from transcribe_music.score_utils import GuitarTrackMeta, set_guitar_track_meta
+from transcribe_music.score_utils import (
+    GuitarTrackMeta,
+    build_fretted_element,
+    set_guitar_track_meta,
+)
 
 
 def test_chord_recognition_viterbi_and_ensemble_reference(tmp_path: Path) -> None:
@@ -313,6 +317,72 @@ def test_guitar_fingering_tab_locked_tuning_and_chords(tmp_path: Path) -> None:
     )
     assert not mv_warnings
     assert len(ET.parse(mv_xml).findall(".//measure[@number='1']/forward")) == 1
+
+    # Unison double-stop on distinct strings + natural harmonic chord + multi-voice fingering placement
+    s_engr = music21.stream.Score()
+    p_engr = music21.stream.Part()
+    p_engr.insert(0, music21.clef.Treble8vbClef())
+    p_engr.atSoundingPitch = False
+    m_engr = music21.stream.Measure(number=1)
+    m_engr.insert(0.0, music21.meter.TimeSignature("4/4"))
+    ev1 = music21.stream.Voice(id="1")
+    unison_chord = build_fretted_element(
+        [(64 + 12, 1, 0), (64 + 12, 2, 5)], music21.duration.Duration(2.0)
+    )
+    harm_chord = build_fretted_element(
+        [(62 + 12, 4, 12), (67 + 12, 3, 12), (71 + 12, 2, 12)],
+        music21.duration.Duration(2.0),
+    )
+    harm_chord.articulations.append(music21.articulations.Harmonic())
+    ev1.insert(0.0, unison_chord)
+    ev1.insert(2.0, harm_chord)
+    ev2 = music21.stream.Voice(id="2")
+    ev2.insert(0.0, music21.note.Note("E3", quarterLength=4.0))
+    m_engr.insert(0.0, ev1)
+    m_engr.insert(0.0, ev2)
+    p_engr.append(m_engr)
+    s_engr.insert(0, p_engr)
+
+    apply_fingering(s_engr, Instrument.GUITAR, preserve_existing_tab=True)
+    engr_xml = tmp_path / "guitar_engraving.musicxml"
+    _, engr_warnings = export_musicxml(
+        s_engr, engr_xml, Instrument.GUITAR, guitar_staff=GuitarStaffMode.BOTH
+    )
+    assert not engr_warnings
+    engr_root = ET.parse(engr_xml).getroot()
+    s2_unison = [
+        (n.findtext("notations/technical/string"), n.findtext("notations/technical/fret"))
+        for n in engr_root.findall(".//measure[@number='1']/note")
+        if n.findtext("staff") == "2" and n.findtext("voice") == "5"
+    ][:2]
+    assert s2_unison == [("2", "5"), ("1", "0")]
+
+    s1_notes = [
+        n
+        for n in engr_root.findall(".//measure[@number='1']/note")
+        if n.findtext("staff") == "1"
+    ]
+    v1_fings = [
+        f.get("placement")
+        for n in s1_notes
+        if n.findtext("voice") == "1"
+        for f in n.findall("./notations/technical/fingering")
+    ]
+    v2_fings = [
+        f.get("placement")
+        for n in s1_notes
+        if n.findtext("voice") == "2"
+        for f in n.findall("./notations/technical/fingering")
+    ]
+    # Unison (2 notes) gets fingerings above; 3-note harmonic omits barre <fingering> clutter; voice 2 gets below
+    assert v1_fings == ["above", "above"]
+    assert v2_fings == ["below"]
+    s2_harm_frets = [
+        n.findtext("notations/technical/fret")
+        for n in engr_root.findall(".//measure[@number='1']/note")
+        if n.findtext("staff") == "2" and n.findtext("voice") == "5"
+    ][2:]
+    assert s2_harm_frets == ["12", "12", "12"]
 
 
 def test_violin_and_cello_fingering_including_thumb_position(tmp_path: Path) -> None:
