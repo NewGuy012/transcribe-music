@@ -4,42 +4,60 @@ from __future__ import annotations
 
 import struct
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import music21
 import pytest
 
 
-def note_tab_tags(el: music21.note.Note | music21.chord.Chord) -> tuple[list[int], list[int]]:
-    """Return (string_numbers, fret_numbers) attached to a Note or Chord."""
-    strings = [
-        int(a.number)
-        for a in el.articulations
-        if isinstance(a, music21.articulations.StringIndication) and a.number is not None
-    ]
-    frets = [
-        int(a.number)
-        for a in el.articulations
-        if isinstance(a, music21.articulations.FretIndication) and a.number is not None
-    ]
-    return strings, frets
+def make_part_score(
+    *elements: music21.base.Music21Object,
+    title: str | None = None,
+    clef: music21.clef.Clef | None = None,
+    time_sig: str | None = None,
+    key_fifths: int | None = None,
+    instrument: music21.instrument.Instrument | None = None,
+    measured: bool = False,
+) -> music21.stream.Score:
+    """Build a single-part Score from music21 elements with optional metadata/notation."""
+    score = music21.stream.Score()
+    if title is not None:
+        score.metadata = music21.metadata.Metadata(title=title)
+    part = music21.stream.Part()
+    if instrument is not None:
+        part.insert(0, instrument)
+    if clef is not None:
+        part.insert(0, clef)
+    if time_sig is not None:
+        part.insert(0, music21.meter.TimeSignature(time_sig))
+    if key_fifths is not None:
+        part.insert(0, music21.key.KeySignature(key_fifths))
+    for el in elements:
+        part.append(el)
+    if measured:
+        part.makeMeasures(inPlace=True)
+    score.insert(0, part)
+    return score
+
+
+def make_notes(pitches: Sequence[str], ql: float = 1.0) -> list[music21.note.Note]:
+    return [music21.note.Note(p, quarterLength=ql) for p in pitches]
 
 
 def make_simple_cello_score(title: str = "Cello Fixture") -> music21.stream.Score:
-    score = music21.stream.Score()
-    score.metadata = music21.metadata.Metadata(title=title)
-    part = music21.stream.Part(id="SoloCello")
-    part.partName = "Solo Violoncello"
-    part.insert(0, music21.instrument.Violoncello())
-    m = music21.stream.Measure(number=1)
-    m.insert(0, music21.clef.BassClef())
-    m.insert(0, music21.meter.TimeSignature("4/4"))
-    m.insert(0, music21.key.KeySignature(2))
-    for p in ("D3", "F#3", "A3", "D4"):
-        m.append(music21.note.Note(p, quarterLength=1.0))
-    part.append(m)
-    score.insert(0, part)
-    return score
+    s = make_part_score(
+        *make_notes(("D3", "F#3", "A3", "D4")),
+        title=title,
+        clef=music21.clef.BassClef(),
+        time_sig="4/4",
+        key_fifths=2,
+        instrument=music21.instrument.Violoncello(),
+        measured=True,
+    )
+    s.parts[0].id = "SoloCello"
+    s.parts[0].partName = "Solo Violoncello"
+    return s
 
 
 def make_concerto_score() -> music21.stream.Score:
@@ -179,6 +197,24 @@ def write_gp5_file(
     return path
 
 
+def _gpif_envelope(
+    *,
+    title: str,
+    artist: str,
+    tempo: int,
+    tracks_xml: str,
+    body_xml: str,
+    doctype: str = "",
+    encoding: str = "utf-8",
+) -> str:
+    return (
+        f'<?xml version="1.0" encoding="{encoding}"?>{doctype}<GPIF>'
+        f"<Score><Title>{title}</Title><Artist>{artist}</Artist></Score>"
+        f"<MasterTrack><Automations><Automation><Type>Tempo</Type><Value>{tempo} 2</Value></Automation></Automations></MasterTrack>"
+        f"<Tracks>{tracks_xml}</Tracks>{body_xml}</GPIF>"
+    )
+
+
 def write_gpif_file(
     path: Path,
     *,
@@ -187,20 +223,18 @@ def write_gpif_file(
     tuning_low_to_high: str = "38 45 50 55 59 64",
     capo: int = 2,
     doctype: str = "",
+    encoding: str = "utf-8",
 ) -> Path:
     """Create a synthetic Guitar Pro 7/8 `.gp` archive with `Content/score.gpif`."""
-    gpif_xml = (
-        f'<?xml version="1.0" encoding="utf-8"?>{doctype}<GPIF>'
-        f"<Score><Title>{title}</Title><Artist>{artist}</Artist></Score>"
-        "<MasterTrack><Automations><Automation><Type>Tempo</Type><Value>112 2</Value></Automation></Automations></MasterTrack>"
-        "<Tracks>"
+    tracks_xml = (
         '<Track id="0"><Name>Lead Guitar</Name>'
         "<GeneralMidi><Program>27</Program><PrimaryChannel>0</PrimaryChannel></GeneralMidi>"
         f'<Staves><Staff><Properties><Property name="Tuning"><Pitches>{tuning_low_to_high}</Pitches></Property>'
         f'<Property name="CapoFret"><Fret>{capo}</Fret></Property></Properties></Staff></Staves></Track>'
         '<Track id="1"><Name>Drumkit</Name><InstrumentSet><Type>drumKit</Type></InstrumentSet>'
         "<GeneralMidi><Program>0</Program><PrimaryChannel>9</PrimaryChannel></GeneralMidi></Track>"
-        "</Tracks>"
+    )
+    body_xml = (
         '<MasterBars><MasterBar><Time>4/4</Time><Key><AccidentalCount>1</AccidentalCount></Key>'
         '<Repeat start="true" end="true" count="2"/><Bars>0 1</Bars></MasterBar></MasterBars>'
         '<Bars><Bar id="0"><Voices>0 -1</Voices></Bar><Bar id="1"><Voices>1 -1</Voices></Bar></Bars>'
@@ -222,10 +256,19 @@ def write_gpif_file(
         "</Notes>"
         '<Rhythms><Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>'
         '<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>'
-        '<Rhythm id="2"><NoteValue>Whole</NoteValue></Rhythm></Rhythms></GPIF>'
+        '<Rhythm id="2"><NoteValue>Whole</NoteValue></Rhythm></Rhythms>'
     )
+    gpif_bytes = _gpif_envelope(
+        title=title,
+        artist=artist,
+        tempo=112,
+        tracks_xml=tracks_xml,
+        body_xml=body_xml,
+        doctype=doctype,
+        encoding=encoding,
+    ).encode(encoding)
     with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("Content/score.gpif", gpif_xml)
+        zf.writestr("Content/score.gpif", gpif_bytes)
     return path
 
 
@@ -287,16 +330,13 @@ def write_gpx_file(
     doctype: str = "",
 ) -> Path:
     """Create a synthetic Guitar Pro 6 `.gpx` (BCFZ/BCFS) file with GP6 `<Track><Properties>`."""
-    gpif_xml = (
-        f'<?xml version="1.0" encoding="utf-8"?>{doctype}<GPIF>'
-        f"<Score><Title>{title}</Title><Artist>{artist}</Artist></Score>"
-        "<MasterTrack><Automations><Automation><Type>Tempo</Type><Value>100 2</Value></Automation></Automations></MasterTrack>"
-        "<Tracks>"
+    tracks_xml = (
         '<Track id="0"><Name>Steel Guitar</Name>'
         "<GeneralMidi><Program>25</Program><PrimaryChannel>0</PrimaryChannel></GeneralMidi>"
         f'<Properties><Property name="Tuning"><Pitches>{tuning_low_to_high}</Pitches></Property>'
         f'<Property name="CapoFret"><Fret>{capo}</Fret></Property></Properties></Track>'
-        "</Tracks>"
+    )
+    body_xml = (
         '<MasterBars><MasterBar><Time>4/4</Time><Key><AccidentalCount>0</AccidentalCount></Key>'
         "<Bars>0</Bars></MasterBar></MasterBars>"
         '<Bars><Bar id="0"><Voices>0 -1 -1 -1</Voices></Bar></Bars>'
@@ -314,7 +354,10 @@ def write_gpx_file(
         '<Property name="HarmonicType"><HType>Natural</HType></Property></Properties></Note>'
         "</Notes>"
         '<Rhythms><Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>'
-        '<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm></Rhythms></GPIF>'
+        '<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm></Rhythms>'
+    )
+    gpif_xml = _gpif_envelope(
+        title=title, artist=artist, tempo=100, tracks_xml=tracks_xml, body_xml=body_xml, doctype=doctype
     ).encode()
 
     sector = 4096

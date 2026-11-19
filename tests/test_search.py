@@ -29,9 +29,22 @@ from transcribe_music import (
 )
 from transcribe_music.cli import main
 from transcribe_music.ingest import _io as io_mod
+from transcribe_music.ingest import gp_catalog as gp_mod
 from transcribe_music.ingest import search as search_mod
 from transcribe_music.ingest.gp_catalog import extract_gp_catalog_member
 from transcribe_music.ingest.pdmx import extract_pdmx_member
+
+
+def _rec(title: str, ext: str, source: str, composer: str, filename: str, url: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "title": title,
+        "composer": composer,
+        "format_ext": ext,
+        "source": source,
+        "filename": filename,
+        "download_url": url,
+        **extra,
+    }
 
 
 def _fake_opener(payload: bytes, url: str, headers: dict[str, str] | None = None) -> Callable[..., Any]:
@@ -72,40 +85,12 @@ def test_search_ranking_diacritics_resilience_and_format_filters(
         monkeypatch,
         lieder=_boom,
         when_in_rome=lambda: [
-            {
-                "title": "Der Erlkönig",
-                "composer": "Emilie Mayer",
-                "format_ext": ".mxl",
-                "source": "When-in-Rome",
-                "filename": "Der_Erlkonig.mxl",
-                "download_url": "https://example.com/erlkonig.mxl",
-            },
-            {
-                "title": "Moonlight Sonata 1st Movement",
-                "composer": "Beethoven",
-                "format_ext": ".mxl",
-                "source": "When-in-Rome",
-                "filename": "moonlight_1.mxl",
-                "download_url": "https://example.com/moonlight_1.mxl",
-            },
-            {
-                "title": "Moonlight Sonata 3rd Movement",
-                "composer": "Beethoven",
-                "format_ext": ".mxl",
-                "source": "When-in-Rome",
-                "filename": "moonlight_3.mxl",
-                "download_url": "https://example.com/moonlight_3.mxl",
-            },
+            _rec("Der Erlkönig", ".mxl", "When-in-Rome", "Emilie Mayer", "Der_Erlkonig.mxl", "https://example.com/erlkonig.mxl"),
+            _rec("Moonlight Sonata 1st Movement", ".mxl", "When-in-Rome", "Beethoven", "moonlight_1.mxl", "https://example.com/moonlight_1.mxl"),
+            _rec("Moonlight Sonata 3rd Movement", ".mxl", "When-in-Rome", "Beethoven", "moonlight_3.mxl", "https://example.com/moonlight_3.mxl"),
         ],
         orchestra=lambda: [
-            {
-                "title": "Moonlight Sonata",
-                "composer": "Beethoven",
-                "format_ext": ext,
-                "source": "OpenScore Orchestra",
-                "filename": f"moonlight{ext}",
-                "download_url": f"https://example.com/moonlight{ext}",
-            }
+            _rec("Moonlight Sonata", ext, "OpenScore Orchestra", "Beethoven", f"moonlight{ext}", f"https://example.com/moonlight{ext}")
             for ext in (".krn", ".mid", ".gp5", ".mscz", ".musicxml")
         ],
     )
@@ -128,6 +113,12 @@ def test_search_ranking_diacritics_resilience_and_format_filters(
 
     diacritics = search_digital_scores("Erlkonig", include_local=False, cache_dir=tmp_path / "cache")
     assert len(diacritics) == 1 and diacritics[0].title == "Der Erlkönig"
+
+    # Stale index cache survives transient network outage
+    monkeypatch.setattr(search_mod, "_fetch_when_in_rome_index", _boom)
+    assert search_mod._load_or_fetch_index(
+        tmp_path / "cache", "when_in_rome", _boom, allow_network=True, ttl_sec=-1
+    )
 
     # Alpha-digit boundary tokenization matches "etude 1" against "Etude1" while keeping catalog tokens
     assert search_mod._normalize_text("Villa-Lobos_Etude1") == "villa lobos etude 1"
@@ -194,14 +185,14 @@ def test_cli_search_and_http_redirect_security_guards(
     _stub_remote_sources(
         monkeypatch,
         when_in_rome=lambda: [
-            {
-                "title": "Moonlight Sonata 1st Movement",
-                "composer": "Ludwig van Beethoven",
-                "format_ext": ".mxl",
-                "source": "When-in-Rome",
-                "filename": "../../evil_path/moonlight.mxl",
-                "download_url": "https://example.com/moonlight.mxl",
-            }
+            _rec(
+                "Moonlight Sonata 1st Movement",
+                ".mxl",
+                "When-in-Rome",
+                "Ludwig van Beethoven",
+                "../../evil_path/moonlight.mxl",
+                "https://example.com/moonlight.mxl",
+            )
         ],
     )
     monkeypatch.setattr(
@@ -243,6 +234,18 @@ def test_cli_search_and_http_redirect_security_guards(
     )
     with pytest.raises(ValueError, match="Only HTTPS"):
         download_score_result(insecure, download_dir=tmp_path)
+
+    for bad_url in (
+        "http://example.com/score.mxl",
+        "https://user:pass@example.com/score.mxl",
+        "https://localhost/score.mxl",
+        "https://127.0.0.1/score.mxl",
+        "https://169.254.169.254/latest/meta-data",
+        "https://[::1]/score.mxl",
+        "https://example.com/score.mxl\n",
+    ):
+        with pytest.raises(ValueError, match="permitted|Only HTTPS"):
+            io_mod.validate_https_url(bad_url)
 
     valid = replace(insecure, download_url="https://example.com/score.mxl")
     monkeypatch.setattr(
@@ -373,25 +376,10 @@ def test_guitar_search_and_dadagp_sqlite_catalog(
     _stub_remote_sources(
         monkeypatch,
         quartets=lambda: [
-            {
-                "title": "Asturias Quartet Transcription",
-                "composer": "Isaac Albeniz",
-                "format_ext": ".mxl",
-                "source": "OpenScore StringQuartets",
-                "filename": "asturias_q.mxl",
-                "download_url": "https://example.com/asturias_q.mxl",
-            }
+            _rec("Asturias Quartet Transcription", ".mxl", "OpenScore StringQuartets", "Isaac Albeniz", "asturias_q.mxl", "https://example.com/asturias_q.mxl")
         ],
         gp_classical=lambda: [
-            {
-                "title": "Asturias (Leyenda)",
-                "composer": "Isaac Albeniz",
-                "format_ext": ".gp5",
-                "source": "GP Classical Guitar",
-                "filename": "asturias.gp5",
-                "edition_note": "Classical Guitar TAB",
-                "download_url": "https://example.com/asturias.gp5",
-            }
+            _rec("Asturias (Leyenda)", ".gp5", "GP Classical Guitar", "Isaac Albeniz", "asturias.gp5", "https://example.com/asturias.gp5", edition_note="Classical Guitar TAB")
         ],
     )
     gtr_hits = search_digital_scores(
@@ -405,13 +393,16 @@ def test_guitar_search_and_dadagp_sqlite_catalog(
     gp_dir = tmp_path / "gp_library"
     (gp_dir / "Rock" / "Metallica").mkdir(parents=True)
     (gp_dir / "Rock" / "Metallica" / "Nothing_Else_Matters.gp5").write_bytes(b"GP5RAW")
+    outside_gp = tmp_path / "secret.gp5"
+    outside_gp.write_bytes(b"SECRET")
+    (gp_dir / "Rock" / "escape.gp5").symlink_to(outside_gp)
 
     tar_buf = io.BytesIO()
     with tarfile.open(fileobj=tar_buf, mode="w:gz") as tf:
-        payload = b"TAR_GP4_BYTES"
-        ti = tarfile.TarInfo("DadaGP-v1.1/A/Albeniz/Capricho_Arabe.gp4")
-        ti.size = len(payload)
-        tf.addfile(ti, io.BytesIO(payload))
+        for payload in (b"OLD_BYTES", b"TAR_GP4_BYTES"):
+            ti = tarfile.TarInfo("DadaGP-v1.1/A/Albeniz/Capricho_Arabe.gp4")
+            ti.size = len(payload)
+            tf.addfile(ti, io.BytesIO(payload))
     (gp_dir / "bundle.tar.gz").write_bytes(tar_buf.getvalue())
 
     with zipfile.ZipFile(gp_dir / "pack.zip", "w") as zf:
@@ -426,7 +417,7 @@ def test_guitar_search_and_dadagp_sqlite_catalog(
     assert get_gp_catalog_status(cache_dir).score_count == 3
 
     for q, expected_ext, expected_bytes in (
-        ("Metallica Nothing Else", ".gp5", b"GP5RAW"),
+        ("Metallica Nothing-Else", ".gp5", b"GP5RAW"),
         ("Capricho Arabe", ".gp4", b"TAR_GP4_BYTES"),
         ("Bourree", ".tab", b"e|---0---|\n"),
     ):
@@ -441,6 +432,29 @@ def test_guitar_search_and_dadagp_sqlite_catalog(
         extract_gp_catalog_member(gp_dir, "file::../../etc/passwd", tmp_path / "x.gp5")
     with pytest.raises(ValueError, match="symlink"):
         extract_gp_catalog_member(gp_dir, "zip::pack.zip::Bach/evil_link.tab", tmp_path / "x.tab")
+
+    # Zenodo Bearer token is never sent to external mirror hosts
+    seen_auth: list[tuple[str, str | None]] = []
+    with monkeypatch.context() as mp:
+        mp.setattr(
+            gp_mod,
+            "http_get_json",
+            lambda url, **_kw: {
+                "files": [{"key": "tabs.zip", "links": {"self": "https://cdn.other.example/tabs.zip"}}]
+            },
+        )
+        mp.setattr(
+            gp_mod,
+            "download_https_stream",
+            lambda url, dest, *, headers=None, **_kw: (
+                seen_auth.append((url, (headers or {}).get("Authorization"))),
+                dest,
+            )[1],
+        )
+        gp_mod._download_zenodo_record_archives(
+            "12345", tmp_path / "z_dl", token="secret_tok", force=True
+        )
+    assert seen_auth == [("https://cdn.other.example/tabs.zip", None)]
 
     def _raise_403(*_a: object, **_kw: object) -> object:
         raise urllib.error.HTTPError("https://zenodo.org/api/records/4789123", 403, "Forbidden", {}, None)
@@ -457,15 +471,7 @@ def test_guitar_search_and_dadagp_sqlite_catalog(
     _stub_remote_sources(
         monkeypatch,
         gp_classical=lambda: [
-            {
-                "title": "Etude1",
-                "composer": "Heitor Villa-Lobos",
-                "format_ext": ".gp5",
-                "source": "GP Classical Guitar",
-                "filename": "Villa-Lobos_Etude1.gp5",
-                "edition_note": "Classical Guitar TAB",
-                "download_url": "https://example.com/Villa-Lobos_Etude1.gp5",
-            }
+            _rec("Etude1", ".gp5", "GP Classical Guitar", "Heitor Villa-Lobos", "Villa-Lobos_Etude1.gp5", "https://example.com/Villa-Lobos_Etude1.gp5", edition_note="Classical Guitar TAB")
         ],
     )
     monkeypatch.setattr(

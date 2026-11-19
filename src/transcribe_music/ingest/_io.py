@@ -311,17 +311,18 @@ def is_zip_symlink(info: zipfile.ZipInfo) -> bool:
     return stat.S_ISLNK(info.external_attr >> 16)
 
 
-def check_zip_safety(zip_path: Path, *, max_bytes: int = MAX_MEMBER_BYTES) -> None:
+def check_zip_safety(zip_path: Path, *, max_bytes: int | None = None) -> None:
     """Reject ZIP files containing symlink entries or uncompressed totals exceeding `max_bytes`."""
     if not zipfile.is_zipfile(zip_path):
         return
+    limit = MAX_MEMBER_BYTES if max_bytes is None else max_bytes
     total = 0
     with zipfile.ZipFile(zip_path, "r") as zf:
         for info in zf.infolist():
             if is_zip_symlink(info):
                 raise ValueError(f"Archive entry '{info.filename}' is a symlink, not a regular file.")
-            if info.file_size > max_bytes or (total := total + info.file_size) > max_bytes:
-                raise ValueError(f"{zip_path.name} exceeds {max_bytes} byte uncompressed limit.")
+            if info.file_size > limit or (total := total + info.file_size) > limit:
+                raise ValueError(f"{zip_path.name} exceeds {limit} byte uncompressed limit.")
 
 
 def read_bounded_zip_member(

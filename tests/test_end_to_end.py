@@ -10,6 +10,8 @@ import music21
 import pytest
 from conftest import (
     make_concerto_score,
+    make_notes,
+    make_part_score,
     write_ascii_tab_file,
     write_gp5_file,
     write_gpif_file,
@@ -55,14 +57,10 @@ def test_end_to_end_mxl_concerto_cache_and_pdf_fallback(
 
     def _fake_homr(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
         for idx, img in enumerate(Path(arg) for arg in cmd if arg.endswith(".png")):
-            s = music21.stream.Score()
-            p = music21.stream.Part()
-            p.insert(0, music21.clef.Treble8vbClef())
-            for pitch in ("C4", "E4", "G4", "C5") if idx == 0 else ("G3", "B3", "D4", "G4"):
-                p.append(music21.note.Note(pitch, quarterLength=1.0))
-            p.makeMeasures(inPlace=True)
-            s.insert(0, p)
-            s.write("musicxml", fp=str(img.with_suffix(".musicxml")))
+            pitches = ("C4", "E4", "G4", "C5") if idx == 0 else ("G3", "B3", "D4", "G4")
+            make_part_score(
+                *make_notes(pitches), clef=music21.clef.Treble8vbClef(), measured=True
+            ).write("musicxml", fp=str(img.with_suffix(".musicxml")))
         return SimpleNamespace(returncode=0, stderr="", stdout="")
 
     monkeypatch.setattr("transcribe_music.transcribe.omr_pdf._find_audiveris_executable", lambda: None)

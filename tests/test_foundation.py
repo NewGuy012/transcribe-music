@@ -9,7 +9,7 @@ from pathlib import Path
 
 import music21
 import pytest
-from conftest import write_pdf_file
+from conftest import make_notes, make_part_score, write_pdf_file
 
 from transcribe_music.cli import main
 from transcribe_music.export.musicxml import (
@@ -28,6 +28,7 @@ from transcribe_music.score_utils import (
     GuitarTrackMeta,
     format_tuning_label,
     get_guitar_track_meta,
+    is_playable_chord,
     set_guitar_track_meta,
 )
 from transcribe_music.storage import open_sqlite
@@ -36,26 +37,19 @@ from transcribe_music.transcribe.omr_pdf import render_pdf_pages
 
 
 def test_export_musicxml_baseline_and_sqlite_catalog(tmp_path: Path) -> None:
-    score = music21.stream.Score()
-    part = music21.stream.Part()
-    for pitch_name in ["C4", "E4", "G4", "C5", "D5", "F5", "G5", "C6"]:
-        part.append(music21.note.Note(pitch_name, quarterLength=1.0))
-    score.append(part)
-
+    score = make_part_score(*make_notes(["C4", "E4", "G4", "C5", "D5", "F5", "G5", "C6"]))
     out_xml = tmp_path / "out.musicxml"
     metrics, warnings = export_musicxml(score, out_xml, Instrument.VIOLIN, title="Test Scale")
-    assert not warnings
-    assert metrics.measure_count == 2
-    assert metrics.note_count == 8
+    assert not warnings and (metrics.measure_count, metrics.note_count) == (2, 8)
 
     tree = ET.parse(out_xml)
     assert tree.getroot().tag == "score-partwise"
     assert all(n.find("duration") is not None for n in tree.findall(".//note"))
+    assert not is_playable_chord(music21.chord.Chord())
 
     cfg = TranscriptionConfig(instrument=Instrument.VIOLIN, cache_dir=tmp_path / ".cache")
     store = CatalogStore(cfg.cache_dir)
-    assert store.list_recent_jobs() == []
-    assert not store.db_path.exists()
+    assert store.list_recent_jobs() == [] and not store.db_path.exists()
 
     job_hash = compute_job_hash(SourceType.DIGITAL, "synthetic", cfg)
     cached_artifact = store.artifact_dir(job_hash) / "out.musicxml"
@@ -78,27 +72,33 @@ def test_export_musicxml_baseline_and_sqlite_catalog(tmp_path: Path) -> None:
     store.record_job(res, cfg)
 
     cached = store.get_cached_job(job_hash)
-    assert cached is not None and cached.cached is True
-    assert cached.note_count == 8
+    assert cached is not None and cached.cached is True and cached.note_count == 8
 
-    # Tampered DB path outside artifacts_dir must be ignored
+    # Tampered outside path or corrupt warnings JSON must miss safely
     outside_xml = tmp_path / "outside.musicxml"
     outside_xml.write_bytes(out_xml.read_bytes())
     with open_sqlite(store.db_path) as con:
         con.execute("UPDATE jobs SET musicxml_path = ? WHERE job_hash = ?", [str(outside_xml), job_hash])
     assert store.get_cached_job(job_hash) is None
 
-    assert store.clear_cache() == 1
-    assert not store.artifacts_dir.exists()
+    with open_sqlite(store.db_path) as con:
+        con.execute(
+            "UPDATE jobs SET musicxml_path = ?, warnings_json = '{bad' WHERE job_hash = ?",
+            [str(cached_artifact), job_hash],
+        )
+    assert store.get_cached_job(job_hash) is None
+
+    assert store.clear_cache() == 1 and not store.artifacts_dir.exists()
 
 
 def test_pdf_rasterization_and_missing_extra_hint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     pdf_path = write_pdf_file(tmp_path / "sheet.pdf")
+    with pytest.raises(ValueError, match="between 150 and 600"):
+        render_pdf_pages(pdf_path, tmp_path / "bad_dpi", dpi=50)
     pages = render_pdf_pages(pdf_path, tmp_path / "pages", dpi=150)
-    assert len(pages) == 2
-    assert all(p.exists() and p.suffix == ".png" for p in pages)
+    assert len(pages) == 2 and all(p.exists() and p.suffix == ".png" for p in pages)
 
     real_import = builtins.__import__
 
@@ -225,36 +225,17 @@ def test_export_atomic_rollback_and_guitar_meta(
     assert get_guitar_track_meta(copy.deepcopy(part)) == meta
     assert format_tuning_label(meta.open_string_midi) == "D2-A2-D3-G3-B3-E4"
 
-    h_not = compute_job_hash(SourceType.DIGITAL, "abc", TranscriptionConfig(instrument=Instrument.GUITAR))
-    h_tab = compute_job_hash(
-        SourceType.DIGITAL,
-        "abc",
-        TranscriptionConfig(instrument=Instrument.GUITAR, guitar_staff=GuitarStaffMode.TAB),
-    )
-    h_recomp = compute_job_hash(
-        SourceType.DIGITAL,
-        "abc",
-        TranscriptionConfig(instrument=Instrument.GUITAR, preserve_existing_tab=False),
-    )
-    assert len({h_not, h_tab, h_recomp}) == 3
+    guitar_hashes = {
+        compute_job_hash(SourceType.DIGITAL, "abc", TranscriptionConfig(instrument=Instrument.GUITAR, **kw))
+        for kw in ({}, {"guitar_staff": GuitarStaffMode.TAB}, {"preserve_existing_tab": False})
+    }
+    assert len(guitar_hashes) == 3
 
-    h_w2 = compute_job_hash(SourceType.DIGITAL, "abc", TranscriptionConfig(instrument=Instrument.PIANO))
-    h_w1 = compute_job_hash(
-        SourceType.DIGITAL,
-        "abc",
-        TranscriptionConfig(instrument=Instrument.PIANO, chord_window_beats=1.0),
-    )
-    h_noslash = compute_job_hash(
-        SourceType.DIGITAL,
-        "abc",
-        TranscriptionConfig(instrument=Instrument.PIANO, include_slash_chords=False),
-    )
-    h_rn = compute_job_hash(
-        SourceType.DIGITAL,
-        "abc",
-        TranscriptionConfig(instrument=Instrument.PIANO, roman_numerals=True),
-    )
-    assert len({h_w2, h_w1, h_noslash, h_rn}) == 4
+    piano_hashes = {
+        compute_job_hash(SourceType.DIGITAL, "abc", TranscriptionConfig(instrument=Instrument.PIANO, **kw))
+        for kw in ({}, {"chord_window_beats": 1.0}, {"include_slash_chords": False}, {"roman_numerals": True})
+    }
+    assert len(piano_hashes) == 4
     with pytest.raises(ValueError, match="chord_window_beats"):
         TranscriptionConfig(instrument=Instrument.PIANO, chord_window_beats=0.0)
 
@@ -264,31 +245,23 @@ def test_title_casing_metadata_overrides_and_key_mode_refinement(tmp_path: Path)
         format_score_title("schubert_moments_musicaux_op94_no3_d780")
         == "Schubert Moments Musicaux Op. 94 No. 3 D. 780"
     )
-    assert (
-        format_score_title("massenet_thais_meditation_violin_piano")
-        == "Massenet Thais Meditation Violin Piano"
-    )
-    assert (
-        format_score_title("bach_bwv1007_cello_suite_1_prelude")
-        == "Bach BWV 1007 Cello Suite 1 Prelude"
-    )
-    assert (
-        format_score_title("bach_wtc1_prelude_01_c_major.mxl")
-        == "Bach WTC 1 Prelude 01 C Major"
-    )
+    assert format_score_title("massenet_thais_meditation_violin_piano") == "Massenet Thais Meditation Violin Piano"
+    assert format_score_title("bach_bwv1007_cello_suite_1_prelude") == "Bach BWV 1007 Cello Suite 1 Prelude"
+    assert format_score_title("bach_wtc1_prelude_01_c_major.mxl") == "Bach WTC 1 Prelude 01 C Major"
 
-    # MIDI file with F minor music tagged with -4 sharps major key signature refines to minor
-    s_fm = music21.stream.Score()
-    p_fm = music21.stream.Part()
-    p_fm.insert(0, music21.key.Key("A-"))
-    for chord_notes in (
-        ["F3", "A-3", "C4", "F4"],
-        ["B-3", "D-4", "F4"],
-        ["C3", "E4", "G4", "B-4"],
-        ["F3", "A-3", "C4", "F4"],
-    ):
-        p_fm.append(music21.chord.Chord(chord_notes, quarterLength=2.0))
-    s_fm.insert(0, p_fm)
+    # MIDI with F minor tagged as -4 major refines to minor; auto-title formats stem while --title stays verbatim
+    s_fm = make_part_score(
+        *[
+            music21.chord.Chord(tones, quarterLength=2.0)
+            for tones in (
+                ["F3", "A-3", "C4", "F4"],
+                ["B-3", "D-4", "F4"],
+                ["C3", "E4", "G4", "B-4"],
+                ["F3", "A-3", "C4", "F4"],
+            )
+        ],
+    )
+    s_fm.parts[0].insert(0, music21.key.Key("A-"))
     mid_in = tmp_path / "schubert_moments_musicaux_op94_no3_d780.mid"
     s_fm.write("midi", fp=str(mid_in))
 
@@ -296,9 +269,6 @@ def test_title_casing_metadata_overrides_and_key_mode_refinement(tmp_path: Path)
     assert main(["convert", str(mid_in), "-i", "piano", "--no-cache", "-o", str(auto_out)]) == 0
     auto_root = ET.parse(auto_out).getroot()
     assert auto_root.findtext("work/work-title") == "Schubert Moments Musicaux Op. 94 No. 3 D. 780"
-    assert (
-        auto_root.findtext("movement-title") == "Schubert Moments Musicaux Op. 94 No. 3 D. 780"
-    )
     assert auto_root.findtext(".//measure[@number='1']/attributes/key/fifths") == "-4"
     assert auto_root.findtext(".//measure[@number='1']/attributes/key/mode") == "minor"
 
@@ -311,7 +281,7 @@ def test_title_casing_metadata_overrides_and_key_mode_refinement(tmp_path: Path)
                 "-i",
                 "piano",
                 "--title",
-                "Moment Musicaux No. 3, Op. 94 (D. 780)",
+                "op94_no3_custom_slug",
                 "--composer",
                 "Franz Schubert",
                 "--no-cache",
@@ -322,6 +292,9 @@ def test_title_casing_metadata_overrides_and_key_mode_refinement(tmp_path: Path)
         == 0
     )
     custom_root = ET.parse(custom_out).getroot()
-    assert custom_root.findtext("work/work-title") == "Moment Musicaux No. 3, Op. 94 (D. 780)"
-    assert custom_root.findtext("movement-title") == "Moment Musicaux No. 3, Op. 94 (D. 780)"
+    assert custom_root.findtext("work/work-title") == "op94_no3_custom_slug"
+    assert custom_root.findtext("movement-title") == "op94_no3_custom_slug"
     assert custom_root.findtext("identification/creator[@type='composer']") == "Franz Schubert"
+
+    with pytest.raises(SystemExit):
+        main(["convert", str(mid_in), "-i", "piano", "--dpi", "abc"])

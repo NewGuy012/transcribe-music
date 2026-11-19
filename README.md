@@ -7,7 +7,7 @@ A fast, lean, local-first Python CLI and SDK that converts **digital symbolic mu
 - **Violin** (4-string Viterbi position solver)
 - **Cello** (Preserves Bass/Tenor/Treble clefs + 4-string closed/extended/thumb `T` solver)
 
-Powered by **`uv`**, **`music21`**, and the Python standard library (**`sqlite3`**, **`dataclasses`**, **`argparse`**, **`urllib`**), with optional extras for **`converter21`**, **`pymupdf`**, and **`pyguitarpro`**.
+Powered by **`uv`**, **`music21`**, and the Python standard library (**`sqlite3`**, **`dataclasses`**, **`argparse`**, **`urllib`**), with optional extras for **`pymupdf`** and **`pyguitarpro`**.
 
 ---
 
@@ -16,7 +16,7 @@ Powered by **`uv`**, **`music21`**, and the Python standard library (**`sqlite3`
 ### 1. Digital Symbolic Files (Primary — 99–100% Note Fidelity, < 0.5s)
 - **MusicXML**: `.musicxml`, `.xml`, `.mxl`
 - **MIDI**: `.mid`, `.midi` (quantized cleanly + auto-split Piano Grand Staff)
-- **Humdrum / MEI / ABC** (via optional `formats` extra: `converter21`): `.krn`, `.mei`, `.abc`
+- **Humdrum / MEI / ABC** (native `music21` parsers): `.krn`, `.mei`, `.abc`
 - **Guitar Pro**: `.gp3`, `.gp4`, `.gp5` (via optional `gp` extra: `pyguitarpro`); `.gp` GP7/8 and `.gpx` GP6 (native stdlib GPIF XML parser with MuseScore fallback)
 - **ASCII Guitar Tabs**: `.tab` (and `.txt` local conversion)
 - **MuseScore & Capella**: `.mscz`, `.mscx`, `.cap` (via MuseScore Studio CLI); `.capx` (native `music21` XML parser with MuseScore fallback)
@@ -36,11 +36,10 @@ Powered by **`uv`**, **`music21`**, and the Python standard library (**`sqlite3`
 Requires **uv** (Python `3.14` managed automatically via `.python-version`).
 
 ```bash
-# Core CLI + SDK (MusicXML, MIDI, native GP7/8 .gp, ASCII .tab, Capella .capx)
+# Core CLI + SDK (MusicXML, MIDI, Humdrum/MEI/ABC, native GP6/7/8 .gpx/.gp, ASCII .tab, Capella .capx)
 uv sync
 
-# Optional extras: Humdrum/MEI/ABC (converter21), PDF OMR (pymupdf), GP3-5 (pyguitarpro)
-uv sync --extra formats
+# Optional extras: PDF OMR (pymupdf), GP3-5 (pyguitarpro)
 uv sync --extra pdf
 uv sync --extra gp
 uv sync --all-extras
@@ -118,7 +117,7 @@ print(res.musicxml_path, res.selected_part, res.note_count, res.chord_count, res
 3. **Pure-Symbolic Enrichment**:
    - **Chords (`<harmony>`)**: Pure-Python symbolic pitch-class Viterbi HMM (zero `numpy` dependency).
    - **Fingerings (`<technical><fingering>`)**: Unified O(N) Viterbi solvers for Piano, Guitar (`<string>` + `<fret>`), Violin, and Cello (including thumb position `T`).
-4. **SQLite Catalog (`catalog.sqlite`)**: Content-addressed canonical job caching queryable via `transcribe-music cache list` (`--no-cache` bypasses the database).
+4. **SQLite Catalog & Security Guards (`catalog.sqlite`)**: Content-addressed canonical job caching queryable via `transcribe-music cache list` (`--no-cache` bypasses the database), alongside public-HTTPS-only SSRF/redirect checks, Expat DTD/entity rejection, bounded ZIP/tar extraction, and atomic SQLite/MusicXML writes.
 
 ## Development & Testing
 

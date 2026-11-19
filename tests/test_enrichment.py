@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import music21
-from conftest import make_progression_score, note_tab_tags
+from conftest import make_notes, make_part_score, make_progression_score
 
 from transcribe_music.cli import main
 from transcribe_music.enrich.chords import annotate_chords
@@ -17,6 +17,7 @@ from transcribe_music.models import GuitarStaffMode, Instrument
 from transcribe_music.score_utils import (
     GuitarTrackMeta,
     build_fretted_element,
+    extract_tab_tags,
     set_guitar_track_meta,
 )
 
@@ -60,130 +61,69 @@ def test_chord_recognition_viterbi_and_ensemble_reference(tmp_path: Path) -> Non
     assert [s.figure for s in custom.recurse().getElementsByClass(music21.harmony.ChordSymbol)] == ["Dmaj7"]
 
 
+def _cli_convert(in_path: Path, out_path: Path, *extra: str) -> ET.Element:
+    assert main(["convert", str(in_path), "-i", "piano", "--no-cache", "-o", str(out_path), *extra]) == 0
+    return ET.parse(out_path).getroot()
+
+
 def test_chords_key_enharmonics_slash_inversions_window_and_roman_numerals(tmp_path: Path) -> None:
-    # Flat key (-3 flats, C minor): Db chord spells D- (<root-step>D</root-step><root-alter>-1</root-alter>)
-    s_flat = music21.stream.Score()
-    p_flat = music21.stream.Part()
-    m1 = music21.stream.Measure(number=1)
-    m1.insert(0.0, music21.key.KeySignature(-3))
-    m1.insert(0.0, music21.chord.Chord(["C3", "E-3", "G3", "C4"], quarterLength=2.0))
-    m1.insert(2.0, music21.chord.Chord(["D-3", "F3", "A-3", "D-4"], quarterLength=2.0))
-    p_flat.append(m1)
-    s_flat.insert(0, p_flat)
+    s_flat = make_part_score(
+        music21.chord.Chord(["C3", "E-3", "G3", "C4"], quarterLength=2.0),
+        music21.chord.Chord(["D-3", "F3", "A-3", "D-4"], quarterLength=2.0),
+        key_fifths=-3,
+        measured=True,
+    )
     flat_in = tmp_path / "flat_in.musicxml"
     s_flat.write("musicxml", fp=str(flat_in))
 
-    flat_out = tmp_path / "flat_out.musicxml"
-    assert (
-        main(
-            [
-                "convert",
-                str(flat_in),
-                "-i",
-                "piano",
-                "--chord-window",
-                "2.0",
-                "--roman-numerals",
-                "--no-cache",
-                "-o",
-                str(flat_out),
-            ]
-        )
-        == 0
-    )
-    flat_root = ET.parse(flat_out).getroot()
-    harms_flat = [
-        (h.findtext("root/root-step"), h.findtext("root/root-alter"))
-        for h in flat_root.findall(".//harmony")
-    ]
-    assert harms_flat == [("C", None), ("D", "-1")]
-    words_flat = [w.text for w in flat_root.findall(".//direction/direction-type/words")]
-    assert len(words_flat) == 2
+    flat_root = _cli_convert(flat_in, tmp_path / "flat_out.musicxml", "--chord-window", "2.0", "--roman-numerals")
+    assert [
+        (h.findtext("root/root-step"), h.findtext("root/root-alter")) for h in flat_root.findall(".//harmony")
+    ] == [("C", None), ("D", "-1")]
+    assert len(flat_root.findall(".//direction/direction-type/words")) == 2
 
     # Sharp key (+4 sharps, E major) spells C# minor rather than Db
-    s_sharp = music21.stream.Score()
-    p_sharp = music21.stream.Part()
-    ms1 = music21.stream.Measure(number=1)
-    ms1.insert(0.0, music21.key.KeySignature(4))
-    ms1.insert(0.0, music21.chord.Chord(["C#3", "E3", "G#3", "C#4"], quarterLength=4.0))
-    p_sharp.append(ms1)
-    s_sharp.insert(0, p_sharp)
+    s_sharp = make_part_score(
+        music21.chord.Chord(["C#3", "E3", "G#3", "C#4"], quarterLength=4.0),
+        key_fifths=4,
+        measured=True,
+    )
     annotate_chords(s_sharp, window_beats=4.0)
-    assert [
-        cs.figure for cs in s_sharp.recurse().getElementsByClass(music21.harmony.ChordSymbol)
-    ] == ["C#m"]
+    assert [cs.figure for cs in s_sharp.recurse().getElementsByClass(music21.harmony.ChordSymbol)] == ["C#m"]
 
     # Slash-chord inversions: C -> Dm7/C -> G7/B -> C, plus --no-slash-chords omitting <bass>
-    s_inv = music21.stream.Score()
-    p_inv = music21.stream.Part()
-    for chord_tones in (
-        ["C3", "E4", "G4", "C5"],
-        ["C3", "D4", "F4", "A4"],
-        ["B2", "D4", "F4", "G4"],
-        ["C3", "E4", "G4", "C5"],
-    ):
-        p_inv.append(music21.chord.Chord(chord_tones, quarterLength=4.0))
-    p_inv.makeMeasures(inPlace=True)
-    s_inv.insert(0, p_inv)
+    s_inv = make_part_score(
+        *[
+            music21.chord.Chord(tones, quarterLength=4.0)
+            for tones in (
+                ["C3", "E4", "G4", "C5"],
+                ["C3", "D4", "F4", "A4"],
+                ["B2", "D4", "F4", "G4"],
+                ["C3", "E4", "G4", "C5"],
+            )
+        ],
+        measured=True,
+    )
     inv_in = tmp_path / "inv_in.musicxml"
     s_inv.write("musicxml", fp=str(inv_in))
 
-    inv_with_slash = tmp_path / "inv_slash.musicxml"
-    assert (
-        main(
-            [
-                "convert",
-                str(inv_in),
-                "-i",
-                "piano",
-                "--chord-window",
-                "4.0",
-                "--no-cache",
-                "-o",
-                str(inv_with_slash),
-            ]
-        )
-        == 0
-    )
-    inv_root = ET.parse(inv_with_slash).getroot()
+    inv_root = _cli_convert(inv_in, tmp_path / "inv_slash.musicxml", "--chord-window", "4.0")
     assert [
         (h.findtext("root/root-step"), h.findtext("kind"), h.findtext("bass/bass-step"))
         for h in inv_root.findall(".//harmony")
-    ] == [
-        ("C", "major", None),
-        ("D", "minor-seventh", "C"),
-        ("G", "dominant", "B"),
-        ("C", "major", None),
-    ]
+    ] == [("C", "major", None), ("D", "minor-seventh", "C"), ("G", "dominant", "B"), ("C", "major", None)]
 
-    inv_no_slash = tmp_path / "inv_noslash.musicxml"
-    assert (
-        main(
-            [
-                "convert",
-                str(inv_in),
-                "-i",
-                "piano",
-                "--chord-window",
-                "4.0",
-                "--no-slash-chords",
-                "--no-cache",
-                "-o",
-                str(inv_no_slash),
-            ]
-        )
-        == 0
+    inv_noslash_root = _cli_convert(
+        inv_in, tmp_path / "inv_noslash.musicxml", "--chord-window", "4.0", "--no-slash-chords"
     )
-    assert not ET.parse(inv_no_slash).findall(".//harmony/bass")
+    assert not inv_noslash_root.findall(".//harmony/bass")
 
     # Custom chord_window_beats (1.0 vs 4.0) produces finer vs coarser harmony timeline
-    s_beat = copy.deepcopy(s_flat)
+    s_beat, s_bar = copy.deepcopy(s_flat), copy.deepcopy(s_flat)
     annotate_chords(s_beat, window_beats=1.0)
-    cs_1 = list(s_beat.recurse().getElementsByClass(music21.harmony.ChordSymbol))
-    s_bar = copy.deepcopy(s_flat)
     annotate_chords(s_bar, window_beats=4.0)
-    cs_4 = list(s_bar.recurse().getElementsByClass(music21.harmony.ChordSymbol))
-    assert len(cs_1) == 2 and len(cs_4) == 1
+    assert len(list(s_beat.recurse().getElementsByClass(music21.harmony.ChordSymbol))) == 2
+    assert len(list(s_bar.recurse().getElementsByClass(music21.harmony.ChordSymbol))) == 1
 
 
 def test_piano_fingering_notes_and_chords(tmp_path: Path) -> None:
@@ -274,61 +214,50 @@ def test_guitar_fingering_tab_locked_tuning_and_chords(tmp_path: Path) -> None:
     assert len({n.findtext("notations/technical/string") for n in notes_xml[-3:]}) == 3
 
     # Sounding-pitch Part without clef must not shift down -12
-    raw_s = music21.stream.Score([music21.stream.Part([music21.note.Note("E2", quarterLength=4.0)])])
+    raw_s = make_part_score(music21.note.Note("E2", quarterLength=4.0))
     apply_fingering(raw_s, Instrument.GUITAR)
-    assert note_tab_tags(next(raw_s.recurse().notes)) == ([6], [0])
+    assert extract_tab_tags(next(raw_s.recurse().notes)) == ([6], [0])
 
-    s_pres = music21.stream.Score()
-    p_pres = music21.stream.Part()
     n_pres = music21.note.Note("E3", quarterLength=4.0)
     n_pres.articulations.append(music21.articulations.Fingering("4"))
-    p_pres.append(n_pres)
-    p_pres.makeMeasures(inPlace=True)
-    s_pres.insert(0, p_pres)
+    s_pres = make_part_score(n_pres, measured=True)
     apply_fingering(s_pres, Instrument.GUITAR, preserve_existing=True)
     assert [a.fingerNumber for a in next(s_pres.recurse().notes).articulations] == ["4"]
 
     # Locked TAB preserves authored positions while recompute moves to open/2nd fret
-    s_locked = music21.stream.Score()
-    p_locked = music21.stream.Part()
-    p_locked.insert(0, music21.clef.Treble8vbClef())
-    p_locked.atSoundingPitch = False
+    locked_notes = []
     for written_pitch, fret in (("A3", 5), ("B3", 7)):
         n = music21.note.Note(written_pitch, quarterLength=2.0)
-        n.articulations.append(music21.articulations.StringIndication(6))
-        n.articulations.append(music21.articulations.FretIndication(fret))
-        p_locked.append(n)
-    p_locked.makeMeasures(inPlace=True)
-    s_locked.insert(0, p_locked)
+        n.articulations.extend(
+            [music21.articulations.StringIndication(6), music21.articulations.FretIndication(fret)]
+        )
+        locked_notes.append(n)
+    s_locked = make_part_score(*locked_notes, clef=music21.clef.Treble8vbClef(), measured=True)
+    s_locked.parts[0].atSoundingPitch = False
 
     s_recomputed = copy.deepcopy(s_locked)
     apply_fingering(s_locked, Instrument.GUITAR, preserve_existing_tab=True)
-    assert [note_tab_tags(n) for n in s_locked.parts[0].recurse().notes] == [([6], [5]), ([6], [7])]
+    assert [extract_tab_tags(n) for n in s_locked.parts[0].recurse().notes] == [([6], [5]), ([6], [7])]
 
     apply_fingering(s_recomputed, Instrument.GUITAR, preserve_existing_tab=False)
-    assert [note_tab_tags(n)[0][0] for n in s_recomputed.parts[0].recurse().notes] == [5, 5]
+    assert [extract_tab_tags(n)[0][0] for n in s_recomputed.parts[0].recurse().notes] == [5, 5]
 
     # Drop-D + 24th fret E6 (= written E7)
-    s_drop = music21.stream.Score()
-    p_drop = music21.stream.Part()
-    p_drop.insert(0, music21.clef.Treble8vbClef())
-    p_drop.atSoundingPitch = False
-    set_guitar_track_meta(p_drop, GuitarTrackMeta(open_string_midi=(64, 59, 55, 50, 45, 38)))
-    p_drop.append(music21.note.Note("D3", quarterLength=2.0))
-    p_drop.append(music21.note.Note("E7", quarterLength=2.0))
-    p_drop.makeMeasures(inPlace=True)
-    s_drop.insert(0, p_drop)
+    s_drop = make_part_score(
+        *make_notes(("D3", "E7"), ql=2.0), clef=music21.clef.Treble8vbClef(), measured=True
+    )
+    s_drop.parts[0].atSoundingPitch = False
+    set_guitar_track_meta(s_drop.parts[0], GuitarTrackMeta(open_string_midi=(64, 59, 55, 50, 45, 38)))
     apply_fingering(s_drop, Instrument.GUITAR, preserve_existing_tab=False)
-    assert [note_tab_tags(n) for n in s_drop.parts[0].recurse().notes] == [([6], [0]), ([1], [24])]
+    assert [extract_tab_tags(n) for n in s_drop.parts[0].recurse().notes] == [([6], [0]), ([1], [24])]
 
     # Power/sus/add9 chords + standard triads
-    s_gc = music21.stream.Score()
-    p_gc = music21.stream.Part()
-    p_gc.append(music21.chord.Chord(["E2", "B2", "E3"], quarterLength=4.0))
-    p_gc.append(music21.chord.Chord(["D3", "A3", "D4", "G4"], quarterLength=4.0))
-    p_gc.append(music21.chord.Chord(["C3", "E3", "G3", "D4"], quarterLength=4.0))
-    p_gc.makeMeasures(inPlace=True)
-    s_gc.insert(0, p_gc)
+    s_gc = make_part_score(
+        music21.chord.Chord(["E2", "B2", "E3"], quarterLength=4.0),
+        music21.chord.Chord(["D3", "A3", "D4", "G4"], quarterLength=4.0),
+        music21.chord.Chord(["C3", "E3", "G3", "D4"], quarterLength=4.0),
+        measured=True,
+    )
     annotate_chords(s_gc, window_beats=4.0, instrument=Instrument.GUITAR)
     assert [cs.figure for cs in s_gc.recurse().getElementsByClass(music21.harmony.ChordSymbol)] == [
         "E5",
@@ -433,31 +362,23 @@ def test_guitar_fingering_tab_locked_tuning_and_chords(tmp_path: Path) -> None:
 
 
 def test_violin_and_cello_fingering_including_thumb_position(tmp_path: Path) -> None:
-    s_vln = music21.stream.Score()
-    p_vln = music21.stream.Part()
-    for pitch in ("G3", "A3", "B3", "C4", "D4", "E4"):
-        p_vln.append(music21.note.Note(pitch, quarterLength=1.0))
-    p_vln.append(music21.chord.Chord(["G3", "D4"], quarterLength=2.0))
-    p_vln.makeMeasures(inPlace=True)
-    s_vln.insert(0, p_vln)
-
+    s_vln = make_part_score(
+        *make_notes(("G3", "A3", "B3", "C4", "D4", "E4")),
+        music21.chord.Chord(["G3", "D4"], quarterLength=2.0),
+        measured=True,
+    )
     apply_fingering(s_vln, Instrument.VIOLIN)
     m_vln, w_vln = export_musicxml(s_vln, tmp_path / "violin.musicxml", Instrument.VIOLIN)
-    assert not w_vln
-    assert m_vln.fingering_count == 8
+    assert not w_vln and m_vln.fingering_count == 8
 
-    s_cel = music21.stream.Score()
-    p_cel = music21.stream.Part()
-    for pitch in ("C2", "D2", "E2", "F2", "D4", "E4", "F#4", "A4"):
-        p_cel.append(music21.note.Note(pitch, quarterLength=1.0))
-    p_cel.makeMeasures(inPlace=True)
-    s_cel.insert(0, p_cel)
-
+    s_cel = make_part_score(
+        *make_notes(("C2", "D2", "E2", "F2", "D4", "E4", "F#4", "A4")),
+        measured=True,
+    )
     apply_fingering(s_cel, Instrument.CELLO)
     cel_xml = tmp_path / "cello.musicxml"
     m_cel, w_cel = export_musicxml(s_cel, cel_xml, Instrument.CELLO)
-    assert not w_cel
-    assert m_cel.fingering_count == 8
+    assert not w_cel and m_cel.fingering_count == 8
     root_cel = ET.parse(cel_xml).getroot()
     assert all(f.text in {"0", "1", "2", "3", "4", "T"} for f in root_cel.findall(".//technical/fingering"))
     assert all(st.text in {"1", "2", "3", "4"} for st in root_cel.findall(".//technical/string"))
