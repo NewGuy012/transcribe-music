@@ -55,7 +55,7 @@ def _annotate_single_part(part: music21.stream.Part, side: str) -> None:
         if isinstance(el, music21.note.Note):
             ordered_indices.append([0])
             steps.append(_chord_poses((int(el.pitch.midi),), side))
-        elif isinstance(el, music21.chord.Chord):
+        else:
             pairs = sorted(enumerate(el.notes), key=lambda p: int(p[1].pitch.midi))
             ordered_indices.append([idx for idx, _ in pairs])
             steps.append(_chord_poses(tuple(int(n.pitch.midi) for _, n in pairs), side))
@@ -108,7 +108,7 @@ def _annotate_single_part(part: music21.stream.Part, side: str) -> None:
     for el, orig_order, pose in zip(elements, ordered_indices, best, strict=True):
         if isinstance(el, music21.note.Note):
             el.articulations.append(music21.articulations.Fingering(pose.fingers[0]))
-        elif isinstance(el, music21.chord.Chord):
+        else:
             by_orig = dict(zip(orig_order, pose.fingers, strict=True))
             for idx in range(len(el.notes)):
                 el.articulations.append(music21.articulations.Fingering(by_orig[idx]))

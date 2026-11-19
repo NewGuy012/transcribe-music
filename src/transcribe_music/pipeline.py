@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import shutil
 import tempfile
 import time
 from dataclasses import replace
@@ -18,6 +17,7 @@ from transcribe_music.export.musicxml import (
     format_score_title,
     looks_like_raw_filename,
 )
+from transcribe_music.ingest._io import copy_file_safe
 from transcribe_music.ingest.digital import load_digital_score
 from transcribe_music.models import (
     Instrument,
@@ -35,11 +35,8 @@ def _default_output_path(default_stem: str, instrument: Instrument, artifact_dir
     return artifact_dir / f"{safe_stem}_{instrument.value}.musicxml"
 
 
-def _copy_if_needed(src: Path, dst: Path) -> Path:
-    if src.resolve() != dst.resolve():
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-    return dst
+def _opening_container(part: music21.stream.Part) -> music21.stream.Stream:
+    return part.getElementsByClass(music21.stream.Measure).first() or part
 
 
 def _refine_initial_key_mode(
@@ -53,35 +50,32 @@ def _refine_initial_key_mode(
     if not parts:
         return
 
-    first_ks: music21.key.KeySignature | None = None
-    for part in parts:
-        first_m = part.getElementsByClass(music21.stream.Measure).first()
-        container = first_m if first_m is not None else part
-        ks = container.getElementsByClass(music21.key.KeySignature).first()
-        if ks is not None:
-            first_ks = ks
-            break
-    if first_ks is None:
-        return
-    if isinstance(first_ks, music21.key.Key) and not is_midi:
+    first_ks = next(
+        (
+            ks
+            for part in parts
+            if (ks := _opening_container(part).getElementsByClass(music21.key.KeySignature).first())
+            is not None
+        ),
+        None,
+    )
+    if first_ks is None or (isinstance(first_ks, music21.key.Key) and not is_midi):
         return
 
     try:
         analyzed = reference_score.analyze("key")
     except Exception:  # noqa: BLE001 — non-fatal heuristic
         return
-    if not isinstance(analyzed, music21.key.Key):
-        return
-    if analyzed.sharps != first_ks.sharps:
-        return
-    if float(getattr(analyzed, "correlationCoefficient", 0.0) or 0.0) < 0.70:
-        return
-    if isinstance(first_ks, music21.key.Key) and first_ks.mode == analyzed.mode:
+    if (
+        not isinstance(analyzed, music21.key.Key)
+        or analyzed.sharps != first_ks.sharps
+        or float(getattr(analyzed, "correlationCoefficient", 0.0) or 0.0) < 0.70
+        or (isinstance(first_ks, music21.key.Key) and first_ks.mode == analyzed.mode)
+    ):
         return
 
     for part in parts:
-        first_m = part.getElementsByClass(music21.stream.Measure).first()
-        container = first_m if first_m is not None else part
+        container = _opening_container(part)
         for ks in list(container.getElementsByClass(music21.key.KeySignature)):
             if ks.sharps == analyzed.sharps:
                 off = ks.offset
@@ -220,42 +214,36 @@ def convert_music(
 
     job_hash = compute_job_hash(source_type, hash_file(path), cfg)
 
-    if cfg.use_cache:
-        store = CatalogStore(cfg.cache_dir)
-        artifact_dir = store.artifact_dir(job_hash)
-        canonical_out = _default_output_path(path.stem, inst, artifact_dir)
-        final_out = Path(output_path) if output_path is not None else canonical_out
-
-        cached = store.get_cached_job(job_hash)
-        if cached is not None:
-            _copy_if_needed(cached.musicxml_path, final_out)
-            return replace(
-                cached,
-                musicxml_path=final_out,
-                elapsed_sec=round(time.perf_counter() - t_start, 3),
-            )
-
-        result = _produce_enrich_and_export(
-            path, source_type, job_hash, cfg, artifact_dir, canonical_out, store, t_start
+    store = CatalogStore(cfg.cache_dir) if cfg.use_cache else None
+    if store is not None and (cached := store.get_cached_job(job_hash)) is not None:
+        final_out = (
+            Path(output_path)
+            if output_path is not None
+            else _default_output_path(path.stem, inst, store.artifact_dir(job_hash))
         )
-        _copy_if_needed(canonical_out, final_out)
-        return replace(result, musicxml_path=final_out)
+        copy_file_safe(cached.musicxml_path, final_out)
+        return replace(
+            cached,
+            musicxml_path=final_out,
+            elapsed_sec=round(time.perf_counter() - t_start, 3),
+        )
 
-    if output_path is not None:
+    if store is None and output_path is not None:
         with tempfile.TemporaryDirectory(prefix="tm_work_") as tmp_dir:
             return _produce_enrich_and_export(
                 path, source_type, job_hash, cfg, Path(tmp_dir), Path(output_path), None, t_start
             )
 
-    artifact_dir = cfg.cache_dir / "artifacts" / job_hash
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    return _produce_enrich_and_export(
-        path,
-        source_type,
-        job_hash,
-        cfg,
-        artifact_dir,
-        _default_output_path(path.stem, inst, artifact_dir),
-        None,
-        t_start,
+    artifact_dir = (
+        store.artifact_dir(job_hash)
+        if store is not None
+        else (cfg.cache_dir / "artifacts" / job_hash)
     )
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    canonical_out = _default_output_path(path.stem, inst, artifact_dir)
+    result = _produce_enrich_and_export(
+        path, source_type, job_hash, cfg, artifact_dir, canonical_out, store, t_start
+    )
+    final_out = Path(output_path) if output_path is not None else canonical_out
+    copy_file_safe(canonical_out, final_out)
+    return replace(result, musicxml_path=final_out)

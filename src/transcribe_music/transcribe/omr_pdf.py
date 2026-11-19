@@ -20,6 +20,8 @@ def render_pdf_pages(
     dpi: int = 300,
 ) -> list[Path]:
     """Render every page of a sheet music PDF into opaque RGB PNGs for OMR."""
+    if not (150 <= dpi <= 600):
+        raise ValueError(f"dpi must be between 150 and 600, got {dpi}")
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
@@ -121,7 +123,14 @@ def _build_homr_command(image_paths: list[Path]) -> list[str]:
     if homr_bin := shutil.which("homr"):
         return [homr_bin, *resolved]
 
-    uvx_bin = find_executable(("uvx",), (Path("/opt/homebrew/bin/uvx"),))
+    uvx_bin = find_executable(
+        ("uvx",),
+        (
+            Path.home() / ".local" / "bin" / "uvx",
+            Path("/opt/homebrew/bin/uvx"),
+            Path("/usr/local/bin/uvx"),
+        ),
+    )
     if uvx_bin is None:
         raise RuntimeError(
             "PDF OMR fallback requires 'homr' or 'uvx' to run homr[cpu] in an isolated environment."
@@ -189,8 +198,8 @@ def stitch_musicxml_pages(
     next_measure_num = 1
 
     for page_idx, xml_path in enumerate(page_xml_paths):
-        parsed = music21.converter.parse(str(xml_path))
-        page_parts = list(parsed.parts) if isinstance(parsed, music21.stream.Score) else [parsed]
+        parsed, _ = coerce_to_score(music21.converter.parse(str(xml_path)))
+        page_parts = list(parsed.parts)
 
         while len(merged_parts) < len(page_parts):
             merged_parts.append(music21.stream.Part(id=f"P{len(merged_parts) + 1}"))

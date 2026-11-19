@@ -56,7 +56,7 @@ def compute_job_hash(
 ) -> str:
     """Compute a deterministic cache key for a score conversion/OMR job."""
     payload = {
-        "pipeline_version": "v7",
+        "pipeline_version": "v8",
         "source_type": source_type.value,
         "source_identity": source_identity,
         "instrument": config.instrument.value,

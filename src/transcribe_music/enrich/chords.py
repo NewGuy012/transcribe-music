@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 from bisect import bisect_right
 from dataclasses import dataclass
+from operator import itemgetter
 
 import music21
 
 from transcribe_music.models import Instrument
-from transcribe_music.score_utils import is_playable_chord, iter_playable_notes
+from transcribe_music.score_utils import element_midis, is_playable_note, iter_playable_notes
 
 _SHARP_ROOT_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 _FLAT_ROOT_NAMES = ("C", "D-", "D", "E-", "E", "F", "G-", "G", "A-", "A", "B-", "B")
@@ -126,7 +127,7 @@ def _sharps_at_offset(
 ) -> int:
     if not sig_timeline:
         return fallback_sharps
-    idx = bisect_right([item[0] for item in sig_timeline], beat_offset + 1e-6) - 1
+    idx = bisect_right(sig_timeline, beat_offset + 1e-6, key=itemgetter(0)) - 1
     return sig_timeline[max(0, idx)][1]
 
 
@@ -151,7 +152,7 @@ def _compute_symbolic_chroma_by_window(
         onset = float(el.offset)
         dur = max(0.125, float(el.duration.quarterLength))
         end = onset + dur
-        pitches = [el.pitch] if isinstance(el, music21.note.Note) else list(el.pitches)
+        midis = element_midis(el)
 
         w_start = max(0, int(onset // window_beats))
         w_end = min(n_windows - 1, int(max(onset, end - 1e-6) // window_beats))
@@ -160,8 +161,7 @@ def _compute_symbolic_chroma_by_window(
             if overlap <= 0:
                 continue
             row = raw_chroma[w]
-            for p in pitches:
-                midi_val = int(p.midi)
+            for midi_val in midis:
                 bass_weight = _BASS_REGISTER_WEIGHT if midi_val < _BASS_REGISTER_CUTOFF_MIDI else 1.0
                 row[midi_val % 12] += overlap * bass_weight
                 cur_low = lowest_midi[w]
@@ -321,10 +321,7 @@ def annotate_chords(
     decoded = _viterbi_chords(chroma, bass_pcs=bass_pcs, templates=templates)
     measures = list(target_part.getElementsByClass(music21.stream.Measure))
     measure_has_notes = {
-        id(m): any(
-            isinstance(el, music21.note.Note) or is_playable_chord(el)
-            for el in m.recurse().notes
-        )
+        id(m): any(is_playable_note(el) for el in m.recurse().notes)
         for m in measures
     }
 
@@ -364,6 +361,9 @@ def annotate_chords(
             except (music21.exceptions21.Music21Exception, ValueError, TypeError):
                 rn_expr = None
 
+        target: music21.stream.Stream = target_part
+        insert_off = beat_offset
+        should_insert = True
         if measures:
             while (
                 m_idx < n_measures
@@ -373,25 +373,17 @@ def annotate_chords(
                 m_idx += 1
             if m_idx < n_measures and float(measures[m_idx].offset) - 1e-6 <= beat_offset:
                 m = measures[m_idx]
+                target = m
                 if not measure_has_notes[id(m)]:
-                    if id(m) not in placed_rest_measures:
-                        m.insert(0.0, cs)
-                        if rn_expr is not None:
-                            m.insert(0.0, rn_expr)
-                        placed_rest_measures.add(id(m))
+                    should_insert = id(m) not in placed_rest_measures
+                    placed_rest_measures.add(id(m))
+                    insert_off = 0.0
                 else:
-                    local_off = max(0.0, beat_offset - float(m.offset))
-                    m.insert(local_off, cs)
-                    if rn_expr is not None:
-                        m.insert(local_off, rn_expr)
-            else:
-                target_part.insert(beat_offset, cs)
-                if rn_expr is not None:
-                    target_part.insert(beat_offset, rn_expr)
-        else:
-            target_part.insert(beat_offset, cs)
+                    insert_off = max(0.0, beat_offset - float(m.offset))
+        if should_insert:
+            target.insert(insert_off, cs)
             if rn_expr is not None:
-                target_part.insert(beat_offset, rn_expr)
+                target.insert(insert_off, rn_expr)
         last_symbol = label
 
     return score

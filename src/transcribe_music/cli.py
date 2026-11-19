@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
 
-from transcribe_music.ingest.digital import inspect_digital_score
+from transcribe_music.ingest.digital import GUITAR_TAB_EXTENSIONS, inspect_digital_score
 from transcribe_music.ingest.gp_catalog import (
     GpCatalogStatus,
     get_gp_catalog_status,
@@ -134,7 +134,10 @@ def _existing_file(raw: str) -> Path:
 
 def _bounded_int(lo: int, hi: int | None = None):
     def _parse(raw: str) -> int:
-        val = int(raw)
+        try:
+            val = int(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"expected integer, got {raw!r}") from exc
         if val < lo or (hi is not None and val > hi):
             bound = f"[{lo}..{hi}]" if hi is not None else f">= {lo}"
             raise argparse.ArgumentTypeError(f"expected integer {bound}, got {val}")
@@ -163,6 +166,15 @@ def _add_cache_dir_arg(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path(".transcribe_cache"),
         help="Cache directory.",
+    )
+
+
+def _add_guitar_staff_arg(parser: argparse.ArgumentParser, help_text: str) -> None:
+    parser.add_argument(
+        "--guitar-staff",
+        choices=_enum_choices(GuitarStaffMode),
+        default=GuitarStaffMode.NOTATION.value,
+        help=help_text,
     )
 
 
@@ -275,11 +287,7 @@ def _cmd_search(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         res = convert_music(input_path=saved_path, instrument=inst, config=cfg)
         _print_result(res)
     else:
-        suggested = (
-            "guitar"
-            if chosen.format_ext in {".gp", ".gpx", ".gp5", ".gp4", ".gp3", ".tab"}
-            else "piano"
-        )
+        suggested = "guitar" if chosen.format_ext in GUITAR_TAB_EXTENSIONS else "piano"
         print(f'Next: transcribe-music convert "{saved_path}" --instrument {suggested}')
     return 0
 
@@ -407,12 +415,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Recompute guitar TAB placements via Viterbi solver.",
     )
-    p_conv.set_defaults(preserve_tab=True)
-    p_conv.add_argument(
-        "--guitar-staff",
-        choices=_enum_choices(GuitarStaffMode),
-        default=GuitarStaffMode.NOTATION.value,
-        help="Guitar MusicXML staff layout: notation (Treble 8vb), tab (6-line TAB), or both.",
+    p_conv.set_defaults(preserve_tab=True, handler=lambda a, _p=parser: _cmd_convert(a))
+    _add_guitar_staff_arg(
+        p_conv,
+        "Guitar MusicXML staff layout: notation (Treble 8vb), tab (6-line TAB), or both.",
     )
     p_conv.add_argument(
         "--cache",
@@ -424,6 +430,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_insp = sub.add_parser("inspect", help="List parts, instruments, clefs, and note counts.")
     p_insp.add_argument("score_file", type=_existing_file, help="Digital score file to inspect.")
+    p_insp.set_defaults(handler=lambda a, _p=parser: _cmd_inspect(a))
 
     p_search = sub.add_parser(
         "search", help="Search symbolic score catalogs and download a pick."
@@ -452,11 +459,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Prioritize matching scores and convert download immediately.",
     )
-    p_search.add_argument(
-        "--guitar-staff",
-        choices=_enum_choices(GuitarStaffMode),
-        default=GuitarStaffMode.NOTATION.value,
-        help="Guitar MusicXML staff layout when converting with -i guitar (default: notation).",
+    _add_guitar_staff_arg(
+        p_search,
+        "Guitar MusicXML staff layout when converting with -i guitar (default: notation).",
     )
     p_search.add_argument(
         "--include-unsynced",
@@ -468,19 +473,25 @@ def _build_parser() -> argparse.ArgumentParser:
         "--offline", action="store_true", help="Search local corpora/indexes without network calls."
     )
     _add_cache_dir_arg(p_search)
+    p_search.set_defaults(handler=_cmd_search)
 
     p_cache = sub.add_parser("cache", help="Inspect or manage the SQLite conversion cache.")
+    p_cache.set_defaults(handler=lambda _a, _p=parser: (p_cache.print_help(), 0)[1])
     cache_sub = p_cache.add_subparsers(dest="subcommand")
     p_clist = cache_sub.add_parser("list", help="List cached MusicXML jobs stored in SQLite.")
     p_clist.add_argument("--limit", "-n", type=_bounded_int(1), default=20, help="Max jobs to show.")
     _add_cache_dir_arg(p_clist)
+    p_clist.set_defaults(handler=lambda a, _p=parser: _cmd_cache_list(a))
     p_cclear = cache_sub.add_parser("clear", help="Clear cached entries in SQLite.")
     _add_cache_dir_arg(p_cclear)
+    p_cclear.set_defaults(handler=lambda a, _p=parser: _cmd_cache_clear(a))
 
     p_pdmx = sub.add_parser("pdmx", help="Manage the optional local PDMX catalog.")
+    p_pdmx.set_defaults(handler=lambda _a, _p=parser: (p_pdmx.print_help(), 0)[1])
     pdmx_sub = p_pdmx.add_subparsers(dest="subcommand")
     p_pdmx_st = pdmx_sub.add_parser("status", help="Inspect local PDMX catalog status.")
     _add_cache_dir_arg(p_pdmx_st)
+    p_pdmx_st.set_defaults(handler=lambda a, _p=parser: (_print_pdmx_status(get_pdmx_status(a.cache_dir)), 0)[1])
     p_pdmx_sync = pdmx_sub.add_parser("sync", help="Sync PDMX metadata/archives into SQLite.")
     p_pdmx_sync.add_argument("--pdmx-dir", type=Path, default=None, help="Custom PDMX directory.")
     p_pdmx_sync.add_argument("--with-mxl", action="store_true", help="Download mxl.tar.gz.")
@@ -494,11 +505,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_pdmx_sync.add_argument("--force", action="store_true", help="Re-download cached archives.")
     _add_cache_dir_arg(p_pdmx_sync)
+    p_pdmx_sync.set_defaults(
+        handler=lambda a, _p=parser: (
+            _print_pdmx_status(
+                sync_pdmx(
+                    cache_dir=a.cache_dir,
+                    pdmx_dir=a.pdmx_dir,
+                    download_csv=not a.no_download,
+                    download_mxl=a.with_mxl,
+                    download_mid=a.with_mid,
+                    extract_archives=a.extract,
+                    include_license_conflicts=a.include_license_conflicts,
+                    force=a.force,
+                )
+            ),
+            0,
+        )[1]
+    )
 
     p_gp = sub.add_parser("dadagp", help="Manage the optional local DadaGP / Guitar Pro catalog.")
+    p_gp.set_defaults(handler=lambda _a, _p=parser: (p_gp.print_help(), 0)[1])
     gp_sub = p_gp.add_subparsers(dest="subcommand")
     p_gp_st = gp_sub.add_parser("status", help="Inspect local DadaGP / Guitar Pro catalog status.")
     _add_cache_dir_arg(p_gp_st)
+    p_gp_st.set_defaults(
+        handler=lambda a, _p=parser: (_print_gp_status(get_gp_catalog_status(a.cache_dir)), 0)[1]
+    )
     p_gp_sync = gp_sub.add_parser(
         "sync", help="Index local Guitar Pro files or download a Zenodo record into SQLite."
     )
@@ -510,6 +542,19 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_gp_sync.add_argument("--force", action="store_true", help="Re-download Zenodo archives.")
     _add_cache_dir_arg(p_gp_sync)
+    p_gp_sync.set_defaults(
+        handler=lambda a, _p=parser: (
+            _print_gp_status(
+                sync_gp_catalog(
+                    cache_dir=a.cache_dir,
+                    gp_dir=a.gp_dir,
+                    zenodo_record=a.zenodo_record,
+                    force=a.force,
+                )
+            ),
+            0,
+        )[1]
+    )
 
     return parser
 
@@ -518,57 +563,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint."""
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-
-    if args.command == "convert":
-        return _cmd_convert(args)
-    if args.command == "inspect":
-        return _cmd_inspect(args)
-    if args.command == "search":
-        return _cmd_search(args, parser)
-    if args.command == "cache":
-        if args.subcommand == "list":
-            return _cmd_cache_list(args)
-        if args.subcommand == "clear":
-            return _cmd_cache_clear(args)
-        parser.parse_args(["cache", "--help"])
-        return 0
-    if args.command == "pdmx":
-        if args.subcommand == "status":
-            _print_pdmx_status(get_pdmx_status(args.cache_dir))
-            return 0
-        if args.subcommand == "sync":
-            _print_pdmx_status(
-                sync_pdmx(
-                    cache_dir=args.cache_dir,
-                    pdmx_dir=args.pdmx_dir,
-                    download_csv=not args.no_download,
-                    download_mxl=args.with_mxl,
-                    download_mid=args.with_mid,
-                    extract_archives=args.extract,
-                    include_license_conflicts=args.include_license_conflicts,
-                    force=args.force,
-                )
-            )
-            return 0
-        parser.parse_args(["pdmx", "--help"])
-        return 0
-    if args.command == "dadagp":
-        if args.subcommand == "status":
-            _print_gp_status(get_gp_catalog_status(args.cache_dir))
-            return 0
-        if args.subcommand == "sync":
-            _print_gp_status(
-                sync_gp_catalog(
-                    cache_dir=args.cache_dir,
-                    gp_dir=args.gp_dir,
-                    zenodo_record=args.zenodo_record,
-                    force=args.force,
-                )
-            )
-            return 0
-        parser.parse_args(["dadagp", "--help"])
-        return 0
-
+    handler = getattr(args, "handler", None)
+    if handler is not None:
+        return int(handler(args, parser))
     parser.print_help()
     return 0
 

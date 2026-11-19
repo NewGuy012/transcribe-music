@@ -15,6 +15,7 @@ from transcribe_music.enrich.fingering.viterbi import (
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 from transcribe_music.score_utils import (
     element_midis,
+    extract_tab_tags,
     get_guitar_track_meta,
     prepare_playable_notes,
 )
@@ -151,16 +152,7 @@ def _extract_locked_tab_poses(
     el: music21.note.Note | music21.chord.Chord,
     n_strings: int,
 ) -> list[_GuitarPose] | None:
-    s_tags = [
-        int(a.number)
-        for a in el.articulations
-        if isinstance(a, music21.articulations.StringIndication) and a.number is not None
-    ]
-    f_tags = [
-        int(a.number)
-        for a in el.articulations
-        if isinstance(a, music21.articulations.FretIndication) and a.number is not None
-    ]
+    s_tags, f_tags = extract_tab_tags(el)
     expected_n = 1 if isinstance(el, music21.note.Note) else len(el.notes)
     if len(s_tags) != expected_n or len(f_tags) != expected_n:
         return None

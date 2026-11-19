@@ -19,6 +19,7 @@ from transcribe_music.score_utils import (
     iter_playable_notes,
     make_clef,
     replace_or_insert_initial_clef,
+    to_frac,
 )
 
 _INSTRUMENT_KEYWORDS: dict[Instrument, tuple[str, ...]] = {
@@ -294,21 +295,18 @@ def _split_single_part_piano(src_part: music21.stream.Part) -> tuple[music21.str
             rh_m.insert(0, music21.clef.TrebleClef())
             lh_m.insert(0, music21.clef.BassClef())
 
-        for meta_cls in (
-            music21.meter.TimeSignature,
-            music21.key.KeySignature,
-            music21.tempo.MetronomeMark,
-            music21.expressions.RehearsalMark,
-            music21.bar.Barline,
+        for el in m.getElementsByClass(
+            (
+                music21.meter.TimeSignature,
+                music21.key.KeySignature,
+                music21.tempo.MetronomeMark,
+                music21.expressions.RehearsalMark,
+                music21.bar.Barline,
+            )
         ):
-            for el in m.getElementsByClass(meta_cls):
-                if isinstance(
-                    el, (music21.tempo.MetronomeMark, music21.expressions.RehearsalMark)
-                ):
-                    rh_m.insert(el.offset, copy.deepcopy(el))
-                else:
-                    rh_m.insert(el.offset, copy.deepcopy(el))
-                    lh_m.insert(el.offset, copy.deepcopy(el))
+            rh_m.insert(el.offset, copy.deepcopy(el))
+            if not isinstance(el, (music21.tempo.MetronomeMark, music21.expressions.RehearsalMark)):
+                lh_m.insert(el.offset, copy.deepcopy(el))
 
         for h in m.getElementsByClass(music21.harmony.ChordSymbol):
             rh_m.insert(h.offset, copy.deepcopy(h))
@@ -317,8 +315,8 @@ def _split_single_part_piano(src_part: music21.stream.Part) -> tuple[music21.str
         lh_events: list[tuple[Fraction, Fraction, list[int], music21.tie.Tie | None]] = []
 
         for el in iter_playable_notes(m):
-            off = Fraction(float(el.getOffsetInHierarchy(m))).limit_denominator(24)
-            dur = max(Fraction(1, 8), Fraction(float(el.duration.quarterLength)).limit_denominator(24))
+            off = to_frac(el.getOffsetInHierarchy(m))
+            dur = max(Fraction(1, 8), to_frac(el.duration.quarterLength))
             pitches = sorted(element_midis(el))
             if not pitches:
                 continue
@@ -366,11 +364,8 @@ def _adapt_guitar_part(
     )
     if needs_octave_up:
         for el in iter_playable_notes(part):
-            if isinstance(el, music21.note.Note):
-                el.pitch.midi += 12
-            else:
-                for p in el.pitches:
-                    p.midi += 12
+            for p in el.pitches:
+                p.midi += 12
 
     replace_or_insert_initial_clef(
         part,
@@ -402,17 +397,17 @@ def _apply_cello_auto_clefs(part: music21.stream.Part) -> None:
         hi = max(midis)
         med = median(midis)
 
-        if not in_tenor:
-            if lo >= 50 and (hi >= 65 or med >= 60):
-                for c in list(m.getElementsByClass(music21.clef.Clef)):
-                    m.remove(c)
-                m.insert(0.0, music21.clef.TenorClef())
-                in_tenor = True
-        elif lo < 55 and hi <= 62:
+        new_clef: music21.clef.Clef | None = None
+        if not in_tenor and lo >= 50 and (hi >= 65 or med >= 60):
+            new_clef = music21.clef.TenorClef()
+            in_tenor = True
+        elif in_tenor and lo < 55 and hi <= 62:
+            new_clef = music21.clef.BassClef()
+            in_tenor = False
+        if new_clef is not None:
             for c in list(m.getElementsByClass(music21.clef.Clef)):
                 m.remove(c)
-            m.insert(0.0, music21.clef.BassClef())
-            in_tenor = False
+            m.insert(0.0, new_clef)
 
 
 def select_and_adapt_parts(

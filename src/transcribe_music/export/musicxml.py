@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
-import os
 import re
-import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from fractions import Fraction
@@ -14,16 +12,18 @@ from pathlib import Path
 
 import music21
 
+from transcribe_music.ingest._io import atomic_write_path
 from transcribe_music.models import INSTRUMENT_SPECS, GuitarStaffMode, Instrument
 from transcribe_music.score_utils import (
     GuitarTrackMeta,
     coerce_to_score,
     fill_stream_rest_gaps,
     get_guitar_track_meta,
-    is_playable_chord,
+    is_playable_note,
     make_clef,
     mark_tie,
     replace_or_insert_initial_clef,
+    to_frac,
     try_int,
 )
 
@@ -38,31 +38,25 @@ class ExportMetrics:
     fingering_count: int
 
 
-def _make_music21_instrument(instrument: Instrument) -> music21.instrument.Instrument:
-    if instrument == Instrument.PIANO:
-        return music21.instrument.Piano()
-    if instrument == Instrument.GUITAR:
-        return music21.instrument.AcousticGuitar()
-    if instrument == Instrument.VIOLIN:
-        return music21.instrument.Violin()
-    return music21.instrument.Violoncello()
-
-
+_INSTRUMENT_FACTORIES = {
+    Instrument.PIANO: music21.instrument.Piano,
+    Instrument.GUITAR: music21.instrument.AcousticGuitar,
+    Instrument.VIOLIN: music21.instrument.Violin,
+    Instrument.CELLO: music21.instrument.Violoncello,
+}
 _UNEXPORTABLE_DURATION_TYPES = frozenset({"inexpressible", "zero", "2048th", "duplex-maxima"})
 
 
 def _is_unexportable_element(el: object) -> bool:
-    """Return True if el is a non-grace Note/Rest/Chord with an unexportable MusicXML duration."""
     return (
-        isinstance(el, (music21.note.Note, music21.note.Rest, music21.chord.Chord))
-        and not isinstance(el, music21.harmony.ChordSymbol)
-        and not el.duration.isGrace
-        and el.duration.type in _UNEXPORTABLE_DURATION_TYPES
+        _is_playable_or_rest(el)
+        and not el.duration.isGrace  # type: ignore[attr-defined]
+        and el.duration.type in _UNEXPORTABLE_DURATION_TYPES  # type: ignore[attr-defined]
     )
 
 
 def _is_playable_or_rest(el: object) -> bool:
-    return isinstance(el, (music21.note.Note, music21.note.Rest)) or is_playable_chord(el)
+    return isinstance(el, music21.note.Rest) or is_playable_note(el)
 
 
 def _snap_clean_quarter_length(
@@ -74,23 +68,16 @@ def _snap_clean_quarter_length(
     """Snap an arbitrary float duration/offset to the closest standard binary/triplet Fraction."""
     if value <= 0.0:
         return Fraction(0, 1) if allow_zero else min_ql
-    candidates: list[tuple[float, int, Fraction]] = []
-    for div in (4, 3, 8, 6):
-        num = round(value * div)
-        if num == 0 and not allow_zero:
-            continue
-        candidates.append((abs(value - num / div), div, Fraction(num, div)))
+    candidates = [
+        (abs(value - num / div), div, Fraction(num, div))
+        for div in (4, 3, 8, 6)
+        if (num := round(value * div)) > 0 or allow_zero
+    ]
     if not candidates:
         return Fraction(0, 1) if allow_zero else min_ql
     candidates.sort(key=lambda item: (round(item[0], 6), item[1]))
     snapped = candidates[0][2]
-    if not allow_zero and snapped <= 0:
-        return min_ql
-    return snapped
-
-
-def _to_fraction(value: float | Fraction) -> Fraction:
-    return value if isinstance(value, Fraction) else Fraction(float(value)).limit_denominator(10000)
+    return snapped if (allow_zero or snapped > 0) else min_ql
 
 
 def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) -> None:
@@ -104,22 +91,18 @@ def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) 
             st.remove(el)
             continue
 
-        off_frac = _to_fraction(el.offset)
+        off_frac = to_frac(el.offset, 10000)
         if off_frac.denominator > 24:
             new_off = _snap_clean_quarter_length(float(el.offset), allow_zero=True)
             st.setElementOffset(el, new_off)
             repaired_ids.add(id(el))
 
-        ql_frac = _to_fraction(el.duration.quarterLength)
-        needs_dur_fix = _is_unexportable_element(el) or ql_frac.denominator > 24
-        if needs_dur_fix:
+        ql_frac = to_frac(el.duration.quarterLength, 10000)
+        if _is_unexportable_element(el) or ql_frac.denominator > 24:
             new_ql = _snap_clean_quarter_length(ql_float, allow_zero=False)
             if bar_ql is not None:
-                cur_off = Fraction(el.offset).limit_denominator(24)
-                if cur_off < bar_ql:
-                    new_ql = min(new_ql, bar_ql - cur_off)
-                else:
-                    new_ql = min(new_ql, bar_ql)
+                cur_off = to_frac(el.offset)
+                new_ql = min(new_ql, bar_ql - cur_off if cur_off < bar_ql else bar_ql)
                 if new_ql <= 0:
                     new_ql = Fraction(1, 8)
             el.duration = music21.duration.Duration(new_ql)
@@ -133,30 +116,19 @@ def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) 
             st.remove(r)
 
     notes_only = sorted(
-        [
-            el
-            for el in st
-            if _is_playable_or_rest(el)
-            and not isinstance(el, music21.note.Rest)
-            and not el.duration.isGrace
-        ],
+        [el for el in st if is_playable_note(el) and not el.duration.isGrace],
         key=lambda e: (float(e.offset), id(e)),
     )
     for idx, n in enumerate(notes_only):
         if id(n) not in repaired_ids:
             continue
-        n_off = Fraction(n.offset).limit_denominator(24)
+        n_off = to_frac(n.offset)
         if n_off >= bar_ql:
             continue
-        next_off = (
-            Fraction(notes_only[idx + 1].offset).limit_denominator(24)
-            if idx + 1 < len(notes_only)
-            else bar_ql
-        )
+        next_off = to_frac(notes_only[idx + 1].offset) if idx + 1 < len(notes_only) else bar_ql
         if next_off > n_off:
             max_dur = min(bar_ql, next_off) - n_off
-            cur_ql = Fraction(n.duration.quarterLength).limit_denominator(24)
-            if cur_ql > max_dur > 0:
+            if to_frac(n.duration.quarterLength) > max_dur > 0:
                 n.duration = music21.duration.Duration(max_dur)
 
     fill_stream_rest_gaps(st, bar_ql, notes_only=notes_only)
@@ -196,8 +168,8 @@ def _measure_stream_overflows(st: music21.stream.Stream, bar_ql: Fraction) -> tu
     seq_cursor = Fraction(0, 1)
     has_overlap = False
     for el in items:
-        off = _to_fraction(el.offset).limit_denominator(24)
-        dur = max(Fraction(0, 1), _to_fraction(el.duration.quarterLength).limit_denominator(24))
+        off = to_frac(el.offset)
+        dur = max(Fraction(0, 1), to_frac(el.duration.quarterLength))
         if off < seq_cursor - Fraction(1, 32):
             has_overlap = True
         seq_cursor = max(seq_cursor, off) + dur
@@ -223,7 +195,7 @@ def _insert_stream_non_overlapping(
 ) -> None:
     if placed:
         prev_off, prev_el = placed[-1]
-        prev_end = prev_off + _to_fraction(prev_el.duration.quarterLength).limit_denominator(24)
+        prev_end = prev_off + to_frac(prev_el.duration.quarterLength)
         if off < prev_end:
             if off > prev_off:
                 prev_el.duration = music21.duration.Duration(off - prev_off)
@@ -243,33 +215,39 @@ def _split_overfull_measure(
     n_bars = 1 if small_tail else max(1, math.ceil(max_end / bar_ql))
     new_bars = [music21.stream.Measure(number=m.number) for _ in range(n_bars)]
 
-    for meta_cls in (
-        music21.clef.Clef,
-        music21.meter.TimeSignature,
-        music21.key.KeySignature,
-        music21.tempo.MetronomeMark,
-        music21.expressions.RehearsalMark,
+    for el in list(
+        m.getElementsByClass(
+            (
+                music21.clef.Clef,
+                music21.meter.TimeSignature,
+                music21.key.KeySignature,
+                music21.tempo.MetronomeMark,
+                music21.expressions.RehearsalMark,
+            )
+        )
     ):
-        for el in list(m.getElementsByClass(meta_cls)):
-            off = min(_to_fraction(el.offset).limit_denominator(24), max(Fraction(0, 1), bar_ql - Fraction(1, 8)))
-            m.remove(el)
-            new_bars[0].insert(off, el)
+        off = min(to_frac(el.offset), max(Fraction(0, 1), bar_ql - Fraction(1, 8)))
+        m.remove(el)
+        new_bars[0].insert(off, el)
 
     if m.leftBarline is not None:
         new_bars[0].leftBarline = copy.deepcopy(m.leftBarline)
     if m.rightBarline is not None:
         new_bars[-1].rightBarline = copy.deepcopy(m.rightBarline)
 
-    for expr_cls in (
-        music21.harmony.ChordSymbol,
-        music21.expressions.TextExpression,
-        music21.dynamics.Dynamic,
+    for el in list(
+        m.getElementsByClass(
+            (
+                music21.harmony.ChordSymbol,
+                music21.expressions.TextExpression,
+                music21.dynamics.Dynamic,
+            )
+        )
     ):
-        for el in list(m.getElementsByClass(expr_cls)):
-            off = max(Fraction(0, 1), _to_fraction(el.offset).limit_denominator(24))
-            b_idx = min(n_bars - 1, int(off // bar_ql))
-            m.remove(el)
-            new_bars[b_idx].insert(off - b_idx * bar_ql, el)
+        off = max(Fraction(0, 1), to_frac(el.offset))
+        b_idx = min(n_bars - 1, int(off // bar_ql))
+        m.remove(el)
+        new_bars[b_idx].insert(off - b_idx * bar_ql, el)
 
     voices = list(m.getElementsByClass(music21.stream.Voice))
     sources: list[tuple[str | None, music21.stream.Stream]] = (
@@ -296,7 +274,7 @@ def _split_overfull_measure(
         total_limit = n_bars * bar_ql
 
         for el in raw_items:
-            off = max(Fraction(0, 1), _to_fraction(el.offset).limit_denominator(24))
+            off = max(Fraction(0, 1), to_frac(el.offset))
             st.remove(el)
             if isinstance(el, music21.note.Rest) and not el.duration.isGrace:
                 continue
@@ -307,7 +285,7 @@ def _split_overfull_measure(
             if off >= total_limit:
                 continue
 
-            dur = max(Fraction(1, 16), _to_fraction(el.duration.quarterLength).limit_denominator(24))
+            dur = max(Fraction(1, 16), to_frac(el.duration.quarterLength))
             end = min(off + dur, total_limit)
             if small_tail and end > bar_ql:
                 end = bar_ql
@@ -465,11 +443,11 @@ def normalize_score_structure(
 
     if score.metadata is None:
         score.metadata = music21.metadata.Metadata()
-    if title:
-        clean_title = format_score_title(title) if looks_like_raw_filename(title) else title.strip()
+    if title and title.strip():
+        clean_title = title.strip()
         score.metadata.title = clean_title
         score.metadata.movementName = clean_title
-    if composer:
+    if composer and composer.strip():
         score.metadata.composer = composer.strip()
 
     if not list(score.parts):
@@ -479,7 +457,7 @@ def normalize_score_structure(
     for idx, part in enumerate(parts):
         for existing_inst in list(part.recurse().getElementsByClass(music21.instrument.Instrument)):
             part.remove(existing_inst, recurse=True)
-        m21_inst = _make_music21_instrument(instrument)
+        m21_inst = _INSTRUMENT_FACTORIES[instrument]()
         if spec.transpose_semitones:
             m21_inst.transposition = music21.interval.Interval(spec.transpose_semitones)
             part.atSoundingPitch = False
@@ -674,22 +652,30 @@ def _shift_note_octave(note_el: ET.Element, delta: int) -> None:
         oct_el.text = str(oct_val + delta)
 
 
-def _set_or_replace_staff(note_el: ET.Element, staff_num: int) -> None:
-    staff_el = note_el.find("staff")
-    if staff_el is None:
-        staff_el = ET.Element("staff")
-        note_el.append(staff_el)
-    staff_el.text = str(staff_num)
-    _sort_children_by_order(note_el, _NOTE_TAG_ORDER)
+def _set_note_subelement(note_el: ET.Element, tag: str, value: int, *, sort: bool = True) -> None:
+    sub = note_el.find(tag)
+    if sub is None:
+        sub = ET.Element(tag)
+        note_el.append(sub)
+    sub.text = str(value)
+    if sort:
+        _sort_children_by_order(note_el, _NOTE_TAG_ORDER)
 
 
-def _ensure_voice(note_el: ET.Element, voice_num: int) -> None:
-    voice_el = note_el.find("voice")
-    if voice_el is None:
-        voice_el = ET.Element("voice")
-        note_el.append(voice_el)
-    voice_el.text = str(voice_num)
-    _sort_children_by_order(note_el, _NOTE_TAG_ORDER)
+def _add_clef_el(
+    attrs: ET.Element,
+    sign: str,
+    line: int,
+    *,
+    octave_change: int | None = None,
+    number: int | None = None,
+) -> None:
+    attrib = {"number": str(number)} if number is not None else {}
+    clef = ET.SubElement(attrs, "clef", attrib)
+    ET.SubElement(clef, "sign").text = sign
+    ET.SubElement(clef, "line").text = str(line)
+    if octave_change is not None:
+        ET.SubElement(clef, "clef-octave-change").text = str(octave_change)
 
 
 def _apply_multivoice_fingering_placement(root: ET.Element) -> bool:
@@ -776,9 +762,7 @@ def _apply_guitar_staff_layout(
     if guitar_staff == GuitarStaffMode.TAB:
         for clef_el in list(first_attrs.findall("clef")):
             first_attrs.remove(clef_el)
-        tab_clef = ET.SubElement(first_attrs, "clef")
-        ET.SubElement(tab_clef, "sign").text = "TAB"
-        ET.SubElement(tab_clef, "line").text = "5"
+        _add_clef_el(first_attrs, "TAB", 5)
         transposes = list(first_attrs.findall("transpose"))
         had_8vb_transpose = any(try_int(tr.findtext("octave-change")) == -1 for tr in transposes)
         for tr_el in transposes:
@@ -802,13 +786,8 @@ def _apply_guitar_staff_layout(
     if clefs:
         clefs[0].set("number", "1")
     else:
-        c1 = ET.SubElement(first_attrs, "clef", {"number": "1"})
-        ET.SubElement(c1, "sign").text = "G"
-        ET.SubElement(c1, "line").text = "2"
-        ET.SubElement(c1, "clef-octave-change").text = "-1"
-    c2 = ET.SubElement(first_attrs, "clef", {"number": "2"})
-    ET.SubElement(c2, "sign").text = "TAB"
-    ET.SubElement(c2, "line").text = "5"
+        _add_clef_el(first_attrs, "G", 2, octave_change=-1, number=1)
+    _add_clef_el(first_attrs, "TAB", 5, number=2)
 
     transposes = list(first_attrs.findall("transpose"))
     had_8vb_transpose = any(try_int(tr.findtext("octave-change")) == -1 for tr in transposes)
@@ -868,18 +847,18 @@ def _apply_guitar_staff_layout(
                 orig_voice = try_int(elem.findtext("voice"))
                 if orig_voice is None:
                     orig_voice = 1
-                    _ensure_voice(elem, orig_voice)
+                    _set_note_subelement(elem, "voice", orig_voice, sort=False)
                 _strip_technical_tags(elem, "string", "fret")
-                _set_or_replace_staff(elem, 1)
+                _set_note_subelement(elem, "staff", 1)
 
                 if had_8vb_transpose:
                     _shift_note_octave(clone, -1)
-                _ensure_voice(clone, orig_voice + voice_shift)
+                _set_note_subelement(clone, "voice", orig_voice + voice_shift, sort=False)
                 for drop_tag in ("stem", "beam", "accidental", "notehead", "lyric"):
                     for d_el in list(clone.findall(drop_tag)):
                         clone.remove(d_el)
                 _strip_technical_tags(clone, "fingering")
-                _set_or_replace_staff(clone, 2)
+                _set_note_subelement(clone, "staff", 2)
             cloned_staff2.append(clone)
 
         insert_pos = len(orig_children)
@@ -1036,15 +1015,7 @@ def export_musicxml(
         repair_overflows=repair_overflows,
         warnings=warnings,
     )
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=output_path.parent,
-            prefix=f".{output_path.stem}_",
-            suffix=".musicxml",
-            delete=False,
-        ) as fh:
-            tmp_path = Path(fh.name)
+    with atomic_write_path(output_path) as tmp_path:
         try:
             normalized.write("musicxml", fp=str(tmp_path))
         except (music21.exceptions21.Music21Exception, OSError, ValueError, TypeError) as exc:
@@ -1057,9 +1028,4 @@ def export_musicxml(
             guitar_staff=guitar_staff,
             guitar_meta=guitar_meta,
         )
-        os.replace(tmp_path, output_path)
-        tmp_path = None
-        return metrics, warnings
-    finally:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+    return metrics, warnings
