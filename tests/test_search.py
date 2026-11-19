@@ -13,7 +13,6 @@ from typing import Any
 
 import pytest
 from conftest import make_simple_cello_score, write_mxl_bytes
-from typer.testing import CliRunner
 
 from transcribe_music import (
     Instrument,
@@ -22,7 +21,7 @@ from transcribe_music import (
     search_digital_scores,
     sync_gp_catalog,
 )
-from transcribe_music.cli import app
+from transcribe_music.cli import main
 from transcribe_music.ingest import _io as io_mod
 from transcribe_music.ingest import search as search_mod
 
@@ -174,7 +173,7 @@ def test_offline_music21_corpus_and_github_tree_parsers(
 
 
 def test_cli_search_and_download_security_guards(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     mxl_bytes = write_mxl_bytes(make_simple_cello_score("Moonlight Study"), tmp_path)
     _stub_remote_sources(
@@ -196,32 +195,31 @@ def test_cli_search_and_download_security_guards(
         _fake_opener(mxl_bytes, "https://example.com/moonlight.mxl"),
     )
 
-    runner = CliRunner()
     dl_dir = tmp_path / "dl"
     cache_dir = tmp_path / "cache"
 
-    cancel_res = runner.invoke(
-        app, ["search", "Moonlight", "--dir", str(dl_dir), "--cache-dir", str(cache_dir)], input="\n"
-    )
-    assert cancel_res.exit_code == 0 and "Download cancelled." in cancel_res.stdout
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "")
+    assert main(["search", "Moonlight", "--dir", str(dl_dir), "--cache-dir", str(cache_dir)]) == 0
+    assert "Download cancelled." in capsys.readouterr().out
 
-    conv_res = runner.invoke(
-        app,
-        [
-            "search",
-            "Moonlight",
-            "--select",
-            "1",
-            "--dir",
-            str(dl_dir),
-            "--instrument",
-            "piano",
-            "--cache-dir",
-            str(cache_dir),
-        ],
+    assert (
+        main(
+            [
+                "search",
+                "Moonlight",
+                "--select",
+                "1",
+                "--dir",
+                str(dl_dir),
+                "--instrument",
+                "piano",
+                "--cache-dir",
+                str(cache_dir),
+            ]
+        )
+        == 0
     )
-    assert conv_res.exit_code == 0, conv_res.stdout
-    assert "MusicXML Ready" in conv_res.stdout
+    assert "MusicXML Ready" in capsys.readouterr().out
     assert (dl_dir / "moonlight.mxl").read_bytes() == mxl_bytes
 
     insecure = search_mod.ScoreSearchResult(
@@ -270,7 +268,7 @@ def test_cli_search_and_download_security_guards(
 
 
 def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     import io
     import tarfile
@@ -363,6 +361,5 @@ def test_guitar_instrument_search_and_dadagp_duckdb_catalog(
     with pytest.raises(RuntimeError, match="approved researcher access"):
         sync_gp_catalog(cache_dir=cache_dir, zenodo_record="4789123")
 
-    runner = CliRunner()
-    cli_st = runner.invoke(app, ["dadagp", "status", "--cache-dir", str(cache_dir)])
-    assert cli_st.exit_code == 0 and "3" in cli_st.stdout
+    assert main(["dadagp", "status", "--cache-dir", str(cache_dir)]) == 0
+    assert "3" in capsys.readouterr().out

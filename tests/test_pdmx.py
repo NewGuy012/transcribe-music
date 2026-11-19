@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 from conftest import make_simple_cello_score, write_mxl_bytes
-from typer.testing import CliRunner
 
 from transcribe_music import (
     Instrument,
@@ -18,7 +17,7 @@ from transcribe_music import (
     search_digital_scores,
     sync_pdmx,
 )
-from transcribe_music.cli import app
+from transcribe_music.cli import main
 from transcribe_music.ingest.pdmx import extract_pdmx_member
 
 
@@ -83,22 +82,22 @@ def test_pdmx_duckdb_sync_search_extract_and_security(tmp_path: Path) -> None:
     assert converted.note_count == 4
     assert converted.fingering_count == 4
 
-    runner = CliRunner()
-    assert runner.invoke(app, ["pdmx", "status", "--cache-dir", str(cache_dir)]).exit_code == 0
-    sync_res = runner.invoke(
-        app,
-        [
-            "pdmx",
-            "sync",
-            "--pdmx-dir",
-            str(pdmx_dir),
-            "--no-download",
-            "--include-license-conflicts",
-            "--cache-dir",
-            str(cache_dir),
-        ],
+    assert main(["pdmx", "status", "--cache-dir", str(cache_dir)]) == 0
+    assert (
+        main(
+            [
+                "pdmx",
+                "sync",
+                "--pdmx-dir",
+                str(pdmx_dir),
+                "--no-download",
+                "--include-license-conflicts",
+                "--cache-dir",
+                str(cache_dir),
+            ]
+        )
+        == 0
     )
-    assert sync_res.exit_code == 0
     assert get_pdmx_status(cache_dir).score_count == 3
 
     for unsafe in ("../../etc/passwd", "/etc/passwd", "mxl/../../etc/passwd"):

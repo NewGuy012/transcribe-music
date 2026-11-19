@@ -1,13 +1,11 @@
-"""Typer CLI entrypoint for transcribe-music."""
+"""Stdlib argparse CLI entrypoint for transcribe-music."""
 
 from __future__ import annotations
 
+import argparse
+from collections.abc import Sequence
+from enum import Enum
 from pathlib import Path
-from typing import Annotated
-
-import typer
-from rich.console import Console
-from rich.table import Table
 
 from transcribe_music.ingest.digital import inspect_digital_score
 from transcribe_music.ingest.gp_catalog import (
@@ -28,170 +26,165 @@ from transcribe_music.models import (
 from transcribe_music.pipeline import convert_music
 from transcribe_music.storage.catalog import CatalogStore
 
-app = typer.Typer(
-    name="transcribe-music",
-    help="Convert digital symbolic scores (primary) or sheet music PDFs (fallback) into enriched MusicXML.",
-    no_args_is_help=True,
-)
-cache_app = typer.Typer(help="Inspect or manage the SQLite conversion cache.")
-pdmx_app = typer.Typer(help="Manage the optional local PDMX (254k+ public domain MusicXML) catalog.")
-dadagp_app = typer.Typer(help="Manage the optional local DadaGP / Guitar Pro catalog.")
-app.add_typer(cache_app, name="cache")
-app.add_typer(pdmx_app, name="pdmx")
-app.add_typer(dadagp_app, name="dadagp")
 
-console = Console()
-
-InstrumentOpt = Annotated[Instrument, typer.Option(..., "--instrument", "-i", help="Target instrument.")]
-OutputOpt = Annotated[Path | None, typer.Option("--output", "-o", help="Output .musicxml path.")]
-PartOpt = Annotated[
-    str | None,
-    typer.Option("--part", "-p", help="Part number (1-based) or name filter (e.g. 'cello' or '1,2')."),
-]
-ChordsOpt = Annotated[bool, typer.Option("--chords/--no-chords", help="Annotate chord symbols.")]
-FingeringOpt = Annotated[bool, typer.Option("--fingering/--no-fingering", help="Annotate fingerings/TAB.")]
-PreserveChordsOpt = Annotated[
-    bool,
-    typer.Option("--preserve-chords", help="Keep authored <harmony> chords when present."),
-]
-PreserveFingeringOpt = Annotated[
-    bool,
-    typer.Option("--preserve-fingering", help="Keep authored fingerings when present."),
-]
-PreserveTabOpt = Annotated[
-    bool,
-    typer.Option(
-        "--preserve-tab/--recompute-tab",
-        help="Keep authored guitar TAB string/fret placements when present (default: preserve).",
-    ),
-]
-GuitarStaffOpt = Annotated[
-    GuitarStaffMode,
-    typer.Option(
-        "--guitar-staff",
-        help="Guitar MusicXML staff layout: notation (Treble 8vb), tab (6-line TAB), or both.",
-    ),
-]
-CacheOpt = Annotated[bool, typer.Option("--cache/--no-cache", help="Use SQLite cache.")]
-CacheDirOpt = Annotated[Path, typer.Option("--cache-dir", help="Cache directory.")]
-OmrBackendOpt = Annotated[
-    OmrBackend,
-    typer.Option("--omr-backend", help="PDF OMR backend (auto prefers Audiveris if installed, else homr)."),
-]
+def _print_table(
+    title: str,
+    headers: Sequence[str] | None,
+    rows: Sequence[Sequence[str]],
+) -> None:
+    print(title)
+    all_rows = [headers, *rows] if headers else list(rows)
+    if not all_rows:
+        return
+    widths = [max(len(str(r[c])) for r in all_rows) for c in range(len(all_rows[0]))]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    if headers:
+        print(fmt.format(*headers).rstrip())
+        print("  ".join("-" * w for w in widths))
+    for row in rows:
+        print(fmt.format(*(str(c) for c in row)).rstrip())
 
 
 def _print_result(res: TranscriptionResult) -> None:
-    table = Table(title="MusicXML Ready", show_header=False)
-    table.add_row("Output MusicXML", str(res.musicxml_path))
-    table.add_row("Instrument", res.instrument.value)
-    table.add_row("Source", f"{res.source_type.value}: {res.source_ref}")
+    rows: list[tuple[str, str]] = [
+        ("Output MusicXML", str(res.musicxml_path)),
+        ("Instrument", res.instrument.value),
+        ("Source", f"{res.source_type.value}: {res.source_ref}"),
+    ]
     if res.backend:
-        table.add_row("Backend", res.backend)
+        rows.append(("Backend", res.backend))
     if res.selected_part:
-        table.add_row("Selected Part", res.selected_part)
-    table.add_row("Cache Hit", "Yes" if res.cached else "No")
-    table.add_row("Elapsed", f"{res.elapsed_sec:.2f}s")
-    table.add_row("Measures", str(res.measure_count))
-    table.add_row("Notes", str(res.note_count))
-    table.add_row("Chords (<harmony>)", str(res.chord_count))
-    table.add_row("Fingerings", str(res.fingering_count))
-    console.print(table)
+        rows.append(("Selected Part", res.selected_part))
+    rows.extend(
+        [
+            ("Cache Hit", "Yes" if res.cached else "No"),
+            ("Elapsed", f"{res.elapsed_sec:.2f}s"),
+            ("Measures", str(res.measure_count)),
+            ("Notes", str(res.note_count)),
+            ("Chords (<harmony>)", str(res.chord_count)),
+            ("Fingerings", str(res.fingering_count)),
+        ]
+    )
+    _print_table("MusicXML Ready", None, rows)
     for warn in res.warnings:
-        console.print(f"[yellow]Warning:[/yellow] {warn}")
+        print(f"Warning: {warn}")
 
 
 def _print_search_results(query: str, results: list[ScoreSearchResult]) -> None:
     show_details = any(item.edition_note for item in results)
-    table = Table(title=f"Top {len(results)} Scores for {query!r}")
-    table.add_column("#", no_wrap=True)
-    table.add_column("Format", no_wrap=True)
-    table.add_column("Title")
-    table.add_column("Composer")
-    table.add_column("Source", no_wrap=True)
+    headers = ["#", "Format", "Title", "Composer", "Source"]
     if show_details:
-        table.add_column("Details")
+        headers.append("Details")
+    rows: list[list[str]] = []
     for idx, item in enumerate(results, start=1):
-        fmt_label = item.format_ext.lstrip(".").upper()
         row = [
             str(idx),
-            fmt_label,
+            item.format_ext.lstrip(".").upper(),
             item.title,
             item.composer or "-",
             item.source,
         ]
         if show_details:
             row.append(item.edition_note or "-")
-        table.add_row(*row)
-    console.print(table)
+        rows.append(row)
+    _print_table(f"Top {len(results)} Scores for {query!r}", headers, rows)
 
 
-@app.command()
-def convert(
-    input_file: Annotated[
-        Path,
-        typer.Argument(
-            exists=True,
-            readable=True,
-            help="Digital score (.musicxml/.mxl/.mid/.krn/.mei/.abc/.gp*/.tab/.mscz/.capx/.ly) or fallback .pdf.",
-        ),
-    ],
-    instrument: InstrumentOpt,
-    output: OutputOpt = None,
-    part: PartOpt = None,
-    dpi: Annotated[int, typer.Option("--dpi", help="PDF rasterization DPI (for .pdf fallback only).")] = 300,
-    omr_backend: OmrBackendOpt = OmrBackend.AUTO,
-    chords: ChordsOpt = True,
-    fingering: FingeringOpt = True,
-    preserve_chords: PreserveChordsOpt = False,
-    preserve_fingering: PreserveFingeringOpt = False,
-    preserve_tab: PreserveTabOpt = True,
-    guitar_staff: GuitarStaffOpt = GuitarStaffMode.NOTATION,
-    cache: CacheOpt = True,
-    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
-) -> None:
-    """Convert any supported digital score (primary) or sheet music PDF (fallback) to MusicXML."""
-    cfg = TranscriptionConfig(
-        instrument=instrument,
-        part=part,
-        enrich_chords=chords,
-        enrich_fingering=fingering,
-        preserve_existing_chords=preserve_chords,
-        preserve_existing_fingering=preserve_fingering,
-        preserve_existing_tab=preserve_tab,
-        guitar_staff=guitar_staff,
-        use_cache=cache,
-        cache_dir=cache_dir,
-        pdf_dpi=dpi,
-        omr_backend=omr_backend,
+def _print_pdmx_status(status: PdmxStatus) -> None:
+    _print_table(
+        "PDMX Local Catalog",
+        ["Field", "Value"],
+        [
+            ("PDMX Directory", str(status.pdmx_dir)),
+            ("PDMX.csv Present", "Yes" if status.csv_exists else "No"),
+            ("SQLite Index", "Yes" if status.db_exists else "No"),
+            ("Indexed Scores", f"{status.score_count:,}"),
+            (
+                "MXL Archive/Dir",
+                "Available" if status.mxl_available else "Not synced (--with-mxl)",
+            ),
+            (
+                "MID Archive/Dir",
+                "Available" if status.mid_available else "Not synced (--with-mid)",
+            ),
+        ],
     )
-    res = convert_music(input_path=input_file, instrument=instrument, output_path=output, config=cfg)
+
+
+def _print_gp_status(status: GpCatalogStatus) -> None:
+    _print_table(
+        "DadaGP / Guitar Pro Local Catalog",
+        ["Field", "Value"],
+        [
+            ("Catalog Directory", str(status.gp_dir)),
+            ("SQLite Index", "Yes" if status.db_exists else "No"),
+            ("Indexed Scores", f"{status.score_count:,}"),
+            ("Files / Archives", "Available" if status.archive_available else "Empty"),
+        ],
+    )
+
+
+def _existing_file(raw: str) -> Path:
+    path = Path(raw)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"File not found: {raw}")
+    return path
+
+
+def _bounded_int(lo: int, hi: int | None = None):
+    def _parse(raw: str) -> int:
+        val = int(raw)
+        if val < lo or (hi is not None and val > hi):
+            bound = f"[{lo}..{hi}]" if hi is not None else f">= {lo}"
+            raise argparse.ArgumentTypeError(f"expected integer {bound}, got {val}")
+        return val
+
+    return _parse
+
+
+def _enum_choices(enum_cls: type[Enum]) -> list[str]:
+    return [m.value for m in enum_cls]
+
+
+def _add_cache_dir_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=Path(".transcribe_cache"),
+        help="Cache directory.",
+    )
+
+
+def _cmd_convert(args: argparse.Namespace) -> int:
+    inst = Instrument(args.instrument)
+    cfg = TranscriptionConfig(
+        instrument=inst,
+        part=args.part,
+        enrich_chords=args.chords,
+        enrich_fingering=args.fingering,
+        preserve_existing_chords=args.preserve_chords,
+        preserve_existing_fingering=args.preserve_fingering,
+        preserve_existing_tab=args.preserve_tab,
+        guitar_staff=GuitarStaffMode(args.guitar_staff),
+        use_cache=args.cache,
+        cache_dir=args.cache_dir,
+        pdf_dpi=args.dpi,
+        omr_backend=OmrBackend(args.omr_backend),
+    )
+    res = convert_music(input_path=args.input_file, instrument=inst, output_path=args.output, config=cfg)
     _print_result(res)
+    return 0
 
 
-@app.command()
-def inspect(
-    score_file: Annotated[
-        Path,
-        typer.Argument(exists=True, readable=True, help="Digital score file to inspect."),
-    ],
-) -> None:
-    """List all parts, instruments, clefs, and note counts in a digital score file."""
-    info = inspect_digital_score(score_file)
+def _cmd_inspect(args: argparse.Namespace) -> int:
+    info = inspect_digital_score(args.score_file)
     show_guitar_meta = any(p.tuning or p.capo for p in info.parts)
-    table = Table(title=f"{info.title or info.source_path.name} ({info.format_name})")
-    table.add_column("#", no_wrap=True)
-    table.add_column("Part", no_wrap=True)
-    table.add_column("Instrument")
-    table.add_column("GM", no_wrap=True)
-    table.add_column("Clef")
-    table.add_column("Bars", no_wrap=True)
-    table.add_column("Notes", no_wrap=True)
-    table.add_column("Range", no_wrap=True)
+    headers = ["#", "Part", "Instrument", "GM", "Clef", "Bars", "Notes", "Range"]
     if show_guitar_meta:
-        table.add_column("Tuning", no_wrap=True)
-        table.add_column("Capo", no_wrap=True)
+        headers.extend(["Tuning", "Capo"])
+    rows: list[list[str]] = []
     for p in info.parts:
-        pitch_span = (
+        span = (
             f"{p.pitch_min}..{p.pitch_max}"
             if p.pitch_min is not None and p.pitch_max is not None
             else "-"
@@ -204,117 +197,61 @@ def inspect(
             p.clef or "-",
             str(p.measure_count),
             str(p.note_count),
-            pitch_span,
+            span,
         ]
         if show_guitar_meta:
             row.append(p.tuning or "-")
             row.append(str(p.capo) if p.capo else "-")
-        table.add_row(*row)
-    console.print(table)
+        rows.append(row)
+    _print_table(f"{info.title or info.source_path.name} ({info.format_name})", headers, rows)
+    return 0
 
 
-@app.command()
-def search(
-    query: Annotated[
-        str,
-        typer.Argument(
-            help="Title, composer, or keywords to search (e.g. 'Moonlight Sonata', 'Bach Cello')."
-        ),
-    ],
-    limit: Annotated[
-        int, typer.Option("--limit", "-n", min=1, max=25, help="Maximum number of top results.")
-    ] = 5,
-    select: Annotated[
-        int | None,
-        typer.Option("--select", "-s", min=1, help="1-based result index to download immediately."),
-    ] = None,
-    output: OutputOpt = None,
-    download_dir: Annotated[
-        Path,
-        typer.Option("--dir", "-d", help="Directory for downloaded file when --output is omitted."),
-    ] = Path("downloads"),
-    musicxml_only: Annotated[
-        bool,
-        typer.Option(
-            "--musicxml-only",
-            help="Only return native MusicXML (.musicxml/.mxl/.xml) results.",
-        ),
-    ] = False,
-    formats: Annotated[
-        str | None,
-        typer.Option(
-            "--format",
-            "-f",
-            help="Comma-separated extension filter (e.g. 'mxl,musicxml' or 'mid').",
-        ),
-    ] = None,
-    instrument: Annotated[
-        Instrument | None,
-        typer.Option(
-            "--instrument",
-            "-i",
-            help="Prioritize matching scores for this instrument and convert the download immediately.",
-        ),
-    ] = None,
-    offline: Annotated[
-        bool,
-        typer.Option("--offline", help="Search local corpus and cached indices without network calls."),
-    ] = False,
-    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
-) -> None:
-    """Search symbolic score catalogs (preferring MusicXML or GP TAB) and download a pick."""
+def _cmd_search(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    inst = Instrument(args.instrument) if args.instrument is not None else None
     parsed_formats = (
-        [tok.strip() for tok in formats.split(",") if tok.strip()] if formats else None
+        [tok.strip() for tok in args.formats.split(",") if tok.strip()] if args.formats else None
     )
     results = search_digital_scores(
-        query,
-        limit=limit,
-        instrument=instrument,
-        musicxml_only=musicxml_only,
+        args.query,
+        limit=args.limit,
+        instrument=inst,
+        musicxml_only=args.musicxml_only,
         formats=parsed_formats,
-        include_remote=not offline,
-        cache_dir=cache_dir,
+        include_remote=not args.offline,
+        cache_dir=args.cache_dir,
     )
     if not results:
-        console.print(f"[yellow]No matching digital scores found for {query!r}.[/yellow]")
-        return
+        print(f"No matching digital scores found for {args.query!r}.")
+        return 0
 
-    _print_search_results(query, results)
+    _print_search_results(args.query, results)
 
-    chosen_idx: int
-    if select is not None:
-        if not (1 <= select <= len(results)):
-            raise typer.BadParameter(f"--select must be between 1 and {len(results)}, got {select}.")
-        chosen_idx = select
+    if args.select is not None:
+        if not (1 <= args.select <= len(results)):
+            parser.error(f"--select must be between 1 and {len(results)}, got {args.select}.")
+        chosen_idx = args.select
     else:
-        raw_choice = typer.prompt(
-            f"Select result to download [1-{len(results)}] (Enter or 'q' to cancel)",
-            default="",
-            show_default=False,
-        ).strip()
+        try:
+            raw_choice = input(
+                f"Select result to download [1-{len(results)}] (Enter or 'q' to cancel): "
+            ).strip()
+        except EOFError:
+            raw_choice = ""
         if not raw_choice or raw_choice.lower() in {"q", "quit", "exit", "0", "n", "no"}:
-            console.print("Download cancelled.")
-            return
+            print("Download cancelled.")
+            return 0
         if not raw_choice.isdigit() or not (1 <= int(raw_choice) <= len(results)):
-            raise typer.BadParameter(
-                f"Invalid selection {raw_choice!r}. Enter a number from 1 to {len(results)}."
-            )
+            parser.error(f"Invalid selection {raw_choice!r}. Enter a number from 1 to {len(results)}.")
         chosen_idx = int(raw_choice)
 
     chosen = results[chosen_idx - 1]
-    saved_path = download_score_result(
-        chosen,
-        output_path=output,
-        download_dir=download_dir,
-    )
-    console.print(
-        f"[green]Downloaded:[/green] {saved_path} "
-        f"({chosen.format_ext.lstrip('.').upper()} from {chosen.source})"
-    )
+    saved_path = download_score_result(chosen, output_path=args.output, download_dir=args.download_dir)
+    print(f"Downloaded: {saved_path} ({chosen.format_ext.lstrip('.').upper()} from {chosen.source})")
 
-    if instrument is not None:
-        cfg = TranscriptionConfig(instrument=instrument, cache_dir=cache_dir)
-        res = convert_music(input_path=saved_path, instrument=instrument, config=cfg)
+    if inst is not None:
+        cfg = TranscriptionConfig(instrument=inst, cache_dir=args.cache_dir)
+        res = convert_music(input_path=saved_path, instrument=inst, config=cfg)
         _print_result(res)
     else:
         suggested = (
@@ -322,24 +259,16 @@ def search(
             if chosen.format_ext in {".gp", ".gpx", ".gp5", ".gp4", ".gp3", ".tab"}
             else "piano"
         )
-        console.print(
-            f"Next: [bold]transcribe-music convert \"{saved_path}\" --instrument {suggested}[/bold]"
-        )
+        print(f'Next: transcribe-music convert "{saved_path}" --instrument {suggested}')
+    return 0
 
 
-@cache_app.command("list")
-def cache_list(
-    limit: Annotated[int, typer.Option("--limit", "-n", help="Max jobs to show.")] = 20,
-    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
-) -> None:
-    """List cached MusicXML jobs stored in SQLite."""
-    store = CatalogStore(cache_dir)
-    rows = store.list_recent_jobs(limit=limit)
+def _cmd_cache_list(args: argparse.Namespace) -> int:
+    rows = CatalogStore(args.cache_dir).list_recent_jobs(limit=args.limit)
     if not rows:
-        console.print("No cached jobs in SQLite.")
-        return
-    table = Table(title="SQLite MusicXML Catalog")
-    for col in (
+        print("No cached jobs in SQLite.")
+        return 0
+    headers = [
         "job_hash",
         "source_type",
         "instrument",
@@ -350,10 +279,9 @@ def cache_list(
         "chords",
         "fingerings",
         "elapsed_s",
-    ):
-        table.add_column(col)
-    for r in rows:
-        table.add_row(
+    ]
+    table_rows = [
+        [
             str(r["job_hash"])[:10],
             str(r["source_type"]),
             str(r["instrument"]),
@@ -364,126 +292,233 @@ def cache_list(
             str(r["chord_count"]),
             str(r["fingering_count"]),
             f"{r['elapsed_sec']:.2f}",
-        )
-    console.print(table)
+        ]
+        for r in rows
+    ]
+    _print_table("SQLite MusicXML Catalog", headers, table_rows)
+    return 0
 
 
-@cache_app.command("clear")
-def cache_clear(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
-    """Clear cached entries in SQLite."""
-    store = CatalogStore(cache_dir)
+def _cmd_cache_clear(args: argparse.Namespace) -> int:
+    store = CatalogStore(args.cache_dir)
     removed = store.clear_cache()
-    console.print(f"Cleared {removed} job records from {store.db_path}")
+    print(f"Cleared {removed} job records from {store.db_path}")
+    return 0
 
 
-def _print_pdmx_status(status: PdmxStatus) -> None:
-    table = Table(title="PDMX Local Catalog")
-    table.add_column("Field", no_wrap=True)
-    table.add_column("Value")
-    table.add_row("PDMX Directory", str(status.pdmx_dir))
-    table.add_row("PDMX.csv Present", "Yes" if status.csv_exists else "No")
-    table.add_row("SQLite Index", "Yes" if status.db_exists else "No")
-    table.add_row("Indexed Scores", f"{status.score_count:,}")
-    table.add_row("MXL Archive/Dir", "Available" if status.mxl_available else "Not synced (--with-mxl)")
-    table.add_row("MID Archive/Dir", "Available" if status.mid_available else "Not synced (--with-mid)")
-    console.print(table)
-
-
-@pdmx_app.command("status")
-def pdmx_status(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
-    """Inspect local PDMX catalog and score archive status."""
-    _print_pdmx_status(get_pdmx_status(cache_dir))
-
-
-@pdmx_app.command("sync")
-def pdmx_sync(
-    pdmx_dir: Annotated[
-        Path | None,
-        typer.Option("--pdmx-dir", help="Custom directory containing or receiving PDMX files."),
-    ] = None,
-    with_mxl: Annotated[
-        bool,
-        typer.Option("--with-mxl", help="Download mxl.tar.gz (~1.89 GB) for offline .mxl extraction."),
-    ] = False,
-    with_mid: Annotated[
-        bool,
-        typer.Option("--with-mid", help="Download mid.tar.gz (~214 MB) for offline .mid extraction."),
-    ] = False,
-    extract: Annotated[
-        bool,
-        typer.Option("--extract", help="Unpack downloaded .tar.gz archives into PDMX directory."),
-    ] = False,
-    no_download: Annotated[
-        bool,
-        typer.Option("--no-download", help="Index an existing local PDMX.csv without downloading."),
-    ] = False,
-    include_license_conflicts: Annotated[
-        bool,
-        typer.Option("--include-license-conflicts", help="Include rows flagged with license conflicts."),
-    ] = False,
-    force: Annotated[
-        bool,
-        typer.Option("--force", help="Re-download PDMX files even if already cached locally."),
-    ] = False,
-    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
-) -> None:
-    """Sync PDMX metadata (Zenodo 15571083) into SQLite and optionally fetch score archives."""
-    status = sync_pdmx(
-        cache_dir=cache_dir,
-        pdmx_dir=pdmx_dir,
-        download_csv=not no_download,
-        download_mxl=with_mxl,
-        download_mid=with_mid,
-        extract_archives=extract,
-        include_license_conflicts=include_license_conflicts,
-        force=force,
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="transcribe-music",
+        description="Convert digital symbolic scores (primary) or sheet music PDFs (fallback) into enriched MusicXML.",
     )
-    _print_pdmx_status(status)
+    sub = parser.add_subparsers(dest="command")
 
-
-def _print_gp_status(status: GpCatalogStatus) -> None:
-    table = Table(title="DadaGP / Guitar Pro Local Catalog")
-    table.add_column("Field", no_wrap=True)
-    table.add_column("Value")
-    table.add_row("Catalog Directory", str(status.gp_dir))
-    table.add_row("SQLite Index", "Yes" if status.db_exists else "No")
-    table.add_row("Indexed Scores", f"{status.score_count:,}")
-    table.add_row("Files / Archives", "Available" if status.archive_available else "Empty")
-    console.print(table)
-
-
-@dadagp_app.command("status")
-def dadagp_status(cache_dir: CacheDirOpt = Path(".transcribe_cache")) -> None:
-    """Inspect local DadaGP / Guitar Pro catalog status."""
-    _print_gp_status(get_gp_catalog_status(cache_dir))
-
-
-@dadagp_app.command("sync")
-def dadagp_sync(
-    gp_dir: Annotated[
-        Path | None,
-        typer.Option("--gp-dir", help="Local directory of .gp*/.tab files or .tar.gz/.zip archives."),
-    ] = None,
-    zenodo_record: Annotated[
-        str | None,
-        typer.Option("--zenodo-record", help="Optional Zenodo record ID to download archives from."),
-    ] = None,
-    zenodo_token: Annotated[
-        str | None,
-        typer.Option("--zenodo-token", help="Optional Zenodo API token (or set ZENODO_TOKEN)."),
-    ] = None,
-    force: Annotated[
-        bool,
-        typer.Option("--force", help="Re-download Zenodo archives even if cached locally."),
-    ] = False,
-    cache_dir: CacheDirOpt = Path(".transcribe_cache"),
-) -> None:
-    """Index local Guitar Pro / DadaGP files or download from Zenodo into SQLite."""
-    status = sync_gp_catalog(
-        cache_dir=cache_dir,
-        gp_dir=gp_dir,
-        zenodo_record=zenodo_record,
-        zenodo_token=zenodo_token,
-        force=force,
+    p_conv = sub.add_parser("convert", help="Convert any digital score or fallback PDF to MusicXML.")
+    p_conv.add_argument(
+        "input_file",
+        type=_existing_file,
+        help="Digital score (.musicxml/.mxl/.mid/.krn/.mei/.abc/.gp*/.tab/.mscz/.capx/.ly) or fallback .pdf.",
     )
-    _print_gp_status(status)
+    p_conv.add_argument(
+        "--instrument", "-i", required=True, choices=_enum_choices(Instrument), help="Target instrument."
+    )
+    p_conv.add_argument("--output", "-o", type=Path, default=None, help="Output .musicxml path.")
+    p_conv.add_argument(
+        "--part", "-p", default=None, help="Part number (1-based) or name filter (e.g. 'cello' or '1,2')."
+    )
+    p_conv.add_argument(
+        "--dpi", type=_bounded_int(150, 600), default=300, help="PDF rasterization DPI (150-600)."
+    )
+    p_conv.add_argument(
+        "--omr-backend",
+        choices=_enum_choices(OmrBackend),
+        default=OmrBackend.AUTO.value,
+        help="PDF OMR backend (auto prefers Audiveris if installed, else homr).",
+    )
+    p_conv.add_argument(
+        "--chords",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Annotate chord symbols.",
+    )
+    p_conv.add_argument(
+        "--fingering",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Annotate fingerings/TAB.",
+    )
+    p_conv.add_argument(
+        "--preserve-chords", action="store_true", help="Keep authored <harmony> chords when present."
+    )
+    p_conv.add_argument(
+        "--preserve-fingering", action="store_true", help="Keep authored fingerings when present."
+    )
+    tab_grp = p_conv.add_mutually_exclusive_group()
+    tab_grp.add_argument(
+        "--preserve-tab",
+        dest="preserve_tab",
+        action="store_true",
+        help="Keep authored guitar TAB placements when present (default).",
+    )
+    tab_grp.add_argument(
+        "--recompute-tab",
+        dest="preserve_tab",
+        action="store_false",
+        help="Recompute guitar TAB placements via Viterbi solver.",
+    )
+    p_conv.set_defaults(preserve_tab=True)
+    p_conv.add_argument(
+        "--guitar-staff",
+        choices=_enum_choices(GuitarStaffMode),
+        default=GuitarStaffMode.NOTATION.value,
+        help="Guitar MusicXML staff layout: notation (Treble 8vb), tab (6-line TAB), or both.",
+    )
+    p_conv.add_argument(
+        "--cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use SQLite cache.",
+    )
+    _add_cache_dir_arg(p_conv)
+
+    p_insp = sub.add_parser("inspect", help="List parts, instruments, clefs, and note counts.")
+    p_insp.add_argument("score_file", type=_existing_file, help="Digital score file to inspect.")
+
+    p_search = sub.add_parser(
+        "search", help="Search symbolic score catalogs and download a pick."
+    )
+    p_search.add_argument("query", help="Title, composer, or keywords to search.")
+    p_search.add_argument(
+        "--limit", "-n", type=_bounded_int(1, 25), default=5, help="Maximum top results (1-25)."
+    )
+    p_search.add_argument(
+        "--select", "-s", type=_bounded_int(1), default=None, help="1-based index to download."
+    )
+    p_search.add_argument("--output", "-o", type=Path, default=None, help="Output file or dir.")
+    p_search.add_argument(
+        "--dir", "-d", dest="download_dir", type=Path, default=Path("downloads"), help="Download dir."
+    )
+    p_search.add_argument(
+        "--musicxml-only", action="store_true", help="Only return native MusicXML results."
+    )
+    p_search.add_argument(
+        "--format", "-f", dest="formats", default=None, help="Comma-separated extension filter."
+    )
+    p_search.add_argument(
+        "--instrument",
+        "-i",
+        choices=_enum_choices(Instrument),
+        default=None,
+        help="Prioritize matching scores and convert download immediately.",
+    )
+    p_search.add_argument(
+        "--offline", action="store_true", help="Search local corpora/indexes without network calls."
+    )
+    _add_cache_dir_arg(p_search)
+
+    p_cache = sub.add_parser("cache", help="Inspect or manage the SQLite conversion cache.")
+    cache_sub = p_cache.add_subparsers(dest="subcommand")
+    p_clist = cache_sub.add_parser("list", help="List cached MusicXML jobs stored in SQLite.")
+    p_clist.add_argument("--limit", "-n", type=_bounded_int(1), default=20, help="Max jobs to show.")
+    _add_cache_dir_arg(p_clist)
+    p_cclear = cache_sub.add_parser("clear", help="Clear cached entries in SQLite.")
+    _add_cache_dir_arg(p_cclear)
+
+    p_pdmx = sub.add_parser("pdmx", help="Manage the optional local PDMX catalog.")
+    pdmx_sub = p_pdmx.add_subparsers(dest="subcommand")
+    p_pdmx_st = pdmx_sub.add_parser("status", help="Inspect local PDMX catalog status.")
+    _add_cache_dir_arg(p_pdmx_st)
+    p_pdmx_sync = pdmx_sub.add_parser("sync", help="Sync PDMX metadata/archives into SQLite.")
+    p_pdmx_sync.add_argument("--pdmx-dir", type=Path, default=None, help="Custom PDMX directory.")
+    p_pdmx_sync.add_argument("--with-mxl", action="store_true", help="Download mxl.tar.gz.")
+    p_pdmx_sync.add_argument("--with-mid", action="store_true", help="Download mid.tar.gz.")
+    p_pdmx_sync.add_argument("--extract", action="store_true", help="Extract .tar.gz archives.")
+    p_pdmx_sync.add_argument(
+        "--no-download", action="store_true", help="Index local PDMX.csv without downloading."
+    )
+    p_pdmx_sync.add_argument(
+        "--include-license-conflicts", action="store_true", help="Include license-flagged rows."
+    )
+    p_pdmx_sync.add_argument("--force", action="store_true", help="Re-download cached archives.")
+    _add_cache_dir_arg(p_pdmx_sync)
+
+    p_gp = sub.add_parser("dadagp", help="Manage the optional local DadaGP / Guitar Pro catalog.")
+    gp_sub = p_gp.add_subparsers(dest="subcommand")
+    p_gp_st = gp_sub.add_parser("status", help="Inspect local DadaGP / Guitar Pro catalog status.")
+    _add_cache_dir_arg(p_gp_st)
+    p_gp_sync = gp_sub.add_parser(
+        "sync", help="Index local Guitar Pro files or download a Zenodo record into SQLite."
+    )
+    p_gp_sync.add_argument("--gp-dir", type=Path, default=None, help="Local Guitar Pro directory.")
+    p_gp_sync.add_argument(
+        "--zenodo-record",
+        default=None,
+        help="Optional Zenodo record ID (set ZENODO_TOKEN env var if restricted).",
+    )
+    p_gp_sync.add_argument("--force", action="store_true", help="Re-download Zenodo archives.")
+    _add_cache_dir_arg(p_gp_sync)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """CLI entrypoint."""
+    parser = _build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.command == "convert":
+        return _cmd_convert(args)
+    if args.command == "inspect":
+        return _cmd_inspect(args)
+    if args.command == "search":
+        return _cmd_search(args, parser)
+    if args.command == "cache":
+        if args.subcommand == "list":
+            return _cmd_cache_list(args)
+        if args.subcommand == "clear":
+            return _cmd_cache_clear(args)
+        parser.parse_args(["cache", "--help"])
+        return 0
+    if args.command == "pdmx":
+        if args.subcommand == "status":
+            _print_pdmx_status(get_pdmx_status(args.cache_dir))
+            return 0
+        if args.subcommand == "sync":
+            _print_pdmx_status(
+                sync_pdmx(
+                    cache_dir=args.cache_dir,
+                    pdmx_dir=args.pdmx_dir,
+                    download_csv=not args.no_download,
+                    download_mxl=args.with_mxl,
+                    download_mid=args.with_mid,
+                    extract_archives=args.extract,
+                    include_license_conflicts=args.include_license_conflicts,
+                    force=args.force,
+                )
+            )
+            return 0
+        parser.parse_args(["pdmx", "--help"])
+        return 0
+    if args.command == "dadagp":
+        if args.subcommand == "status":
+            _print_gp_status(get_gp_catalog_status(args.cache_dir))
+            return 0
+        if args.subcommand == "sync":
+            _print_gp_status(
+                sync_gp_catalog(
+                    cache_dir=args.cache_dir,
+                    gp_dir=args.gp_dir,
+                    zenodo_record=args.zenodo_record,
+                    force=args.force,
+                )
+            )
+            return 0
+        parser.parse_args(["dadagp", "--help"])
+        return 0
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

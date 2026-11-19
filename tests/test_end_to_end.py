@@ -14,7 +14,6 @@ from conftest import (
     write_gpif_file,
     write_pdf_file,
 )
-from typer.testing import CliRunner
 
 from transcribe_music import (
     GuitarStaffMode,
@@ -23,7 +22,7 @@ from transcribe_music import (
     convert_music,
     inspect_score,
 )
-from transcribe_music.cli import app
+from transcribe_music.cli import main
 from transcribe_music.storage.catalog import CatalogStore
 
 
@@ -116,65 +115,66 @@ def test_end_to_end_gp5_krn_and_pdf_fallback(
     assert len(ET.parse(pdf_out).findall(".//technical/fret")) == 8
 
 
-def test_cli_convert_inspect_and_cache_commands(tmp_path: Path) -> None:
+def test_cli_convert_inspect_and_cache_commands(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     mxl_path = tmp_path / "cli_concerto.mxl"
     make_concerto_score().write("mxl", fp=str(mxl_path))
     cache_dir = tmp_path / ".cli_cache"
-    runner = CliRunner()
 
-    insp_res = runner.invoke(app, ["inspect", str(mxl_path)])
-    assert insp_res.exit_code == 0, insp_res.output
-    assert "Solo Violoncello" in insp_res.output
+    assert main(["inspect", str(mxl_path)]) == 0
+    assert "Solo Violoncello" in capsys.readouterr().out
 
     nocache_out = tmp_path / "nocache.musicxml"
-    nc_res = runner.invoke(
-        app,
-        [
-            "convert",
-            str(mxl_path),
-            "-i",
-            "cello",
-            "--no-cache",
-            "--cache-dir",
-            str(cache_dir),
-            "-o",
-            str(nocache_out),
-        ],
+    assert (
+        main(
+            [
+                "convert",
+                str(mxl_path),
+                "-i",
+                "cello",
+                "--no-cache",
+                "--cache-dir",
+                str(cache_dir),
+                "-o",
+                str(nocache_out),
+            ]
+        )
+        == 0
     )
-    assert nc_res.exit_code == 0, nc_res.output
     assert nocache_out.exists()
     assert not (cache_dir / "catalog.sqlite").exists()
 
     conv_out = tmp_path / "cli_conv.musicxml"
-    conv_res = runner.invoke(
-        app,
-        [
-            "convert",
-            str(mxl_path),
-            "-i",
-            "cello",
-            "--part",
-            "solo",
-            "--cache-dir",
-            str(cache_dir),
-            "-o",
-            str(conv_out),
-        ],
+    assert (
+        main(
+            [
+                "convert",
+                str(mxl_path),
+                "-i",
+                "cello",
+                "--part",
+                "solo",
+                "--cache-dir",
+                str(cache_dir),
+                "-o",
+                str(conv_out),
+            ]
+        )
+        == 0
     )
-    assert conv_res.exit_code == 0, conv_res.output
 
-    list_res = runner.invoke(app, ["cache", "list", "--cache-dir", str(cache_dir)])
-    assert list_res.exit_code == 0, list_res.output
-    assert "cello" in list_res.output
+    capsys.readouterr()
+    assert main(["cache", "list", "--cache-dir", str(cache_dir)]) == 0
+    assert "cello" in capsys.readouterr().out
     assert len(CatalogStore(cache_dir).list_recent_jobs()) == 1
 
-    clear_res = runner.invoke(app, ["cache", "clear", "--cache-dir", str(cache_dir)])
-    assert clear_res.exit_code == 0, clear_res.output
-    assert "Cleared 1 job records" in clear_res.output
+    assert main(["cache", "clear", "--cache-dir", str(cache_dir)]) == 0
+    assert "Cleared 1 job records" in capsys.readouterr().out
 
 
 def test_end_to_end_guitar_staff_modes_gpif_ascii_tab_and_cli(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # 1. GP5 with Drop-D tuning and Capo 2 exported in notation, tab, and both modes
     gp5_path = write_gp5_file(
@@ -251,26 +251,25 @@ def test_end_to_end_guitar_staff_modes_gpif_ascii_tab_and_cli(
     gp_path = write_gpif_file(tmp_path / "lead.gp")
     tab_path = write_ascii_tab_file(tmp_path / "riff.tab")
 
-    runner = CliRunner()
-    insp_res = runner.invoke(app, ["inspect", str(gp_path)])
-    assert insp_res.exit_code == 0, insp_res.output
-    assert "D2-A2-D3-G3-B3-E4" in insp_res.output
+    assert main(["inspect", str(gp_path)]) == 0
+    assert "D2-A2-D3-G3-B3-E4" in capsys.readouterr().out
 
     cli_both = tmp_path / "cli_both.musicxml"
-    conv_res = runner.invoke(
-        app,
-        [
-            "convert",
-            str(tab_path),
-            "-i",
-            "guitar",
-            "--guitar-staff",
-            "both",
-            "--recompute-tab",
-            "--no-cache",
-            "-o",
-            str(cli_both),
-        ],
+    assert (
+        main(
+            [
+                "convert",
+                str(tab_path),
+                "-i",
+                "guitar",
+                "--guitar-staff",
+                "both",
+                "--recompute-tab",
+                "--no-cache",
+                "-o",
+                str(cli_both),
+            ]
+        )
+        == 0
     )
-    assert conv_res.exit_code == 0, conv_res.output
     assert ET.parse(cli_both).findtext(".//attributes/staves") == "2"
