@@ -90,7 +90,7 @@ def _annotate_single_part(part: music21.stream.Part, side: str) -> None:
             return 0.0 if prev.fingers == cur.fingers else 0.4
 
         dir_dx = dx * sign
-        df = (cur_f - prev_f) * sign
+        df = cur_f - prev_f
         # Thumb-under or finger-over crossing in scale motion
         if len(prev.fingers) == 1 and len(cur.fingers) == 1:
             pf, cf = prev.fingers[0], cur.fingers[0]

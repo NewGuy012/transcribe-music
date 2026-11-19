@@ -203,6 +203,53 @@ def test_piano_fingering_notes_and_chords(tmp_path: Path) -> None:
     assert len(fingers) == metrics.note_count
     assert all(f in {"1", "2", "3", "4", "5"} for f in fingers)
 
+    # Left-hand ascending scale decreases 5->1, and bass-to-chord ostinato uses 5 on bass / 3-1 above
+    def _run_lh(elements: list[music21.note.NotRest]) -> list[list[int]]:
+        s_lh = music21.stream.Score()
+        rh = music21.stream.Part(id="RH")
+        rh.append(music21.note.Note("C5", quarterLength=4.0))
+        rh.makeMeasures(inPlace=True)
+        lh = music21.stream.Part(id="LH")
+        for el in elements:
+            lh.append(el)
+        lh.makeMeasures(inPlace=True)
+        s_lh.insert(0, rh)
+        s_lh.insert(0, lh)
+        apply_fingering(s_lh, Instrument.PIANO)
+        return [
+            [
+                int(a.fingerNumber)
+                for a in el.articulations
+                if isinstance(a, music21.articulations.Fingering)
+            ]
+            for el in s_lh.parts[1].recurse().notes
+        ]
+
+    assert _run_lh([music21.note.Note(p, quarterLength=1.0) for p in ("C3", "D3", "E3", "F3", "G3")]) == [
+        [5],
+        [4],
+        [3],
+        [2],
+        [1],
+    ]
+    assert _run_lh([music21.note.Note(p, quarterLength=1.0) for p in ("G3", "F3", "E3", "D3", "C3")]) == [
+        [1],
+        [2],
+        [3],
+        [4],
+        [5],
+    ]
+    ostinato_fings = _run_lh(
+        [
+            music21.note.Note("F3", quarterLength=0.5),
+            music21.chord.Chord(["C4", "F4"], quarterLength=0.5),
+            music21.note.Note("F3", quarterLength=0.5),
+            music21.chord.Chord(["C4", "F4"], quarterLength=0.5),
+        ]
+    )
+    assert ostinato_fings[0] == [5]
+    assert ostinato_fings[1][0] > ostinato_fings[1][1] and ostinato_fings[1][1] == 1
+
 
 def test_guitar_fingering_tab_locked_tuning_and_chords(tmp_path: Path) -> None:
     s = music21.stream.Score()
