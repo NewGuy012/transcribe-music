@@ -303,6 +303,27 @@ def _redistribute_chord_technical_tags(root: ET.Element) -> bool:
     return changed
 
 
+def _normalize_power_chord_harmonies(root: ET.Element) -> bool:
+    """Convert music21's `<kind>none</kind>` + `<degree>5</degree>` into standard `<kind text='5'>power</kind>`."""
+    changed = False
+    for harmony in root.findall(".//harmony"):
+        kind_el = harmony.find("kind")
+        degrees = harmony.findall("degree")
+        if kind_el is None or kind_el.text != "none" or len(degrees) != 1:
+            continue
+        deg = degrees[0]
+        if (
+            deg.findtext("degree-value") == "5"
+            and (deg.findtext("degree-alter") or "0") == "0"
+            and deg.findtext("degree-type") == "add"
+        ):
+            kind_el.text = "power"
+            kind_el.set("text", "5")
+            harmony.remove(deg)
+            changed = True
+    return changed
+
+
 _ATTR_TAG_ORDER: dict[str, int] = {
     "divisions": 0,
     "key": 1,
@@ -504,12 +525,28 @@ def _apply_guitar_staff_layout(
     for measure in measures:
         orig_children = list(measure)
         timeline_elems: list[ET.Element] = []
+        prefix_elems: list[ET.Element] = []
+        prefix_delta = 0
+        seen_note = False
         staff1_cursor = 0
         for child in orig_children:
-            if child.tag in {"note", "forward", "backup"}:
+            if child.tag not in {"note", "forward", "backup"}:
+                continue
+            delta = _timeline_delta(child)
+            if not seen_note:
+                if child.tag == "note":
+                    seen_note = True
+                    if prefix_delta != 0:
+                        timeline_elems.extend(prefix_elems)
+                    timeline_elems.append(child)
+                else:
+                    prefix_elems.append(child)
+                    if delta is not None:
+                        prefix_delta += delta
+            else:
                 timeline_elems.append(child)
-                if (delta := _timeline_delta(child)) is not None:
-                    staff1_cursor += delta
+            if delta is not None:
+                staff1_cursor += delta
 
         if not timeline_elems:
             continue
@@ -616,6 +653,7 @@ def _postprocess_and_validate_xml(
         raise ValueError(f"Invalid MusicXML root element: {root.tag}")
 
     changed = _redistribute_chord_technical_tags(root)
+    changed = _normalize_power_chord_harmonies(root) or changed
     if guitar_meta is not None:
         changed = _apply_guitar_staff_layout(root, guitar_staff, guitar_meta) or changed
     if changed:

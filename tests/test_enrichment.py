@@ -12,7 +12,7 @@ from conftest import make_progression_score, note_tab_tags
 from transcribe_music.enrich.chords import annotate_chords
 from transcribe_music.enrich.fingering import apply_fingering
 from transcribe_music.export.musicxml import export_musicxml
-from transcribe_music.models import Instrument
+from transcribe_music.models import GuitarStaffMode, Instrument
 from transcribe_music.score_utils import GuitarTrackMeta, set_guitar_track_meta
 
 
@@ -157,6 +157,35 @@ def test_guitar_fingering_tab_locked_tuning_and_chords(tmp_path: Path) -> None:
         "Dsus4",
         "Cadd9",
     ]
+    gc_xml = tmp_path / "guitar_chords.musicxml"
+    _, gc_warnings = export_musicxml(s_gc, gc_xml, Instrument.GUITAR)
+    assert not gc_warnings
+    gc_harmonies = ET.parse(gc_xml).findall(".//harmony")
+    assert gc_harmonies[0].findtext("kind") == "power"
+    kind0 = gc_harmonies[0].find("kind")
+    assert kind0 is not None and kind0.attrib.get("text") == "5"
+
+    # Multi-voice measure with mid-bar harmony should not clone harmony cursor forwards to staff 2
+    s_mv = music21.stream.Score()
+    p_mv = music21.stream.Part()
+    m_mv = music21.stream.Measure(number=1)
+    m_mv.insert(0.0, music21.meter.TimeSignature("4/4"))
+    m_mv.insert(0.0, music21.harmony.ChordSymbol("Am"))
+    m_mv.insert(2.0, music21.harmony.ChordSymbol("E7"))
+    v1 = music21.stream.Voice(id="1")
+    v1.insert(0.0, music21.note.Note("C5", quarterLength=4.0))
+    v2 = music21.stream.Voice(id="2")
+    v2.insert(0.0, music21.note.Note("A3", quarterLength=4.0))
+    m_mv.insert(0.0, v1)
+    m_mv.insert(0.0, v2)
+    p_mv.append(m_mv)
+    s_mv.insert(0, p_mv)
+    mv_xml = tmp_path / "mv_both.musicxml"
+    _, mv_warnings = export_musicxml(
+        s_mv, mv_xml, Instrument.GUITAR, guitar_staff=GuitarStaffMode.BOTH
+    )
+    assert not mv_warnings
+    assert len(ET.parse(mv_xml).findall(".//measure[@number='1']/forward")) == 1
 
 
 def test_violin_and_cello_fingering_including_thumb_position(tmp_path: Path) -> None:
