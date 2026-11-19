@@ -10,28 +10,57 @@ from typing import Literal
 
 import music21
 
-from transcribe_music.ingest.pdf import render_pdf_pages
 from transcribe_music.models import Instrument, OmrBackend
-from transcribe_music.score_utils import coerce_to_score, iter_playable_notes
+from transcribe_music.score_utils import coerce_to_score, find_executable, iter_playable_notes
+
+
+def render_pdf_pages(
+    pdf_path: Path,
+    out_dir: Path,
+    dpi: int = 300,
+) -> list[Path]:
+    """Render every page of a sheet music PDF into opaque RGB PNGs for OMR."""
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    if pdf_path.suffix.lower() != ".pdf":
+        raise ValueError(f"Sheet music input must be a .pdf file, got: {pdf_path.suffix}")
+
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF OMR fallback requires the optional 'pdf' extra (`pymupdf`). "
+            "Install with: uv sync --extra pdf"
+        ) from exc
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    matrix = pymupdf.Matrix(dpi / 72.0, dpi / 72.0)
+    image_paths: list[Path] = []
+
+    with pymupdf.open(str(pdf_path)) as doc:
+        if len(doc) == 0:
+            raise ValueError(f"PDF has zero pages: {pdf_path}")
+        for idx, page in enumerate(doc, start=1):
+            pix = page.get_pixmap(matrix=matrix, colorspace=pymupdf.csRGB, alpha=False)
+            page_path = out_dir / f"page_{idx:03d}.png"
+            pix.save(str(page_path))
+            image_paths.append(page_path)
+
+    return image_paths
 
 
 def _find_audiveris_executable() -> str | None:
-    """Locate an installed Audiveris CLI binary if available on the host."""
-    for name in ("audiveris", "Audiveris"):
-        found = shutil.which(name)
-        if found:
-            return found
-
-    candidates = (
-        Path("/Applications/Audiveris.app/Contents/MacOS/Audiveris"),
-        Path.home() / "Applications" / "Audiveris.app" / "Contents" / "MacOS" / "Audiveris",
-        Path("/opt/homebrew/bin/audiveris"),
-        Path("/usr/local/bin/audiveris"),
+    return find_executable(
+        ("audiveris", "Audiveris"),
+        (
+            Path("/Applications/Audiveris.app/Contents/MacOS/Audiveris"),
+            Path.home() / "Applications" / "Audiveris.app" / "Contents" / "MacOS" / "Audiveris",
+            Path("/opt/homebrew/bin/audiveris"),
+            Path("/usr/local/bin/audiveris"),
+        ),
     )
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return None
 
 
 def resolve_omr_backend(preferred: OmrBackend | str = OmrBackend.AUTO) -> Literal["audiveris", "homr"]:
@@ -50,7 +79,6 @@ def resolve_omr_backend(preferred: OmrBackend | str = OmrBackend.AUTO) -> Litera
 
 
 def _run_audiveris_batch(pdf_path: Path, work_dir: Path) -> list[Path]:
-    """Run Audiveris headless batch OMR directly on a PDF and return exported MusicXML files."""
     audiveris_bin = _find_audiveris_executable()
     if audiveris_bin is None:
         raise RuntimeError(
@@ -72,27 +100,16 @@ def _run_audiveris_batch(pdf_path: Path, work_dir: Path) -> list[Path]:
         "--",
         str(Path(pdf_path).resolve()),
     ]
-    proc = subprocess.run(
-        cmd,
-        check=False,
-        cwd=str(out_dir),
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
+    proc = subprocess.run(cmd, check=False, cwd=str(out_dir), capture_output=True, text=True, timeout=900)
 
-    mxl_files = sorted(out_dir.rglob("*.mxl"))
-    if mxl_files:
-        return mxl_files
-    musicxml_files = sorted(out_dir.rglob("*.musicxml"))
-    if musicxml_files:
-        return musicxml_files
-    xml_files = sorted(
+    for ext in ("*.mxl", "*.musicxml"):
+        if files := sorted(out_dir.rglob(ext)):
+            return files
+    if xml_files := sorted(
         p
         for p in out_dir.rglob("*.xml")
-        if p.name.lower() not in {"book.xml"} and not p.name.lower().startswith("sheet")
-    )
-    if xml_files:
+        if p.name.lower() != "book.xml" and not p.name.lower().startswith("sheet")
+    ):
         return xml_files
 
     detail = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
@@ -100,14 +117,12 @@ def _run_audiveris_batch(pdf_path: Path, work_dir: Path) -> list[Path]:
 
 
 def _build_homr_command(image_paths: list[Path]) -> list[str]:
-    """Build a single batched CLI invocation for homr across one or more rendered pages."""
     resolved = [str(Path(p).resolve()) for p in image_paths]
-    homr_bin = shutil.which("homr")
-    if homr_bin:
+    if homr_bin := shutil.which("homr"):
         return [homr_bin, *resolved]
 
-    uvx_bin = shutil.which("uvx") or "/opt/homebrew/bin/uvx"
-    if not Path(uvx_bin).exists() and shutil.which("uvx") is None:
+    uvx_bin = find_executable(("uvx",), (Path("/opt/homebrew/bin/uvx"),))
+    if uvx_bin is None:
         raise RuntimeError(
             "PDF OMR fallback requires 'homr' or 'uvx' to run homr[cpu] in an isolated environment."
         )
@@ -115,7 +130,6 @@ def _build_homr_command(image_paths: list[Path]) -> list[str]:
 
 
 def _run_homr_batch(image_paths: list[Path], work_dir: Path) -> list[Path]:
-    """Run homr OMR once across all PDF pages and return generated MusicXML path(s)."""
     if not image_paths:
         raise ValueError("No page images supplied to homr OMR.")
 
@@ -124,41 +138,35 @@ def _run_homr_batch(image_paths: list[Path], work_dir: Path) -> list[Path]:
         stale.unlink(missing_ok=True)
 
     cmd = _build_homr_command(image_paths)
-    timeout_sec = max(300, 120 * len(image_paths))
     proc = subprocess.run(
-        cmd, check=False, cwd=str(work_dir), capture_output=True, text=True, timeout=timeout_sec
+        cmd,
+        check=False,
+        cwd=str(work_dir),
+        capture_output=True,
+        text=True,
+        timeout=max(300, 120 * len(image_paths)),
     )
     if proc.returncode != 0:
         raise RuntimeError(f"homr OMR failed: {proc.stderr.strip() or proc.stdout.strip()}")
 
     first_stem = image_paths[0].stem
-    merged_candidates = [
-        work_dir / f"merged_{first_stem}.musicxml",
-        work_dir / f"merged_{first_stem}.xml",
-    ]
-    for merged in merged_candidates:
-        if merged.exists():
+    for suffix in (".musicxml", ".xml"):
+        if (merged := work_dir / f"merged_{first_stem}{suffix}").exists():
             return [merged]
 
     per_page: list[Path] = []
     for img in image_paths:
-        direct = img.with_suffix(".musicxml")
-        if direct.exists():
+        if (direct := img.with_suffix(".musicxml")).exists():
             per_page.append(direct)
-            continue
-        matches = sorted(work_dir.glob(f"{img.stem}*.musicxml")) + sorted(
+        elif matches := sorted(work_dir.glob(f"{img.stem}*.musicxml")) + sorted(
             work_dir.glob(f"{img.stem}*.xml")
-        )
-        if matches:
+        ):
             per_page.append(matches[0])
-
     if per_page:
         return per_page
 
-    any_xml = sorted(work_dir.glob("*.musicxml")) + sorted(work_dir.glob("*.xml"))
-    if any_xml:
+    if any_xml := sorted(work_dir.glob("*.musicxml")) + sorted(work_dir.glob("*.xml")):
         return any_xml
-
     raise RuntimeError(f"homr produced no MusicXML output in {work_dir}")
 
 
@@ -172,37 +180,31 @@ def stitch_musicxml_pages(
         raise ValueError("No page MusicXML files to stitch")
 
     if len(page_xml_paths) == 1:
-        parsed = music21.converter.parse(str(page_xml_paths[0]))
-        score, _ = coerce_to_score(parsed, title)
+        score, _ = coerce_to_score(music21.converter.parse(str(page_xml_paths[0])), title)
         return score
 
     merged_score = music21.stream.Score()
     merged_score.metadata = music21.metadata.Metadata(title=title or f"{instrument.value.title()} Score")
     merged_parts: list[music21.stream.Part] = []
-
     next_measure_num = 1
+
     for page_idx, xml_path in enumerate(page_xml_paths):
         parsed = music21.converter.parse(str(xml_path))
         page_parts = list(parsed.parts) if isinstance(parsed, music21.stream.Score) else [parsed]
 
-        if not merged_parts:
-            for p_idx in range(len(page_parts)):
-                merged_parts.append(music21.stream.Part(id=f"P{p_idx + 1}"))
+        while len(merged_parts) < len(page_parts):
+            merged_parts.append(music21.stream.Part(id=f"P{len(merged_parts) + 1}"))
 
         page_measure_count = 0
         for p_idx, src_part in enumerate(page_parts):
-            if p_idx >= len(merged_parts):
-                merged_parts.append(music21.stream.Part(id=f"P{p_idx + 1}"))
             dst_part = merged_parts[p_idx]
-
             measures = list(src_part.getElementsByClass(music21.stream.Measure))
             page_measure_count = max(page_measure_count, len(measures))
             for m_offset, m in enumerate(measures):
                 m_copy = copy.deepcopy(m)
                 m_copy.number = next_measure_num + m_offset
-                # Strip redundant clefs on subsequent page boundaries
                 if page_idx > 0 and m_offset == 0:
-                    for redundant in list(m_copy.getElementsByClass((music21.clef.Clef,))):
+                    for redundant in list(m_copy.getElementsByClass(music21.clef.Clef)):
                         m_copy.remove(redundant)
                 dst_part.append(m_copy)
 
@@ -216,17 +218,13 @@ def stitch_musicxml_pages(
 def _is_omr_tab_part(part: music21.stream.Part) -> bool:
     if any(isinstance(c, music21.clef.TabClef) for c in part.recurse().getElementsByClass(music21.clef.Clef)):
         return True
-    for sl in part.recurse().getElementsByClass(music21.layout.StaffLayout):
-        if getattr(sl, "staffLines", None) == 6:
-            return True
-    return False
+    return any(
+        getattr(sl, "staffLines", None) == 6
+        for sl in part.recurse().getElementsByClass(music21.layout.StaffLayout)
+    )
 
 
-def _filter_guitar_omr_tab_staves(
-    score: music21.stream.Score,
-    warnings: list[str],
-) -> None:
-    """Drop noisy OMR'd 6-line TAB staves when a paired standard notation staff exists."""
+def _filter_guitar_omr_tab_staves(score: music21.stream.Score, warnings: list[str]) -> None:
     parts = list(score.parts)
     if not parts:
         return
@@ -244,6 +242,18 @@ def _filter_guitar_omr_tab_staves(
         )
 
 
+def _finalize_omr_score(
+    xml_paths: list[Path],
+    instrument: Instrument,
+    title: str,
+    warnings: list[str],
+) -> music21.stream.Score:
+    score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=title)
+    if instrument == Instrument.GUITAR:
+        _filter_guitar_omr_tab_staves(score, warnings)
+    return score
+
+
 def run_pdf_omr(
     pdf_path: Path,
     work_dir: Path,
@@ -259,10 +269,7 @@ def run_pdf_omr(
     if selected == "audiveris":
         try:
             xml_paths = _run_audiveris_batch(pdf_path, work_dir)
-            score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
-            if instrument == Instrument.GUITAR:
-                _filter_guitar_omr_tab_staves(score, warnings)
-            return score, "audiveris", warnings
+            return _finalize_omr_score(xml_paths, instrument, pdf_path.stem, warnings), "audiveris", warnings
         except Exception as exc:
             if pref == OmrBackend.AUDIVERIS:
                 raise
@@ -271,7 +278,4 @@ def run_pdf_omr(
     pages_dir = Path(work_dir) / "pdf_pages"
     image_paths = render_pdf_pages(pdf_path, pages_dir, dpi=dpi)
     xml_paths = _run_homr_batch(image_paths, pages_dir)
-    score = stitch_musicxml_pages(xml_paths, instrument=instrument, title=pdf_path.stem)
-    if instrument == Instrument.GUITAR:
-        _filter_guitar_omr_tab_staves(score, warnings)
-    return score, "homr", warnings
+    return _finalize_omr_score(xml_paths, instrument, pdf_path.stem, warnings), "homr", warnings

@@ -72,7 +72,7 @@ def _compute_symbolic_chroma_by_window(
 
     try:
         sounding_score = score.toSoundingPitch()
-    except Exception:  # noqa: BLE001 — fallback when transposition metadata is incomplete
+    except (music21.exceptions21.Music21Exception, ValueError, TypeError):
         sounding_score = score
 
     flat = sounding_score.flatten()
@@ -110,7 +110,7 @@ def _compute_symbolic_chroma_by_window(
 
 def _viterbi_chords(
     chroma_windows: list[list[float]],
-    bass_pcs: list[int | None] | None = None,
+    bass_pcs: list[int | None],
     switch_penalty: float = 0.14,
     templates: list[_ChordTemplate] = _BASE_TEMPLATES,
 ) -> list[str | None]:
@@ -122,15 +122,14 @@ def _viterbi_chords(
     energies: list[float] = []
     for t, chroma in enumerate(chroma_windows):
         energies.append(math.hypot(*chroma))
-        bass = bass_pcs[t] if bass_pcs is not None else None
+        bass = bass_pcs[t]
         row: list[float] = []
         for tmpl in templates:
             sim = sum(c * tv for c, tv in zip(chroma, tmpl.vector, strict=True))
-            if bass_pcs is not None:
-                if bass == tmpl.root_pc:
-                    sim += 0.12
-                if chroma[tmpl.root_pc] < 1e-3:
-                    sim -= 0.20
+            if bass == tmpl.root_pc:
+                sim += 0.12
+            if chroma[tmpl.root_pc] < 1e-3:
+                sim -= 0.20
             if tmpl.suffix == "5" and (
                 chroma[(tmpl.root_pc + 3) % 12] >= 0.15 or chroma[(tmpl.root_pc + 4) % 12] >= 0.15
             ):
@@ -203,6 +202,8 @@ def annotate_chords(
 
     last_symbol: str | None = None
     placed_rest_measures: set[int] = set()
+    m_idx = 0
+    n_measures = len(measures)
     for w_idx, label in enumerate(labels):
         if label is None or label == last_symbol:
             continue
@@ -214,22 +215,21 @@ def annotate_chords(
             continue
 
         if measures:
-            placed = False
-            for m in measures:
-                m_start = float(m.offset)
-                m_end = m_start + float(m.duration.quarterLength)
-                if m_start - 1e-6 <= beat_offset < m_end - 1e-6:
-                    if not measure_has_notes[id(m)]:
-                        if id(m) in placed_rest_measures:
-                            placed = True
-                            break
+            while (
+                m_idx < n_measures
+                and float(measures[m_idx].offset) + float(measures[m_idx].duration.quarterLength) - 1e-6
+                <= beat_offset
+            ):
+                m_idx += 1
+            if m_idx < n_measures and float(measures[m_idx].offset) - 1e-6 <= beat_offset:
+                m = measures[m_idx]
+                if not measure_has_notes[id(m)]:
+                    if id(m) not in placed_rest_measures:
                         m.insert(0.0, cs)
                         placed_rest_measures.add(id(m))
-                    else:
-                        m.insert(max(0.0, beat_offset - m_start), cs)
-                    placed = True
-                    break
-            if not placed:
+                else:
+                    m.insert(max(0.0, beat_offset - float(m.offset)), cs)
+            else:
                 target_part.insert(beat_offset, cs)
         else:
             target_part.insert(beat_offset, cs)

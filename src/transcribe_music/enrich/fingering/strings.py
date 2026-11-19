@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
+from itertools import islice, product
 
 import music21
 
-from transcribe_music.enrich.fingering._shared import (
+from transcribe_music.enrich.fingering.viterbi import (
     apply_string_articulations,
     pick_unique_string_candidates,
+    solve_viterbi,
 )
-from transcribe_music.enrich.fingering.viterbi import solve_viterbi
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 from transcribe_music.score_utils import element_midis, prepare_playable_notes
 
@@ -82,7 +82,7 @@ def _chord_poses(
 
     per_note = [_single_candidates(m, open_strings, is_cello) for m in midis]
     valid: list[_StringPose] = []
-    for combo in product(*per_note):
+    for combo in islice(product(*per_note), 4096):
         if len({c[0] for c in combo}) != len(combo):
             continue
         positions = [c[3] for c in combo]

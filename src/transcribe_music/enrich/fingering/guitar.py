@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
+from itertools import islice, product
 
 import music21
 
-from transcribe_music.enrich.fingering._shared import (
+from transcribe_music.enrich.fingering.viterbi import (
     apply_string_articulations,
     pick_unique_string_candidates,
+    solve_viterbi,
 )
-from transcribe_music.enrich.fingering.viterbi import solve_viterbi
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 from transcribe_music.score_utils import (
     element_midis,
@@ -45,18 +45,37 @@ def _single_note_candidates(
     return out
 
 
+def _poses_for_placement(s_num: int, fret: int) -> list[_GuitarPose]:
+    if fret == 0:
+        return [_GuitarPose(notes_pose=((s_num, 0, 0),), anchor_fret=1.0, span=0)]
+    return [
+        _GuitarPose(
+            notes_pose=((s_num, fret, finger),),
+            anchor_fret=max(1.0, float(fret - (finger - 1))),
+            span=0,
+        )
+        for finger in (1, 2, 3, 4)
+    ]
+
+
+def _pose_from_note_tuples(tuples: list[tuple[int, int, int]]) -> _GuitarPose:
+    frets = [f for _, f, _ in tuples if f > 0]
+    return _GuitarPose(
+        notes_pose=tuple(tuples),
+        anchor_fret=float(min(frets)) if frets else 1.0,
+        span=(max(frets) - min(frets)) if frets else 0,
+    )
+
+
 def _single_note_poses(
     sounding_midi: int,
     effective_open_midi: tuple[int, ...],
 ) -> list[_GuitarPose]:
-    poses: list[_GuitarPose] = []
-    for s_num, fret in _single_note_candidates(sounding_midi, effective_open_midi):
-        if fret == 0:
-            poses.append(_GuitarPose(notes_pose=((s_num, 0, 0),), anchor_fret=1.0, span=0))
-        else:
-            for finger in (1, 2, 3, 4):
-                anchor = max(1.0, float(fret - (finger - 1)))
-                poses.append(_GuitarPose(notes_pose=((s_num, fret, finger),), anchor_fret=anchor, span=0))
+    poses = [
+        pose
+        for s_num, fret in _single_note_candidates(sounding_midi, effective_open_midi)
+        for pose in _poses_for_placement(s_num, fret)
+    ]
     if not poses:
         clamped = min(
             max(sounding_midi, min(effective_open_midi)),
@@ -102,20 +121,14 @@ def _chord_poses(
     """Generate playable guitar chord voicings (distinct strings, <= 4 fret span)."""
     per_note_opts = [_single_note_candidates(m, effective_open_midi) for m in sounding_midis]
     if any(not opts for opts in per_note_opts):
-        fallback = [
-            _single_note_poses(m, effective_open_midi)[0].notes_pose[0] for m in sounding_midis
-        ]
-        frets = [f for _, f, _ in fallback if f > 0]
         return [
-            _GuitarPose(
-                notes_pose=tuple(fallback),
-                anchor_fret=float(min(frets)) if frets else 1.0,
-                span=(max(frets) - min(frets)) if frets else 0,
+            _pose_from_note_tuples(
+                [_single_note_poses(m, effective_open_midi)[0].notes_pose[0] for m in sounding_midis]
             )
         ]
 
     valid: list[_GuitarPose] = []
-    for combo in product(*per_note_opts):
+    for combo in islice(product(*per_note_opts), 4096):
         strings = [s for s, _ in combo]
         if len(set(strings)) != len(strings):
             continue
@@ -128,15 +141,7 @@ def _chord_poses(
 
     if not valid:
         picked = pick_unique_string_candidates(per_note_opts, lambda c: c[0])
-        fallback_list = [(s, f, 0 if f == 0 else 1) for s, f in picked]
-        frets = [f for _, f, _ in fallback_list if f > 0]
-        return [
-            _GuitarPose(
-                notes_pose=tuple(fallback_list),
-                anchor_fret=float(min(frets)) if frets else 1.0,
-                span=(max(frets) - min(frets)) if frets else 0,
-            )
-        ]
+        return [_pose_from_note_tuples([(s, f, 0 if f == 0 else 1) for s, f in picked])]
 
     valid.sort(key=lambda p: (p.span, p.anchor_fret))
     return valid[:12]
@@ -164,17 +169,7 @@ def _extract_locked_tab_poses(
         return None
 
     if isinstance(el, music21.note.Note):
-        s_num, fret = pairs[0]
-        if fret == 0:
-            return [_GuitarPose(notes_pose=((s_num, 0, 0),), anchor_fret=1.0, span=0)]
-        return [
-            _GuitarPose(
-                notes_pose=((s_num, fret, finger),),
-                anchor_fret=max(1.0, float(fret - (finger - 1))),
-                span=0,
-            )
-            for finger in (1, 2, 3, 4)
-        ]
+        return _poses_for_placement(*pairs[0])
     return [_assign_chord_fingers(pairs)]
 
 
@@ -225,12 +220,13 @@ def annotate_guitar_fingering(
                 _chord_poses([m + transpose for m in element_midis(el)], effective_open)
             )
 
-    prepare_playable_notes(
-        part,
+    drop_types = (
         music21.articulations.Fingering,
         music21.articulations.StringIndication,
         music21.articulations.FretIndication,
     )
+    for el in elements:
+        el.articulations = [a for a in el.articulations if not isinstance(a, drop_types)]
 
     def _unary(_step: int, pose: _GuitarPose) -> float:
         cost = 0.0

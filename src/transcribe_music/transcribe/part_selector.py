@@ -375,9 +375,7 @@ def _adapt_guitar_part(
         part,
         music21.clef.Treble8vbClef(),
         force_replace=(
-            is_sounding_pitch_source
-            or isinstance(first_clef, music21.clef.BassClef)
-            or not isinstance(first_clef, music21.clef.Treble8vbClef)
+            is_sounding_pitch_source or not isinstance(first_clef, music21.clef.Treble8vbClef)
         ),
     )
     part.atSoundingPitch = False

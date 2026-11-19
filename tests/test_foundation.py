@@ -11,7 +11,6 @@ import pytest
 from conftest import write_pdf_file
 
 from transcribe_music.export.musicxml import _postprocess_and_validate_xml, export_musicxml
-from transcribe_music.ingest.pdf import render_pdf_pages
 from transcribe_music.models import (
     GuitarStaffMode,
     Instrument,
@@ -26,6 +25,7 @@ from transcribe_music.score_utils import (
     set_guitar_track_meta,
 )
 from transcribe_music.storage.catalog import CatalogStore, compute_job_hash
+from transcribe_music.transcribe.omr_pdf import render_pdf_pages
 
 
 def test_export_musicxml_baseline_and_duckdb_catalog(tmp_path: Path) -> None:

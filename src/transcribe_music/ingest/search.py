@@ -135,7 +135,7 @@ def _format_composer_name(raw: str) -> str:
 def _safe_filename(name: str, fallback_ext: str = ".musicxml") -> str:
     base = Path(name).name.strip() or f"score{fallback_ext}"
     cleaned = _SAFE_NAME_RE.sub("_", base).strip("._") or f"score{fallback_ext}"
-    if Path(cleaned).suffix.lower() not in (SUPPORTED_SEARCH_EXTENSIONS | _GUITAR_TAB_EXTENSIONS):
+    if Path(cleaned).suffix.lower() not in SUPPORTED_SEARCH_EXTENSIONS:
         cleaned = f"{cleaned}{fallback_ext}"
     return cleaned
 
@@ -190,55 +190,60 @@ def _load_or_fetch_index(
     return records
 
 
-def _fetch_openscore_orchestra_index() -> list[dict[str, Any]]:
+def _fetch_github_records(
+    tree_url: str,
+    mapper: Callable[[str], dict[str, Any] | None],
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    for node in _fetch_github_tree(_OPENSCORE_ORCH_TREE_URL):
+    for node in _fetch_github_tree(tree_url):
         rel_path = str(node.get("path", ""))
+        if rec := mapper(rel_path):
+            records.append(rec)
+    return records
+
+
+def _fetch_openscore_orchestra_index() -> list[dict[str, Any]]:
+    def _map(rel_path: str) -> dict[str, Any] | None:
         if not rel_path.startswith("data/") or not rel_path.lower().endswith(".mxl"):
-            continue
+            return None
         if rel_path.lower().endswith("_melody.mxl"):
-            continue
+            return None
         parts = Path(rel_path).parts
         composer = _format_composer_name(parts[1]) if len(parts) >= 3 else None
         work = parts[2].replace("_", " ").strip() if len(parts) >= 3 else Path(rel_path).stem
         movement = parts[3].replace("_", " ").strip() if len(parts) >= 5 else ""
-        records.append(
-            {
-                "title": f"{work} ({movement})" if movement else work,
-                "composer": composer,
-                "format_ext": ".mxl",
-                "source": "OpenScore Orchestra",
-                "filename": _safe_filename(Path(rel_path).name, fallback_ext=".mxl"),
-                "download_url": f"{_OPENSCORE_ORCH_RAW_PREFIX}{_encode_url_path(rel_path)}",
-            }
-        )
-    return records
+        return {
+            "title": f"{work} ({movement})" if movement else work,
+            "composer": composer,
+            "format_ext": ".mxl",
+            "source": "OpenScore Orchestra",
+            "filename": _safe_filename(Path(rel_path).name, fallback_ext=".mxl"),
+            "download_url": f"{_OPENSCORE_ORCH_RAW_PREFIX}{_encode_url_path(rel_path)}",
+        }
+
+    return _fetch_github_records(_OPENSCORE_ORCH_TREE_URL, _map)
 
 
 def _fetch_when_in_rome_index() -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for node in _fetch_github_tree(_WHEN_IN_ROME_TREE_URL):
-        rel_path = str(node.get("path", ""))
+    def _map(rel_path: str) -> dict[str, Any] | None:
         if not rel_path.startswith("Corpus/") or not rel_path.lower().endswith(".mxl"):
-            continue
+            return None
         parts = Path(rel_path).parts
         if len(parts) < 5 or parts[1] in {"Textbooks", "OpenScore-LiederCorpus"}:
-            continue
-        composer = _format_composer_name(parts[2])
+            return None
         work = parts[3].replace("_", " ").strip()
         movement = parts[4].replace("_", " ").strip() if len(parts) >= 6 else ""
-        records.append(
-            {
-                "title": f"{work} ({movement})" if movement else work,
-                "composer": composer,
-                "format_ext": ".mxl",
-                "source": "When-in-Rome",
-                "filename": _safe_filename(f"{work}_{movement or 'score'}.mxl", fallback_ext=".mxl"),
-                "edition_note": parts[1].replace("_", " ").strip(),
-                "download_url": f"{_WHEN_IN_ROME_RAW_PREFIX}{_encode_url_path(rel_path)}",
-            }
-        )
-    return records
+        return {
+            "title": f"{work} ({movement})" if movement else work,
+            "composer": _format_composer_name(parts[2]),
+            "format_ext": ".mxl",
+            "source": "When-in-Rome",
+            "filename": _safe_filename(f"{work}_{movement or 'score'}.mxl", fallback_ext=".mxl"),
+            "edition_note": parts[1].replace("_", " ").strip(),
+            "download_url": f"{_WHEN_IN_ROME_RAW_PREFIX}{_encode_url_path(rel_path)}",
+        }
+
+    return _fetch_github_records(_WHEN_IN_ROME_TREE_URL, _map)
 
 
 def _fetch_openscore_lieder_index() -> list[dict[str, Any]]:
@@ -296,12 +301,10 @@ def _fetch_openscore_sq_index() -> list[dict[str, Any]]:
 
 
 def _fetch_gp_classical_guitar_index() -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for node in _fetch_github_tree(_GP_CLASSICAL_GUITAR_TREE_URL):
-        rel_path = str(node.get("path", ""))
+    def _map(rel_path: str) -> dict[str, Any] | None:
         ext = Path(rel_path).suffix.lower()
-        if ext not in (SUPPORTED_SEARCH_EXTENSIONS | _GUITAR_TAB_EXTENSIONS):
-            continue
+        if ext not in SUPPORTED_SEARCH_EXTENSIONS:
+            return None
         parts = Path(rel_path).parts
         clean_dirs = [
             p.replace("_", " ").strip()
@@ -311,20 +314,17 @@ def _fetch_gp_classical_guitar_index() -> list[dict[str, Any]]:
         composer = _format_composer_name(clean_dirs[0]) if clean_dirs else None
         stem_title = Path(rel_path).stem.replace("_", " ").strip()
         work_group = " - ".join(clean_dirs[1:]) if len(clean_dirs) > 1 else ""
-        title = f"{stem_title} ({work_group})" if work_group else stem_title
-        note = "Classical Guitar MIDI" if ext in {".mid", ".midi"} else "Classical Guitar TAB"
-        records.append(
-            {
-                "title": title,
-                "composer": composer,
-                "format_ext": ext,
-                "source": "GP Classical Guitar",
-                "filename": _safe_filename(Path(rel_path).name, fallback_ext=ext),
-                "edition_note": note,
-                "download_url": f"{_GP_CLASSICAL_GUITAR_RAW_PREFIX}{_encode_url_path(rel_path)}",
-            }
-        )
-    return records
+        return {
+            "title": f"{stem_title} ({work_group})" if work_group else stem_title,
+            "composer": composer,
+            "format_ext": ext,
+            "source": "GP Classical Guitar",
+            "filename": _safe_filename(Path(rel_path).name, fallback_ext=ext),
+            "edition_note": "Classical Guitar MIDI" if ext in {".mid", ".midi"} else "Classical Guitar TAB",
+            "download_url": f"{_GP_CLASSICAL_GUITAR_RAW_PREFIX}{_encode_url_path(rel_path)}",
+        }
+
+    return _fetch_github_records(_GP_CLASSICAL_GUITAR_TREE_URL, _map)
 
 
 def _search_music21_corpus(query: str) -> list[dict[str, Any]]:
@@ -337,7 +337,7 @@ def _search_music21_corpus(query: str) -> list[dict[str, Any]]:
     for tok in sorted(tokens, key=len, reverse=True)[:2]:
         try:
             entries = music21.corpus.search(tok)
-        except Exception as exc:  # noqa: BLE001 — non-fatal local corpus index fallback
+        except (music21.exceptions21.Music21Exception, OSError, ValueError) as exc:
             logger.debug("music21 corpus search failed for %r: %s", tok, exc)
             continue
         for entry in entries:
@@ -370,6 +370,15 @@ def _search_music21_corpus(query: str) -> list[dict[str, Any]]:
                 }
             )
     return records
+
+
+def _is_guitar_intent(q_tokens: list[str], instrument: Instrument | None) -> bool:
+    return instrument == Instrument.GUITAR or "guitar" in q_tokens or "tab" in q_tokens
+
+
+def _effective_format_priority(ext: str, guitar_intent: bool, default: float = 0.0) -> float:
+    prio = _FORMAT_PRIORITY.get(ext, default)
+    return max(prio, 0.96) if (guitar_intent and ext in _GUITAR_TAB_EXTENSIONS) else prio
 
 
 def _score_candidate(
@@ -417,15 +426,11 @@ def _score_candidate(
     if matched < min_required:
         return 0.0
 
-    guitar_intent = (
-        instrument == Instrument.GUITAR or "guitar" in q_tokens or "tab" in q_tokens
-    )
+    guitar_intent = _is_guitar_intent(q_tokens, instrument)
     is_preferred_fmt = ext in MUSICXML_SEARCH_EXTENSIONS or (
         guitar_intent and ext in _GUITAR_TAB_EXTENSIONS
     )
-    fmt_prio = _FORMAT_PRIORITY.get(ext, 0.2)
-    if guitar_intent and ext in _GUITAR_TAB_EXTENSIONS:
-        fmt_prio = max(fmt_prio, 0.96)
+    fmt_prio = _effective_format_priority(ext, guitar_intent, default=0.2)
 
     coverage = matched / len(q_tokens)
     exact_ratio = exact_word_hits / len(q_tokens)
@@ -461,7 +466,7 @@ def _normalize_allowed_formats(
     *,
     musicxml_only: bool,
 ) -> frozenset[str]:
-    supported = SUPPORTED_SEARCH_EXTENSIONS | _GUITAR_TAB_EXTENSIONS
+    supported = SUPPORTED_SEARCH_EXTENSIONS
     if formats is not None:
         cleaned = {f".{f.strip().lstrip('.').lower()}" for f in formats if f.strip()}
         valid = frozenset(cleaned & supported)
@@ -495,8 +500,7 @@ def search_digital_scores(
         raise ValueError("limit must be a positive integer.")
 
     allowed_exts = _normalize_allowed_formats(formats, musicxml_only=musicxml_only)
-    q_tokens = _normalize_text(clean_query).split()
-    guitar_intent = instrument == Instrument.GUITAR or "guitar" in q_tokens or "tab" in q_tokens
+    guitar_intent = _is_guitar_intent(_normalize_text(clean_query).split(), instrument)
 
     def _safe_index(name: str, fetcher: Callable[[], list[dict[str, Any]]]) -> list[dict[str, Any]]:
         try:
@@ -535,7 +539,10 @@ def search_digital_scores(
     raw_records: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
         for fut in as_completed(pool.submit(fn) for fn in tasks):
-            raw_records.extend(fut.result())
+            try:
+                raw_records.extend(fut.result())
+            except Exception as exc:  # noqa: BLE001 — isolate failing search backend
+                logger.debug("Search backend failed safely: %s", exc)
 
     scored_candidates: list[ScoreSearchResult] = []
     for rec in raw_records:
@@ -563,13 +570,8 @@ def search_digital_scores(
             )
         )
 
-    def _effective_priority(ext: str) -> float:
-        if guitar_intent and ext in _GUITAR_TAB_EXTENSIONS:
-            return max(_FORMAT_PRIORITY.get(ext, 0.0), 0.96)
-        return _FORMAT_PRIORITY.get(ext, 0.0)
-
     scored_candidates.sort(
-        key=lambda r: (r.score, _effective_priority(r.format_ext)),
+        key=lambda r: (r.score, _effective_format_priority(r.format_ext, guitar_intent)),
         reverse=True,
     )
 

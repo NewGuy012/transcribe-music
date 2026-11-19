@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import tempfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from fractions import Fraction
@@ -19,6 +21,7 @@ from transcribe_music.score_utils import (
     is_playable_chord,
     make_clef,
     replace_or_insert_initial_clef,
+    try_int,
 )
 
 
@@ -83,10 +86,8 @@ def _snap_clean_quarter_length(
     return snapped
 
 
-def _exact_fraction_or_none(value: float | Fraction) -> Fraction | None:
-    if isinstance(value, Fraction):
-        return value
-    return Fraction(float(value)).limit_denominator(10000)
+def _to_fraction(value: float | Fraction) -> Fraction:
+    return value if isinstance(value, Fraction) else Fraction(float(value)).limit_denominator(10000)
 
 
 def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) -> None:
@@ -100,16 +101,14 @@ def _repair_stream_elements(st: music21.stream.Stream, bar_ql: Fraction | None) 
             st.remove(el)
             continue
 
-        off_frac = _exact_fraction_or_none(el.offset)
-        if off_frac is not None and off_frac.denominator > 24:
+        off_frac = _to_fraction(el.offset)
+        if off_frac.denominator > 24:
             new_off = _snap_clean_quarter_length(float(el.offset), allow_zero=True)
             st.setElementOffset(el, new_off)
             repaired_ids.add(id(el))
 
-        ql_frac = _exact_fraction_or_none(el.duration.quarterLength)
-        needs_dur_fix = _is_unexportable_element(el) or (
-            ql_frac is not None and ql_frac.denominator > 24
-        )
+        ql_frac = _to_fraction(el.duration.quarterLength)
+        needs_dur_fix = _is_unexportable_element(el) or ql_frac.denominator > 24
         if needs_dur_fix:
             new_ql = _snap_clean_quarter_length(ql_float, allow_zero=False)
             if bar_ql is not None:
@@ -371,8 +370,8 @@ def _build_staff_details_element(
 
 def _shift_note_octave(note_el: ET.Element, delta: int) -> None:
     oct_el = note_el.find("./pitch/octave")
-    if oct_el is not None and oct_el.text and oct_el.text.lstrip("-").isdigit():
-        oct_el.text = str(int(oct_el.text) + delta)
+    if oct_el is not None and (oct_val := try_int(oct_el.text)) is not None:
+        oct_el.text = str(oct_val + delta)
 
 
 def _set_or_replace_staff(note_el: ET.Element, staff_num: int) -> None:
@@ -382,6 +381,34 @@ def _set_or_replace_staff(note_el: ET.Element, staff_num: int) -> None:
         note_el.append(staff_el)
     staff_el.text = str(staff_num)
     _sort_children_by_order(note_el, _NOTE_TAG_ORDER)
+
+
+def _timeline_delta(child: ET.Element) -> int | None:
+    if child.tag == "note":
+        if child.find("grace") is not None or child.find("chord") is not None:
+            return None
+        return try_int(child.findtext("duration"))
+    if child.tag == "forward":
+        return try_int(child.findtext("duration"))
+    if child.tag == "backup":
+        dur = try_int(child.findtext("duration"))
+        return -dur if dur is not None else None
+    return None
+
+
+def _strip_technical_tags(note_el: ET.Element, *tag_names: str) -> None:
+    tech = note_el.find("notations/technical")
+    if tech is None:
+        return
+    for tag in tag_names:
+        for child in list(tech.findall(tag)):
+            tech.remove(child)
+    if not list(tech):
+        notations = note_el.find("notations")
+        if notations is not None:
+            notations.remove(tech)
+            if not list(notations):
+                note_el.remove(notations)
 
 
 def _apply_guitar_staff_layout(
@@ -421,17 +448,20 @@ def _apply_guitar_staff_layout(
         tab_clef = ET.SubElement(first_attrs, "clef")
         ET.SubElement(tab_clef, "sign").text = "TAB"
         ET.SubElement(tab_clef, "line").text = "5"
-        for tr_el in list(first_attrs.findall("transpose")):
+        transposes = list(first_attrs.findall("transpose"))
+        had_8vb_transpose = any(try_int(tr.findtext("octave-change")) == -1 for tr in transposes)
+        for tr_el in transposes:
             first_attrs.remove(tr_el)
         for sd_el in list(first_attrs.findall("staff-details")):
             first_attrs.remove(sd_el)
         first_attrs.append(_build_staff_details_element(guitar_meta))
         _sort_children_by_order(first_attrs, _ATTR_TAG_ORDER)
-        for note_el in part.findall(".//note"):
-            _shift_note_octave(note_el, -1)
+        if had_8vb_transpose:
+            for note_el in part.findall(".//note"):
+                _shift_note_octave(note_el, -1)
         return True
 
-    # GuitarStaffMode.BOTH: 2-staff Standard Notation (Staff 1) + TAB (Staff 2)
+    # GuitarStaffMode.BOTH: Staff 1 Notation (written 8vb) + Staff 2 TAB (sounding)
     staves_el = first_attrs.find("staves")
     if staves_el is None:
         staves_el = ET.SubElement(first_attrs, "staves")
@@ -449,12 +479,27 @@ def _apply_guitar_staff_layout(
     ET.SubElement(c2, "sign").text = "TAB"
     ET.SubElement(c2, "line").text = "5"
 
-    for tr_el in first_attrs.findall("transpose"):
+    transposes = list(first_attrs.findall("transpose"))
+    had_8vb_transpose = any(try_int(tr.findtext("octave-change")) == -1 for tr in transposes)
+    for tr_el in transposes:
         tr_el.set("number", "1")
     for sd_el in list(first_attrs.findall("staff-details")):
         first_attrs.remove(sd_el)
     first_attrs.append(_build_staff_details_element(guitar_meta, staff_number=2))
     _sort_children_by_order(first_attrs, _ATTR_TAG_ORDER)
+
+    voice_shift = max(
+        4,
+        max(
+            (
+                v
+                for m in measures
+                for ch in m
+                if ch.tag == "note" and (v := try_int(ch.findtext("voice"))) is not None
+            ),
+            default=0,
+        ),
+    )
 
     for measure in measures:
         orig_children = list(measure)
@@ -463,19 +508,8 @@ def _apply_guitar_staff_layout(
         for child in orig_children:
             if child.tag in {"note", "forward", "backup"}:
                 timeline_elems.append(child)
-                if child.tag == "note":
-                    if child.find("grace") is None and child.find("chord") is None:
-                        dur_txt = child.findtext("duration")
-                        if dur_txt and dur_txt.isdigit():
-                            staff1_cursor += int(dur_txt)
-                elif child.tag == "forward":
-                    dur_txt = child.findtext("duration")
-                    if dur_txt and dur_txt.isdigit():
-                        staff1_cursor += int(dur_txt)
-                elif child.tag == "backup":
-                    dur_txt = child.findtext("duration")
-                    if dur_txt and dur_txt.isdigit():
-                        staff1_cursor -= int(dur_txt)
+                if (delta := _timeline_delta(child)) is not None:
+                    staff1_cursor += delta
 
         if not timeline_elems:
             continue
@@ -484,31 +518,18 @@ def _apply_guitar_staff_layout(
         for elem in timeline_elems:
             clone = copy.deepcopy(elem)
             if elem.tag == "note":
-                # Staff 1 retains notation + <fingering>, moves <string>/<fret> strictly to Staff 2 TAB
-                tech1 = elem.find("notations/technical")
-                if tech1 is not None:
-                    for tab_tag in (*tech1.findall("string"), *tech1.findall("fret")):
-                        tech1.remove(tab_tag)
-                    if not list(tech1):
-                        notations1 = elem.find("notations")
-                        if notations1 is not None:
-                            notations1.remove(tech1)
-                            if not list(notations1):
-                                elem.remove(notations1)
+                _strip_technical_tags(elem, "string", "fret")
                 _set_or_replace_staff(elem, 1)
 
-                # Staff 2 TAB clone: sounding octave, shifted voice, strip notation-only tags & <fingering>
-                _shift_note_octave(clone, -1)
+                if had_8vb_transpose:
+                    _shift_note_octave(clone, -1)
                 voice_el = clone.find("voice")
-                if voice_el is not None and voice_el.text and voice_el.text.isdigit():
-                    voice_el.text = str(int(voice_el.text) + 4)
+                if voice_el is not None and (v_num := try_int(voice_el.text)) is not None:
+                    voice_el.text = str(v_num + voice_shift)
                 for drop_tag in ("stem", "beam", "accidental", "notehead", "lyric"):
                     for d_el in list(clone.findall(drop_tag)):
                         clone.remove(d_el)
-                tech2 = clone.find("notations/technical")
-                if tech2 is not None:
-                    for f_el in list(tech2.findall("fingering")):
-                        tech2.remove(f_el)
+                _strip_technical_tags(clone, "fingering")
                 _set_or_replace_staff(clone, 2)
             cloned_staff2.append(clone)
 
@@ -549,20 +570,18 @@ def _validate_part_measures(parts: list[ET.Element]) -> None:
                 raise ValueError(f"Measure {m_num} contains duplicate whole-measure rests")
 
             for attrs in measure.findall("attributes"):
-                div_txt = attrs.findtext("divisions")
-                if div_txt is not None:
-                    divisions = int(div_txt)
+                if (div_val := try_int(attrs.findtext("divisions"))) is not None:
+                    divisions = div_val
                 time_el = attrs.find("time")
                 if time_el is not None:
                     if time_el.find("senza-misura") is not None:
                         senza_misura = True
                     else:
                         senza_misura = False
-                        b_txt = time_el.findtext("beats")
-                        bt_txt = time_el.findtext("beat-type")
-                        if b_txt and bt_txt and b_txt.isdigit() and bt_txt.isdigit():
-                            beats = int(b_txt)
-                            beat_type = int(bt_txt)
+                        b_val = try_int(time_el.findtext("beats"))
+                        bt_val = try_int(time_el.findtext("beat-type"))
+                        if b_val and bt_val and b_val > 0 and bt_val > 0:
+                            beats, beat_type = b_val, bt_val
 
             if senza_misura or divisions is None or beats is None or beat_type is None:
                 continue
@@ -573,22 +592,9 @@ def _validate_part_measures(parts: list[ET.Element]) -> None:
             cursor = 0
             max_cursor = 0
             for child in measure:
-                if child.tag == "note":
-                    if child.find("grace") is not None or child.find("chord") is not None:
-                        continue
-                    dur_txt = child.findtext("duration")
-                    if dur_txt is not None:
-                        cursor += int(dur_txt)
-                        max_cursor = max(max_cursor, cursor)
-                elif child.tag == "forward":
-                    dur_txt = child.findtext("duration")
-                    if dur_txt is not None:
-                        cursor += int(dur_txt)
-                        max_cursor = max(max_cursor, cursor)
-                elif child.tag == "backup":
-                    dur_txt = child.findtext("duration")
-                    if dur_txt is not None:
-                        cursor -= int(dur_txt)
+                if (delta := _timeline_delta(child)) is not None:
+                    cursor += delta
+                    max_cursor = max(max_cursor, cursor)
 
             if max_cursor > expected_divs + 1:
                 raise ValueError(
@@ -670,19 +676,30 @@ def export_musicxml(
         )
 
     normalized = normalize_score_structure(score, instrument=instrument, title=title)
-
+    tmp_path: Path | None = None
     try:
-        normalized.write("musicxml", fp=str(output_path))
-    except Exception as exc:  # noqa: BLE001 — guarantee valid baseline MusicXML output
-        warnings.append(f"Enrichment tag fallback triggered during MusicXML write: {exc}")
-        _strip_non_note_articulations(normalized)
-        normalized.write("musicxml", fp=str(output_path))
+        with tempfile.NamedTemporaryFile(
+            dir=output_path.parent,
+            prefix=f".{output_path.stem}_",
+            suffix=".musicxml",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+        try:
+            normalized.write("musicxml", fp=str(tmp_path))
+        except (music21.exceptions21.Music21Exception, OSError, ValueError, TypeError) as exc:
+            warnings.append(f"Enrichment tag fallback triggered during MusicXML write: {exc}")
+            _strip_non_note_articulations(normalized)
+            normalized.write("musicxml", fp=str(tmp_path))
 
-    return (
-        _postprocess_and_validate_xml(
-            output_path,
+        metrics = _postprocess_and_validate_xml(
+            tmp_path,
             guitar_staff=guitar_staff,
             guitar_meta=guitar_meta,
-        ),
-        warnings,
-    )
+        )
+        os.replace(tmp_path, output_path)
+        tmp_path = None
+        return metrics, warnings
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
