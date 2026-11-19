@@ -265,6 +265,7 @@ def search_pdmx_catalog(
     cache_dir: Path = Path(".transcribe_cache"),
     allowed_exts: frozenset[str],
     instrument: Instrument | None = None,
+    include_unsynced_pdmx: bool = False,
     limit: int = 30,
 ) -> list[dict[str, Any]]:
     """Query the local SQLite PDMX catalog if synced; returns `[]` immediately otherwise."""
@@ -284,6 +285,8 @@ def search_pdmx_catalog(
 
     mxl_ready = _pdmx_archive_available(pdmx_dir, "mxl")
     mid_ready = _pdmx_archive_available(pdmx_dir, "mid")
+    if not include_unsynced_pdmx and not (want_mxl and mxl_ready) and not (want_mid and mid_ready):
+        return []
 
     where_clauses = ["INSTR(search_text, ?) > 0"] * len(tokens)
     inst_term = instrument.value if instrument is not None else None
@@ -347,6 +350,8 @@ def search_pdmx_catalog(
         has_inst_match = bool(inst_keywords and any(kw in inst_meta_lower for kw in inst_keywords))
 
         for ext, rel_path, archive_ready in candidates:
+            if not archive_ready and not include_unsynced_pdmx:
+                continue
             if ext == ".mxl" and not mxl_ready and mid_ready and want_mid and mid_rel:
                 continue
             note_bits = []

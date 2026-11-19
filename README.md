@@ -51,8 +51,8 @@ uv sync --all-extras
 ```bash
 # 1. Search fast symbolic catalogs (MusicXML or GP TAB with --instrument guitar), show top 5, and download
 uv run transcribe-music search "Moonlight Sonata"
-uv run transcribe-music search "Asturias" --instrument guitar
-# Or download selection #1 and enrich immediately for piano:
+uv run transcribe-music search "Asturias" --instrument guitar --guitar-staff both
+# Or download selection #1 and enrich immediately for piano (add --include-unsynced for un-archived PDMX rows):
 uv run transcribe-music search "Moonlight Sonata" --select 1 --instrument piano
 
 # Optional: sync the 254k-score PDMX SQLite catalog (Zenodo 15571083)
@@ -69,6 +69,12 @@ uv run transcribe-music inspect haydn_cello_concerto.mxl
 # 3. Convert any digital score (or fallback PDF) with automatic part selection
 uv run transcribe-music convert haydn_cello_concerto.mxl \
   --instrument cello -o haydn_cello_fingered.musicxml
+
+# 3b. Customize chord recognition window (beats), slash chords, and Roman numerals
+uv run transcribe-music convert chopin_prelude.mxl \
+  --instrument piano --chord-window 1.0 --roman-numerals -o chopin_analyzed.musicxml
+uv run transcribe-music convert bach_wtc1.mxl \
+  --instrument piano --chord-window 4.0 --no-slash-chords -o wtc1_triads.musicxml
 
 # 4. Override part selection explicitly by part number or name
 uv run transcribe-music convert suite_or_sonata.mid \

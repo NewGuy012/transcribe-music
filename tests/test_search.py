@@ -6,6 +6,7 @@ import io
 import tarfile
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
 from dataclasses import replace
@@ -14,7 +15,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from conftest import make_simple_cello_score, write_mxl_bytes
+from conftest import make_simple_cello_score, write_gp5_file, write_mxl_bytes
 
 from transcribe_music import (
     Instrument,
@@ -128,6 +129,10 @@ def test_search_ranking_diacritics_resilience_and_format_filters(
     diacritics = search_digital_scores("Erlkonig", include_local=False, cache_dir=tmp_path / "cache")
     assert len(diacritics) == 1 and diacritics[0].title == "Der Erlkönig"
 
+    # Alpha-digit boundary tokenization matches "etude 1" against "Etude1" while keeping catalog tokens
+    assert search_mod._normalize_text("Villa-Lobos_Etude1") == "villa lobos etude 1"
+    assert search_mod._normalize_text("Mozart K156 movement2") == "mozart k156 movement 2"
+
 
 def test_offline_music21_corpus_and_github_tree_parsers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -138,6 +143,14 @@ def test_offline_music21_corpus_and_github_tree_parsers(
     assert results and results[0].source == "music21 Corpus"
     saved = download_score_result(results[0], download_dir=tmp_path / "downloads")
     assert saved.exists() and saved.stat().st_size > 0
+
+    k156_hits = search_digital_scores(
+        "mozart k156 movement2",
+        limit=5,
+        include_remote=False,
+        cache_dir=tmp_path / "cache",
+    )
+    assert k156_hits and k156_hits[0].local_corpus_path == "mozart/k156/movement2.mxl"
 
     monkeypatch.setattr(
         search_mod,
@@ -280,16 +293,34 @@ def test_pdmx_sqlite_sync_search_extract_and_security(tmp_path: Path) -> None:
     status_meta = sync_pdmx(cache_dir=cache_dir, pdmx_dir=pdmx_dir, download_csv=False)
     assert status_meta.score_count == 3 and status_meta.mxl_available is False
 
+    # Un-synced PDMX rows are hidden by default and returned when include_unsynced_pdmx=True
+    assert (
+        search_digital_scores(
+            "Dvorak Cello Concerto", include_remote=False, include_local=False, cache_dir=cache_dir
+        )
+        == []
+    )
     dvorak_hits = search_digital_scores(
-        "Dvorak Cello Concerto", include_remote=False, include_local=False, cache_dir=cache_dir
+        "Dvorak Cello Concerto",
+        include_unsynced_pdmx=True,
+        include_remote=False,
+        include_local=False,
+        cache_dir=cache_dir,
     )
     assert len(dvorak_hits) == 1 and dvorak_hits[0].composer == "Antonín Dvořák"
-    assert search_digital_scores("%", include_remote=False, include_local=False, cache_dir=cache_dir) == []
+    assert search_digital_scores(
+        "%", include_unsynced_pdmx=True, include_remote=False, include_local=False, cache_dir=cache_dir
+    ) == []
     with pytest.raises(FileNotFoundError, match="pdmx sync --with-mxl"):
         download_score_result(dvorak_hits[0], download_dir=tmp_path / "dl")
 
     gtr_hits = search_digital_scores(
-        "Capricho", instrument=Instrument.GUITAR, include_remote=False, include_local=False, cache_dir=cache_dir
+        "Capricho",
+        instrument=Instrument.GUITAR,
+        include_unsynced_pdmx=True,
+        include_remote=False,
+        include_local=False,
+        cache_dir=cache_dir,
     )
     assert gtr_hits[0].filename == "QmGuitar.mxl" and "Classical Guitar" in (gtr_hits[0].edition_note or "")
 
@@ -420,3 +451,49 @@ def test_guitar_search_and_dadagp_sqlite_catalog(
 
     assert main(["dadagp", "status", "--cache-dir", str(cache_dir)]) == 0
     assert "3" in capsys.readouterr().out
+
+    # CLI search --guitar-staff both forwards staff mode to conversion
+    gp5_bytes = write_gp5_file(tmp_path / "Etude1.gp5").read_bytes()
+    _stub_remote_sources(
+        monkeypatch,
+        gp_classical=lambda: [
+            {
+                "title": "Etude1",
+                "composer": "Heitor Villa-Lobos",
+                "format_ext": ".gp5",
+                "source": "GP Classical Guitar",
+                "filename": "Villa-Lobos_Etude1.gp5",
+                "edition_note": "Classical Guitar TAB",
+                "download_url": "https://example.com/Villa-Lobos_Etude1.gp5",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        urllib.request,
+        "build_opener",
+        _fake_opener(gp5_bytes, "https://example.com/Villa-Lobos_Etude1.gp5"),
+    )
+    cli_cache = tmp_path / "cli_gtr_cache"
+    assert (
+        main(
+            [
+                "search",
+                "villa-lobos etude 1",
+                "--select",
+                "1",
+                "-i",
+                "guitar",
+                "--guitar-staff",
+                "both",
+                "--dir",
+                str(tmp_path / "cli_dl"),
+                "--cache-dir",
+                str(cli_cache),
+            ]
+        )
+        == 0
+    )
+    out_text = capsys.readouterr().out
+    out_line = next(line for line in out_text.splitlines() if "Output MusicXML" in line)
+    exported_xml = Path(out_line.split("Output MusicXML", 1)[1].strip())
+    assert ET.parse(exported_xml).findtext(".//attributes/staves") == "2"

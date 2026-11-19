@@ -102,6 +102,8 @@ _GP_CLASSICAL_GUITAR_RAW_PREFIX = (
 )
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+_ALPHA_DIGIT_SPLIT_RE = re.compile(r"(?<=[a-z])(?=[0-9])|(?<=[0-9])(?=[a-z])")
+_CATALOG_TOKEN_RE = re.compile(r"^(?:k|kv|bwv|op|hwv|rv|hob|d|s|w|mwv|woo|sz)[0-9]+$")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 _MUSICAL_ALIASES: dict[str, str] = {
@@ -119,8 +121,16 @@ _MUSICAL_ALIASES: dict[str, str] = {
 
 
 def _normalize_text(text: str) -> str:
-    tokens = _NON_ALNUM_RE.sub(" ", normalize_ascii(text)).split()
-    return " ".join(_MUSICAL_ALIASES.get(tok, tok) for tok in tokens)
+    raw_tokens = _NON_ALNUM_RE.sub(" ", normalize_ascii(text)).split()
+    out_tokens: list[str] = []
+    for tok in raw_tokens:
+        if _CATALOG_TOKEN_RE.match(tok):
+            out_tokens.append(tok)
+        else:
+            for sub in _ALPHA_DIGIT_SPLIT_RE.split(tok):
+                if sub:
+                    out_tokens.append(_MUSICAL_ALIASES.get(sub, sub))
+    return " ".join(out_tokens)
 
 
 def _format_composer_name(raw: str) -> str:
@@ -336,7 +346,7 @@ def _search_music21_corpus(query: str) -> list[dict[str, Any]]:
 
     seen_paths: set[str] = set()
     records: list[dict[str, Any]] = []
-    for tok in sorted(tokens, key=len, reverse=True)[:2]:
+    for tok in sorted(tokens, key=len, reverse=True)[:3]:
         try:
             entries = music21.corpus.search(tok)
         except (music21.exceptions21.Music21Exception, OSError, ValueError) as exc:
@@ -398,14 +408,20 @@ def _score_candidate(
     composer_norm = _normalize_text(str(record.get("composer") or ""))
     filename_norm = _normalize_text(str(record.get("filename", "")))
     edition_norm = _normalize_text(str(record.get("edition_note") or ""))
+    corpus_path_norm = _normalize_text(str(record.get("local_corpus_path") or ""))
     ext = str(record.get("format_ext", "")).lower()
     source = str(record.get("source", ""))
 
-    haystack = f"{title_norm} {composer_norm} {filename_norm} {edition_norm}".strip()
+    haystack = (
+        f"{title_norm} {composer_norm} {filename_norm} {edition_norm} {corpus_path_norm}".strip()
+    )
     if not haystack:
         return 0.0
 
     hay_words = set(haystack.split())
+    for w in list(hay_words):
+        if _CATALOG_TOKEN_RE.match(w):
+            hay_words.update(_ALPHA_DIGIT_SPLIT_RE.split(w))
     title_words = set(title_norm.split())
     composer_words = set(composer_norm.split())
 
@@ -489,6 +505,7 @@ def search_digital_scores(
     musicxml_only: bool = False,
     formats: Iterable[str] | None = None,
     include_pdmx: bool = True,
+    include_unsynced_pdmx: bool = False,
     include_gp_catalog: bool = True,
     include_remote: bool = True,
     include_local: bool = True,
@@ -527,6 +544,7 @@ def search_digital_scores(
                 cache_dir=cache_dir,
                 allowed_exts=allowed_exts,
                 instrument=instrument,
+                include_unsynced_pdmx=include_unsynced_pdmx,
             )
         )
     if include_gp_catalog:

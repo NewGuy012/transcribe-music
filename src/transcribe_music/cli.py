@@ -232,6 +232,7 @@ def _cmd_search(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         instrument=inst,
         musicxml_only=args.musicxml_only,
         formats=parsed_formats,
+        include_unsynced_pdmx=args.include_unsynced,
         include_remote=not args.offline,
         cache_dir=args.cache_dir,
     )
@@ -264,7 +265,11 @@ def _cmd_search(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
     print(f"Downloaded: {saved_path} ({chosen.format_ext.lstrip('.').upper()} from {chosen.source})")
 
     if inst is not None:
-        cfg = TranscriptionConfig(instrument=inst, cache_dir=args.cache_dir)
+        cfg = TranscriptionConfig(
+            instrument=inst,
+            guitar_staff=GuitarStaffMode(args.guitar_staff),
+            cache_dir=args.cache_dir,
+        )
         res = convert_music(input_path=saved_path, instrument=inst, config=cfg)
         _print_result(res)
     else:
@@ -442,6 +447,18 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=_enum_choices(Instrument),
         default=None,
         help="Prioritize matching scores and convert download immediately.",
+    )
+    p_search.add_argument(
+        "--guitar-staff",
+        choices=_enum_choices(GuitarStaffMode),
+        default=GuitarStaffMode.NOTATION.value,
+        help="Guitar MusicXML staff layout when converting with -i guitar (default: notation).",
+    )
+    p_search.add_argument(
+        "--include-unsynced",
+        action="store_true",
+        default=False,
+        help="Include local PDMX catalog rows whose score archives are not downloaded yet.",
     )
     p_search.add_argument(
         "--offline", action="store_true", help="Search local corpora/indexes without network calls."
