@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import builtins
+import copy
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,7 +26,8 @@ from transcribe_music.ingest.digital import (
     inspect_digital_score,
     load_digital_score,
 )
-from transcribe_music.models import Instrument, OmrBackend
+from transcribe_music.models import Instrument, OmrBackend, TranscriptionConfig
+from transcribe_music.pipeline import convert_music
 from transcribe_music.transcribe.omr_pdf import run_pdf_omr
 from transcribe_music.transcribe.part_selector import select_and_adapt_parts
 
@@ -373,3 +376,94 @@ def test_pdf_omr_audiveris_and_guitar_tab_guard(
     monkeypatch.setattr("subprocess.run", _fake_tab_only_homr)
     _, _, tab_only_warns = run_pdf_omr(pdf_path, tmp_path / "w_tabonly", Instrument.GUITAR, dpi=150)
     assert any("guitar TAB or unrecognized staves" in w for w in tab_only_warns)
+
+
+def test_pdf_omr_overfull_measure_recovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # 8-beat merged OMR bar in 4/4 (plus bar-crossing tied note) recovers under repair_overflows=True
+    s_over = music21.stream.Score()
+    p_over = music21.stream.Part()
+    m1 = music21.stream.Measure(number=1)
+    m1.insert(0.0, music21.meter.TimeSignature("4/4"))
+    for pitch in ("D3", "E3", "F#3", "G3"):
+        m1.append(music21.note.Note(pitch, quarterLength=1.0))
+    m2 = music21.stream.Measure(number=2)
+    for pitch in ("A3", "B3", "C#4"):
+        m2.append(music21.note.Note(pitch, quarterLength=1.0))
+    m2.append(music21.note.Note("D4", quarterLength=2.0))  # crosses beat 4 -> 5 boundary
+    m2.append(music21.note.Note("A3", quarterLength=3.0))
+    p_over.append(m1)
+    p_over.append(m2)
+    s_over.insert(0, p_over)
+
+    with pytest.raises(ValueError, match="overflows active 4/4 meter"):
+        export_musicxml(copy.deepcopy(s_over), tmp_path / "strict_fail.musicxml", Instrument.CELLO)
+
+    repaired_xml = tmp_path / "repaired_omr.musicxml"
+    metrics, warns = export_musicxml(
+        copy.deepcopy(s_over),
+        repaired_xml,
+        Instrument.CELLO,
+        repair_overflows=True,
+    )
+    assert metrics.measure_count == 3
+    assert any("Repaired overfull measure(s) 2" in w for w in warns)
+    ties = ET.parse(repaired_xml).findall(".//note/tie")
+    assert {t.get("type") for t in ties} == {"start", "stop"}
+
+    # Pipeline enables repair_overflows ONLY for PDF OMR sources, never digital scores
+    overfull_xml_text = """<?xml version="1.0" encoding="utf-8"?>
+<score-partwise version="4.0">
+  <part-list><score-part id="P1"><part-name>Violoncello</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>1</divisions>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>F</sign><line>4</line></clef>
+      </attributes>
+      <note><pitch><step>D</step><octave>3</octave></pitch><duration>4</duration><type>whole</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>E</step><octave>3</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note><pitch><step>F</step><octave>3</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note><pitch><step>G</step><octave>3</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note><pitch><step>A</step><octave>3</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note><pitch><step>B</step><octave>3</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note><pitch><step>C</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note><pitch><step>D</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>1</duration><type>quarter</type></note>
+    </measure>
+  </part>
+</score-partwise>"""
+
+    digital_overfull = tmp_path / "digital_overfull.musicxml"
+    digital_overfull.write_text(overfull_xml_text, encoding="utf-8")
+    with pytest.raises(ValueError, match="overflows active 4/4 meter"):
+        convert_music(
+            digital_overfull,
+            Instrument.CELLO,
+            output_path=tmp_path / "digital_fail.musicxml",
+            config=TranscriptionConfig(instrument=Instrument.CELLO, use_cache=False),
+        )
+
+    pdf_path = write_pdf_file(tmp_path / "haydn_omr.pdf", labels=("Page 1",))
+
+    def _fake_overfull_homr(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+        img = next(Path(arg) for arg in cmd if arg.endswith(".png"))
+        img.with_suffix(".musicxml").write_text(overfull_xml_text, encoding="utf-8")
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr("transcribe_music.transcribe.omr_pdf._find_audiveris_executable", lambda: None)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/homr" if name == "homr" else None)
+    monkeypatch.setattr("subprocess.run", _fake_overfull_homr)
+
+    pdf_res = convert_music(
+        pdf_path,
+        Instrument.CELLO,
+        output_path=tmp_path / "from_pdf.musicxml",
+        config=TranscriptionConfig(instrument=Instrument.CELLO, use_cache=False, pdf_dpi=150),
+    )
+    assert pdf_res.measure_count == 3
+    assert any("Repaired overfull measure(s) 2" in w for w in pdf_res.warnings)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import tempfile
 import xml.etree.ElementTree as ET
@@ -20,6 +21,7 @@ from transcribe_music.score_utils import (
     get_guitar_track_meta,
     is_playable_chord,
     make_clef,
+    mark_tie,
     replace_or_insert_initial_clef,
     try_int,
 )
@@ -182,10 +184,217 @@ def _repair_unexportable_durations(part: music21.stream.Part) -> None:
             _repair_stream_elements(st, bar_ql=bar_ql)
 
 
+def _measure_stream_overflows(st: music21.stream.Stream, bar_ql: Fraction) -> tuple[bool, Fraction]:
+    items = sorted(
+        [el for el in list(st) if _is_playable_or_rest(el) and not el.duration.isGrace],
+        key=lambda e: (float(e.offset), id(e)),
+    )
+    if not items:
+        return False, Fraction(0, 1)
+    max_end = Fraction(0, 1)
+    seq_cursor = Fraction(0, 1)
+    has_overlap = False
+    for el in items:
+        off = _to_fraction(el.offset).limit_denominator(24)
+        dur = max(Fraction(0, 1), _to_fraction(el.duration.quarterLength).limit_denominator(24))
+        if off < seq_cursor - Fraction(1, 32):
+            has_overlap = True
+        seq_cursor = max(seq_cursor, off) + dur
+        max_end = max(max_end, off + dur)
+    tol = Fraction(1, 32)
+    return (max_end > bar_ql + tol or (has_overlap and seq_cursor > bar_ql + tol)), max_end
+
+
+def _clone_tie_segment(
+    el: music21.note.Note | music21.chord.Chord,
+    dur: Fraction,
+) -> music21.note.Note | music21.chord.Chord:
+    if isinstance(el, music21.note.Note):
+        return music21.note.Note(copy.deepcopy(el.pitch), quarterLength=dur)
+    return music21.chord.Chord([copy.deepcopy(p) for p in el.pitches], quarterLength=dur)
+
+
+def _insert_stream_non_overlapping(
+    target: music21.stream.Stream,
+    off: Fraction,
+    seg: music21.note.Note | music21.chord.Chord,
+    placed: list[tuple[Fraction, music21.note.Note | music21.chord.Chord]],
+) -> None:
+    if placed:
+        prev_off, prev_el = placed[-1]
+        prev_end = prev_off + _to_fraction(prev_el.duration.quarterLength).limit_denominator(24)
+        if off < prev_end:
+            if off > prev_off:
+                prev_el.duration = music21.duration.Duration(off - prev_off)
+            else:
+                return
+    target.insert(off, seg)
+    placed.append((off, seg))
+
+
+def _split_overfull_measure(
+    m: music21.stream.Measure,
+    bar_ql: Fraction,
+    max_end: Fraction,
+) -> list[music21.stream.Measure]:
+    """Split or trim an overfull Measure across bar_ql boundaries."""
+    small_tail = max_end <= bar_ql + Fraction(1, 8)
+    n_bars = 1 if small_tail else max(1, math.ceil(max_end / bar_ql))
+    new_bars = [music21.stream.Measure(number=m.number) for _ in range(n_bars)]
+
+    for meta_cls in (
+        music21.clef.Clef,
+        music21.meter.TimeSignature,
+        music21.key.KeySignature,
+        music21.tempo.MetronomeMark,
+        music21.expressions.RehearsalMark,
+    ):
+        for el in list(m.getElementsByClass(meta_cls)):
+            off = min(_to_fraction(el.offset).limit_denominator(24), max(Fraction(0, 1), bar_ql - Fraction(1, 8)))
+            m.remove(el)
+            new_bars[0].insert(off, el)
+
+    if m.leftBarline is not None:
+        new_bars[0].leftBarline = copy.deepcopy(m.leftBarline)
+    if m.rightBarline is not None:
+        new_bars[-1].rightBarline = copy.deepcopy(m.rightBarline)
+
+    for expr_cls in (
+        music21.harmony.ChordSymbol,
+        music21.expressions.TextExpression,
+        music21.dynamics.Dynamic,
+    ):
+        for el in list(m.getElementsByClass(expr_cls)):
+            off = max(Fraction(0, 1), _to_fraction(el.offset).limit_denominator(24))
+            b_idx = min(n_bars - 1, int(off // bar_ql))
+            m.remove(el)
+            new_bars[b_idx].insert(off - b_idx * bar_ql, el)
+
+    voices = list(m.getElementsByClass(music21.stream.Voice))
+    sources: list[tuple[str | None, music21.stream.Stream]] = (
+        [(v.id, v) for v in voices] if voices else [(None, m)]
+    )
+
+    for voice_id, st in sources:
+        if voice_id is None:
+            targets: list[music21.stream.Stream] = list(new_bars)
+        else:
+            targets = []
+            for nb in new_bars:
+                v_new = music21.stream.Voice(id=voice_id)
+                nb.insert(0.0, v_new)
+                targets.append(v_new)
+
+        raw_items = sorted(
+            [el for el in list(st) if _is_playable_or_rest(el)],
+            key=lambda e: (float(e.offset), id(e)),
+        )
+        placed_per_bar: list[list[tuple[Fraction, music21.note.Note | music21.chord.Chord]]] = [
+            [] for _ in range(n_bars)
+        ]
+        total_limit = n_bars * bar_ql
+
+        for el in raw_items:
+            off = max(Fraction(0, 1), _to_fraction(el.offset).limit_denominator(24))
+            st.remove(el)
+            if isinstance(el, music21.note.Rest) and not el.duration.isGrace:
+                continue
+            if el.duration.isGrace:
+                b_idx = min(n_bars - 1, int(off // bar_ql))
+                targets[b_idx].insert(off - b_idx * bar_ql, el)
+                continue
+            if off >= total_limit:
+                continue
+
+            dur = max(Fraction(1, 16), _to_fraction(el.duration.quarterLength).limit_denominator(24))
+            end = min(off + dur, total_limit)
+            if small_tail and end > bar_ql:
+                end = bar_ql
+            if end <= off:
+                continue
+
+            cur = off
+            orig_tie_type = el.tie.type if el.tie is not None else None
+            if orig_tie_type == "continue":
+                el.tie = music21.tie.Tie("stop")
+            elif orig_tie_type == "start":
+                el.tie = None
+            prev_seg: music21.note.Note | music21.chord.Chord | None = None
+            first_seg = True
+            while cur < end:
+                b_idx = min(n_bars - 1, int(cur // bar_ql))
+                bar_end = (b_idx + 1) * bar_ql
+                seg_end = min(end, bar_end)
+                seg_dur = seg_end - cur
+                local_off = cur - b_idx * bar_ql
+                if first_seg:
+                    el.duration = music21.duration.Duration(seg_dur)
+                    seg: music21.note.Note | music21.chord.Chord = el
+                    first_seg = False
+                else:
+                    seg = _clone_tie_segment(el, seg_dur)
+                if prev_seg is not None:
+                    mark_tie(prev_seg, seg)
+                _insert_stream_non_overlapping(targets[b_idx], local_off, seg, placed_per_bar[b_idx])
+                prev_seg = seg
+                cur = seg_end
+            if prev_seg is not None and orig_tie_type in ("start", "continue"):
+                prev_seg.tie = music21.tie.Tie(
+                    "continue" if prev_seg.tie is not None and prev_seg.tie.type == "stop" else "start"
+                )
+
+        for b_idx, tgt in enumerate(targets):
+            fill_stream_rest_gaps(tgt, bar_ql)
+
+    return new_bars
+
+
+def _repair_overfull_measures(part: music21.stream.Part, warnings: list[str]) -> None:
+    """Split or trim OMR measures that overflow their active time signature."""
+    measures = list(part.getElementsByClass(music21.stream.Measure))
+    if not measures:
+        return
+
+    active_bar_ql = Fraction(4, 1)
+    rebuilt: list[music21.stream.Measure] = []
+    repaired_nums: list[str] = []
+
+    for m in measures:
+        ts = m.getElementsByClass(music21.meter.TimeSignature).first()
+        if ts is not None:
+            active_bar_ql = Fraction(ts.barDuration.quarterLength).limit_denominator(24)
+        bar_ql = active_bar_ql
+
+        voices = list(m.getElementsByClass(music21.stream.Voice))
+        checks = [_measure_stream_overflows(st, bar_ql) for st in (voices or [m])]
+        if any(flag for flag, _ in checks):
+            max_end = max(end for _, end in checks)
+            repaired_nums.append(str(m.number))
+            rebuilt.extend(_split_overfull_measure(m, bar_ql, max_end))
+        else:
+            rebuilt.append(m)
+
+    if not repaired_nums:
+        return
+
+    for m in measures:
+        part.remove(m)
+    for m_num, m in enumerate(rebuilt, start=1):
+        m.number = m_num
+        part.append(m)
+
+    warnings.append(
+        f"Repaired overfull measure(s) {', '.join(repaired_nums)} by re-barring to active time signature."
+    )
+
+
 def normalize_score_structure(
     score: music21.stream.Score,
     instrument: Instrument,
     title: str | None = None,
+    *,
+    repair_overflows: bool = False,
+    warnings: list[str] | None = None,
 ) -> music21.stream.Score:
     """Ensure parts have valid instrument metadata, clefs, time signatures, and complete measures."""
     spec = INSTRUMENT_SPECS[instrument]
@@ -241,6 +450,8 @@ def normalize_score_structure(
                     first_m.insert(0, copy.deepcopy(ks))
 
         _repair_unexportable_durations(part)
+        if repair_overflows:
+            _repair_overfull_measures(part, warnings if warnings is not None else [])
 
     if instrument == Instrument.PIANO and len(parts) == 2:
         has_brace = any(
@@ -733,6 +944,7 @@ def export_musicxml(
     title: str | None = None,
     *,
     guitar_staff: GuitarStaffMode = GuitarStaffMode.NOTATION,
+    repair_overflows: bool = False,
 ) -> tuple[ExportMetrics, list[str]]:
     """Normalize, serialize, and validate a MusicXML score with graceful fallback."""
     warnings: list[str] = []
@@ -747,7 +959,13 @@ def export_musicxml(
             or GuitarTrackMeta(open_string_midi=INSTRUMENT_SPECS[Instrument.GUITAR].open_string_midi)
         )
 
-    normalized = normalize_score_structure(score, instrument=instrument, title=title)
+    normalized = normalize_score_structure(
+        score,
+        instrument=instrument,
+        title=title,
+        repair_overflows=repair_overflows,
+        warnings=warnings,
+    )
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(

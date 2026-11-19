@@ -102,6 +102,7 @@ def _produce_enrich_and_export(
         instrument=cfg.instrument,
         title=existing_title or input_path.stem,
         guitar_staff=cfg.guitar_staff,
+        repair_overflows=(source_type == SourceType.PDF),
     )
     warnings.extend(export_warnings)
 
