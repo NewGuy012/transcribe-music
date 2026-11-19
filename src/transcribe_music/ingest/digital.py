@@ -207,11 +207,11 @@ def load_digital_score(
         score, warnings = parse_gp35_file(src)
         return LoadedDigitalScore(score, "pyguitarpro", suffix.lstrip("."), True, warnings)
 
-    if suffix == ".gp":
+    if suffix in MUSESCORE_GP_EXTENSIONS:
         gpif_res = parse_gpif_file(src)
         if gpif_res is not None:
             score, warnings = gpif_res
-            return LoadedDigitalScore(score, "gpif", "gp", True, warnings)
+            return LoadedDigitalScore(score, "gpif", suffix.lstrip("."), True, warnings)
 
     if suffix in (MUSESCORE_EXTENSIONS | MUSESCORE_GP_EXTENSIONS):
         return _load_musescore_file(src)

@@ -17,7 +17,7 @@ Powered by **`uv`**, **`music21`**, and the Python standard library (**`sqlite3`
 - **MusicXML**: `.musicxml`, `.xml`, `.mxl`
 - **MIDI**: `.mid`, `.midi` (quantized cleanly + auto-split Piano Grand Staff)
 - **Humdrum / MEI / ABC** (via optional `formats` extra: `converter21`): `.krn`, `.mei`, `.abc`
-- **Guitar Pro**: `.gp3`, `.gp4`, `.gp5` (via optional `gp` extra: `pyguitarpro`); `.gp` GP7/8 (native stdlib GPIF XML parser with MuseScore fallback); `.gpx` (via MuseScore Studio CLI)
+- **Guitar Pro**: `.gp3`, `.gp4`, `.gp5` (via optional `gp` extra: `pyguitarpro`); `.gp` GP7/8 and `.gpx` GP6 (native stdlib GPIF XML parser with MuseScore fallback)
 - **ASCII Guitar Tabs**: `.tab` (and `.txt` local conversion)
 - **MuseScore & Capella**: `.mscz`, `.mscx`, `.cap` (via MuseScore Studio CLI); `.capx` (native `music21` XML parser with MuseScore fallback)
 - **LilyPond**: `.ly` (via `python-ly` pure-parser `ly` CLI when installed)

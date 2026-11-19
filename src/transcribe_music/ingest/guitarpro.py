@@ -1,15 +1,17 @@
-"""Native ingestion for Guitar Pro 3-5 (.gp3/.gp4/.gp5 via pyguitarpro) and GP7/8 (.gp GPIF XML)."""
+"""Native ingestion for Guitar Pro 3-5 (.gp3/.gp4/.gp5 via pyguitarpro) and GP6-8 (.gpx/.gp GPIF XML)."""
 
 from __future__ import annotations
 
+import struct
 import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
 import music21
 
-from transcribe_music.ingest._io import read_bounded_zip_member
+from transcribe_music.ingest._io import MAX_MEMBER_BYTES, read_bounded_zip_member
 from transcribe_music.models import INSTRUMENT_SPECS, Instrument
 from transcribe_music.score_utils import (
     GuitarTrackMeta,
@@ -395,18 +397,157 @@ def _gpif_is_percussion(track_el: ET.Element) -> bool:
     )
 
 
+_BCFS_SECTOR_SIZE = 4096
+_GPIF_MEMBER_NAMES = frozenset({"content/score.gpif", "score.gpif"})
+
+
+def _decompress_bcfz(raw: bytes, *, max_bytes: int = MAX_MEMBER_BYTES) -> bytes | None:
+    """Decompress a Guitar Pro 6 BCFZ bitstream into its underlying BCFS filesystem bytes."""
+    if len(raw) < 8 or raw[:4] != b"BCFZ":
+        return None
+    expected_len = struct.unpack_from("<I", raw, 4)[0]
+    if expected_len == 0:
+        return None
+    if expected_len > max_bytes:
+        raise ValueError(f"GPX BCFZ payload exceeds {max_bytes} byte safety limit.")
+
+    byte_pos = 8
+    bit_pos = 0
+    raw_len = len(raw)
+
+    def _read_bit() -> int:
+        nonlocal byte_pos, bit_pos
+        if byte_pos >= raw_len:
+            raise EOFError
+        val = (raw[byte_pos] >> (7 - bit_pos)) & 1
+        bit_pos += 1
+        if bit_pos == 8:
+            bit_pos = 0
+            byte_pos += 1
+        return val
+
+    def _read_bits(count: int) -> int:
+        val = 0
+        for _ in range(count):
+            val = (val << 1) | _read_bit()
+        return val
+
+    def _read_bits_reversed(count: int) -> int:
+        val = 0
+        for idx in range(count):
+            val |= _read_bit() << idx
+        return val
+
+    out = bytearray()
+    try:
+        while len(out) < expected_len:
+            if _read_bit() == 1:
+                word_size = _read_bits(4)
+                offset = _read_bits_reversed(word_size)
+                length = _read_bits_reversed(word_size)
+                if offset == 0 or offset > len(out):
+                    return None
+                start = len(out) - offset
+                remaining = min(length, expected_len - len(out))
+                for idx in range(remaining):
+                    out.append(out[start + (idx % offset)])
+            else:
+                lit_count = _read_bits_reversed(2)
+                for _ in range(lit_count):
+                    if len(out) >= expected_len:
+                        break
+                    out.append(_read_bits(8))
+    except EOFError:
+        pass
+
+    if not out.startswith(b"BCFS"):
+        return None
+    if 0 < expected_len - len(out) <= _BCFS_SECTOR_SIZE:
+        out.extend(b"\x00" * (expected_len - len(out)))
+    return bytes(out)
+
+
+def _extract_bcfs_member(
+    bcfs: bytes,
+    target_names: frozenset[str],
+    *,
+    max_bytes: int = MAX_MEMBER_BYTES,
+) -> bytes | None:
+    """Extract a named file entry from a GP6 BCFS sector filesystem within size bounds."""
+    if len(bcfs) < 4 + _BCFS_SECTOR_SIZE or bcfs[:4] != b"BCFS":
+        return None
+    n_sectors = (len(bcfs) - 4) // _BCFS_SECTOR_SIZE
+    for sec_idx in range(n_sectors):
+        sec_off = 4 + sec_idx * _BCFS_SECTOR_SIZE
+        sec = bcfs[sec_off : sec_off + _BCFS_SECTOR_SIZE]
+        if struct.unpack_from("<I", sec, 0)[0] != 2:
+            continue
+        raw_name = sec[4:131].split(b"\x00", 1)[0]
+        name = raw_name.decode("utf-8", errors="ignore").replace("\\", "/").lstrip("/")
+        if name.lower() not in target_names:
+            continue
+        file_size = struct.unpack_from("<I", sec, 0x8C)[0]
+        if file_size > max_bytes:
+            raise ValueError(f"GPX entry '{name}' exceeds {max_bytes} byte safety limit.")
+        if file_size == 0:
+            continue
+
+        content = bytearray()
+        for blk_off in range(0x94, _BCFS_SECTOR_SIZE, 4):
+            blk_idx = struct.unpack_from("<I", sec, blk_off)[0]
+            if blk_idx == 0:
+                break
+            if blk_idx >= n_sectors:
+                return None
+            data_off = 4 + blk_idx * _BCFS_SECTOR_SIZE
+            content.extend(bcfs[data_off : data_off + _BCFS_SECTOR_SIZE])
+            if len(content) >= file_size:
+                break
+        if len(content) < file_size:
+            return None
+        return bytes(content[:file_size])
+    return None
+
+
+def _read_gpif_xml_bytes(gp_path: Path) -> bytes | None:
+    """Read `score.gpif` XML bytes from a GP7/8 ZIP (`.gp`) or GP6 BCFZ/BCFS (`.gpx`) container."""
+    if zipfile.is_zipfile(gp_path):
+        return read_bounded_zip_member(
+            gp_path,
+            lambda name: name.lower() in _GPIF_MEMBER_NAMES,
+        )
+    if gp_path.stat().st_size > MAX_MEMBER_BYTES:
+        raise ValueError(f"{gp_path.name} exceeds {MAX_MEMBER_BYTES} byte safety limit.")
+    raw = gp_path.read_bytes()
+    if raw.startswith(b"BCFZ"):
+        bcfs = _decompress_bcfz(raw)
+    elif raw.startswith(b"BCFS"):
+        bcfs = raw
+    else:
+        return None
+    if bcfs is None:
+        return None
+    return _extract_bcfs_member(bcfs, _GPIF_MEMBER_NAMES)
+
+
 def _gpif_tuning_and_capo(track_el: ET.Element) -> tuple[tuple[int, ...] | None, int]:
     tuning: tuple[int, ...] | None = None
     capo = 0
-    for prop in track_el.findall("./Staves/Staff/Properties/Property"):
+    prop_elems = (
+        *track_el.findall("./Staves/Staff/Properties/Property"),
+        *track_el.findall("./Properties/Property"),
+    )
+    for prop in prop_elems:
         name = prop.attrib.get("name", "").strip()
-        if name == "Tuning":
+        if name == "Tuning" and tuning is None:
             vals = [v for tok in (prop.findtext("Pitches") or "").split() if (v := try_int(tok)) is not None]
             if vals:
                 tuning = tuple(reversed(vals))  # GPIF stores low-to-high; reverse to string 1..N
-        elif name == "CapoFret" and (
-            c := try_int(prop.findtext("Fret") or prop.findtext("Number"))
-        ) is not None:
+        elif (
+            name == "CapoFret"
+            and capo == 0
+            and (c := try_int(prop.findtext("Fret") or prop.findtext("Number"))) is not None
+        ):
             capo = max(0, c)
     return tuning, capo
 
@@ -426,11 +567,8 @@ def _gpif_initial_tempo(root: ET.Element) -> float | None:
 
 
 def parse_gpif_file(gp_path: Path) -> tuple[music21.stream.Score, list[str]] | None:
-    """Parse a `.gp` (GP7/8) file via stdlib ZIP+XML if `Content/score.gpif` is present."""
-    xml_bytes = read_bounded_zip_member(
-        gp_path,
-        lambda name: name.lower() in {"content/score.gpif", "score.gpif"},
-    )
+    """Parse a `.gp` (GP7/8 ZIP) or `.gpx` (GP6 BCFZ/BCFS) file via stdlib GPIF XML."""
+    xml_bytes = _read_gpif_xml_bytes(gp_path)
     if xml_bytes is None:
         return None
     head_upper = xml_bytes[:4096].upper()
@@ -515,7 +653,7 @@ def parse_gpif_file(gp_path: Path) -> tuple[music21.stream.Score, list[str]] | N
                     for nid in note_ids:
                         n_el = notes_by_id[nid]
                         props = {
-                            k: prop
+                            k.lower(): prop
                             for prop in n_el.findall("./Properties/Property")
                             if (k := prop.attrib.get("name", "").strip())
                         }
@@ -525,19 +663,19 @@ def parse_gpif_file(gp_path: Path) -> tuple[music21.stream.Score, list[str]] | N
 
                         s_num: int | None = None
                         if (
-                            "String" in props
+                            "string" in props
                             and open_strings
-                            and (gpif_s := try_int(props["String"].findtext("String"))) is not None
+                            and (gpif_s := try_int(props["string"].findtext("String"))) is not None
                         ):
                             cand = len(open_strings) - gpif_s
                             if 1 <= cand <= len(open_strings):
                                 s_num = cand
-                        fret_num = try_int(props["Fret"].findtext("Fret")) if "Fret" in props else None
+                        fret_num = try_int(props["fret"].findtext("Fret")) if "fret" in props else None
 
                         midi_val: int | None = None
                         if (
-                            "Midi" in props
-                            and (raw_m := try_int(props["Midi"].findtext("Number"))) is not None
+                            "midi" in props
+                            and (raw_m := try_int(props["midi"].findtext("Number"))) is not None
                         ):
                             midi_val = raw_m + capo_fret
                         if midi_val is None and s_num is not None and fret_num is not None and open_strings:
@@ -546,14 +684,16 @@ def parse_gpif_file(gp_path: Path) -> tuple[music21.stream.Score, list[str]] | N
                             continue
 
                         note_specs.append((midi_val, s_num, fret_num))
-                        harmonic = harmonic or ("Harmonic" in props or "HarmonicType" in props)
-                        palm_mute = palm_mute or ("PalmMuted" in props)
-                        slide_origin = slide_origin or ("Slide" in props)
-                        hop_origin = hop_origin or ("HopOOrigin" in props)
-                        hop_dest = hop_dest or ("HopODestination" in props)
-                        if "Bended" in props and "BendDestinationValue" in props:
+                        harmonic = harmonic or ("harmonic" in props or "harmonictype" in props)
+                        palm_mute = palm_mute or ("palmmuted" in props)
+                        slide_origin = slide_origin or ("slide" in props)
+                        hop_origin = hop_origin or ("hopoorigin" in props)
+                        hop_dest = hop_dest or ("hopodestination" in props)
+                        if "bended" in props and "benddestinationvalue" in props:
                             try:
-                                val = float((props["BendDestinationValue"].findtext("Float") or "0").strip())
+                                val = float(
+                                    (props["benddestinationvalue"].findtext("Float") or "0").strip()
+                                )
                                 bend_semis = max(bend_semis, val / 50.0)
                             except ValueError:
                                 pass

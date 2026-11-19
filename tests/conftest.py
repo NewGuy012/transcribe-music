@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 import zipfile
 from pathlib import Path
 
@@ -225,6 +226,109 @@ def write_gpif_file(
     )
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("Content/score.gpif", gpif_xml)
+    return path
+
+
+def _encode_bcfz_literal_and_lz(bcfs: bytes) -> bytes:
+    """Encode a BCFS payload into a valid GP6 BCFZ bitstream exercising both literals and LZ copies."""
+    bits: list[int] = []
+
+    def _push_bits(val: int, count: int) -> None:
+        for shift in range(count - 1, -1, -1):
+            bits.append((val >> shift) & 1)
+
+    def _push_bits_rev(val: int, count: int) -> None:
+        for idx in range(count):
+            bits.append((val >> idx) & 1)
+
+    pos = 0
+    total = len(bcfs)
+    while pos < total:
+        # Use a back-reference for zero runs to exercise the LZ decoder branch.
+        if pos > 0 and bcfs[pos] == 0 and bcfs[pos - 1] == 0:
+            run_end = pos
+            while run_end < total and bcfs[run_end] == 0 and (run_end - pos) < 127:
+                run_end += 1
+            run_len = run_end - pos
+            if run_len >= 3:
+                bits.append(1)
+                _push_bits(7, 4)
+                _push_bits_rev(1, 7)
+                _push_bits_rev(run_len, 7)
+                pos = run_end
+                continue
+        chunk = bcfs[pos : pos + 3]
+        bits.append(0)
+        _push_bits_rev(len(chunk), 2)
+        for byte_val in chunk:
+            _push_bits(byte_val, 8)
+        pos += len(chunk)
+
+    payload = bytearray(b"BCFZ" + struct.pack("<I", total))
+    cur = 0
+    for idx, bit in enumerate(bits):
+        cur = (cur << 1) | bit
+        if (idx + 1) % 8 == 0:
+            payload.append(cur)
+            cur = 0
+    if len(bits) % 8:
+        payload.append(cur << (8 - (len(bits) % 8)))
+    return bytes(payload)
+
+
+def write_gpx_file(
+    path: Path,
+    *,
+    title: str = "GP6 Study",
+    artist: str = "GP6 Artist",
+    tuning_low_to_high: str = "40 45 50 55 59 64",
+    capo: int = 2,
+    compressed: bool = True,
+    doctype: str = "",
+) -> Path:
+    """Create a synthetic Guitar Pro 6 `.gpx` (BCFZ/BCFS) file with GP6 `<Track><Properties>`."""
+    gpif_xml = (
+        f'<?xml version="1.0" encoding="utf-8"?>{doctype}<GPIF>'
+        f"<Score><Title>{title}</Title><Artist>{artist}</Artist></Score>"
+        "<MasterTrack><Automations><Automation><Type>Tempo</Type><Value>100 2</Value></Automation></Automations></MasterTrack>"
+        "<Tracks>"
+        '<Track id="0"><Name>Steel Guitar</Name>'
+        "<GeneralMidi><Program>25</Program><PrimaryChannel>0</PrimaryChannel></GeneralMidi>"
+        f'<Properties><Property name="Tuning"><Pitches>{tuning_low_to_high}</Pitches></Property>'
+        f'<Property name="CapoFret"><Fret>{capo}</Fret></Property></Properties></Track>'
+        "</Tracks>"
+        '<MasterBars><MasterBar><Time>4/4</Time><Key><AccidentalCount>0</AccidentalCount></Key>'
+        "<Bars>0</Bars></MasterBar></MasterBars>"
+        '<Bars><Bar id="0"><Voices>0 -1 -1 -1</Voices></Bar></Bars>'
+        '<Voices><Voice id="0"><Beats>0 1 2</Beats></Voice></Voices>'
+        '<Beats><Beat id="0"><Rhythm ref="0"/><Notes>0</Notes></Beat>'
+        '<Beat id="1"><Rhythm ref="0"/><Notes>1</Notes></Beat>'
+        '<Beat id="2"><Rhythm ref="1"/><Notes>2</Notes></Beat></Beats>'
+        "<Notes>"
+        '<Note id="0"><Properties><Property name="String"><String>1</String></Property>'
+        '<Property name="Fret"><Fret>0</Fret></Property><Property name="HopoOrigin"><Enable/></Property></Properties></Note>'
+        '<Note id="1"><Properties><Property name="String"><String>1</String></Property>'
+        '<Property name="Fret"><Fret>2</Fret></Property><Property name="HopoDestination"><Enable/></Property></Properties></Note>'
+        '<Note id="2"><Properties><Property name="String"><String>5</String></Property>'
+        '<Property name="Fret"><Fret>7</Fret></Property>'
+        '<Property name="HarmonicType"><HType>Natural</HType></Property></Properties></Note>'
+        "</Notes>"
+        '<Rhythms><Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>'
+        '<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm></Rhythms></GPIF>'
+    ).encode()
+
+    sector = 4096
+    data_blocks = [gpif_xml[i : i + sector].ljust(sector, b"\x00") for i in range(0, len(gpif_xml), sector)]
+    sec0 = bytearray(sector)
+    sec1 = bytearray(sector)
+    struct.pack_into("<I", sec1, 0, 2)
+    sec1[4 : 4 + len(b"score.gpif")] = b"score.gpif"
+    struct.pack_into("<I", sec1, 0x8C, len(gpif_xml))
+    for idx in range(len(data_blocks)):
+        struct.pack_into("<I", sec1, 0x94 + idx * 4, 2 + idx)
+
+    bcfs = b"BCFS" + bytes(sec0) + bytes(sec1) + b"".join(data_blocks)
+    path.write_bytes(_encode_bcfz_literal_and_lz(bcfs) if compressed else bcfs)
     return path
 
 

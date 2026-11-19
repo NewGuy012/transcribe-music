@@ -17,6 +17,7 @@ from conftest import (
     write_ascii_tab_file,
     write_gp5_file,
     write_gpif_file,
+    write_gpx_file,
     write_pdf_file,
 )
 
@@ -284,6 +285,33 @@ def test_gp5_gpif_and_ascii_tab_parsers(
     bad_gp.write_bytes(b"not a zip")
     with pytest.raises(RuntimeError, match="MuseScore"):
         load_digital_score(bad_gp)
+
+    for compressed in (True, False):
+        gpx_path = write_gpx_file(tmp_path / f"gp6_{compressed}.gpx", compressed=compressed)
+        insp_gpx = inspect_digital_score(gpx_path)
+        assert insp_gpx.format_name == "gpx"
+        assert insp_gpx.parts[0].tuning == "E2-A2-D3-G3-B3-E4"
+        assert insp_gpx.parts[0].capo == 2
+
+        loaded_gpx = load_digital_score(gpx_path)
+        assert loaded_gpx.backend == "gpif"
+        gpx_xml = tmp_path / f"gp6_{compressed}.musicxml"
+        export_musicxml(loaded_gpx.score, gpx_xml, Instrument.GUITAR)
+        gpx_root = ET.parse(gpx_xml).getroot()
+        assert gpx_root.findtext(".//staff-details/capo") == "2"
+        assert [s.text for s in gpx_root.findall(".//technical/string")] == ["5", "5", "1"]
+        assert [f.text for f in gpx_root.findall(".//technical/fret")] == ["0", "2", "7"]
+        gpx_txt = gpx_xml.read_text(encoding="utf-8")
+        assert "<hammer-on" in gpx_txt and "<harmonic" in gpx_txt
+
+    evil_gpx = write_gpx_file(tmp_path / "evil.gpx", doctype="<!DOCTYPE foo>")
+    with pytest.raises(ValueError, match="Unsafe XML DTD"):
+        load_digital_score(evil_gpx)
+
+    oversized_gpx = tmp_path / "bomb.gpx"
+    oversized_gpx.write_bytes(b"BCFZ\xff\xff\xff\x7f")
+    with pytest.raises(ValueError, match="safety limit"):
+        load_digital_score(oversized_gpx)
 
     tab_path = write_ascii_tab_file(tmp_path / "riff.tab")
     loaded_tab = load_digital_score(tab_path)
